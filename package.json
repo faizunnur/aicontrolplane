@@ -4,7 +4,9 @@
   "private": true,
   "description": "Single control plane for AI agents scattered across ChatGPT, Claude, Grok and custom platforms.",
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
@@ -14,6 +16,7 @@
     "push-state": "tsx scripts/push-state.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.127.0",
     "better-sqlite3": "^13.0.3",
     "express": "^5.2.1",
     "http-proxy": "^1.18.1",

@@ -51,6 +51,21 @@
       <div id="attention-list" class="list"></div>
     </section>
 
+    <section class="card" id="messages-card">
+      <div class="section-head">
+        <h2>Messages</h2>
+        <span class="muted small" id="router-status"></span>
+      </div>
+      <form id="message-form" class="message-form">
+        <textarea id="message-text" rows="2" placeholder="Tell an agent what to do. e.g. &quot;Add Tesla to the competitor watch&quot; or &quot;@daily-digest include weekend news&quot;" required></textarea>
+        <div class="row">
+          <select id="message-agent" title="Leave on auto to let the router pick the agent"><option value="">Auto-route</option></select>
+          <button class="btn primary" type="submit" id="message-send">Send</button>
+        </div>
+      </form>
+      <div id="messages" class="list"></div>
+    </section>
+
     <section>
       <div class="section-head">
         <h2>Platforms</h2>
@@ -110,6 +125,21 @@
       <label>Purpose <textarea id="agent-purpose" rows="2"></textarea></label>
       <label>Schedule <input id="agent-schedule" placeholder="e.g. weekdays 09:00, every 6h, cron" /></label>
       <label>Native link <input id="agent-url" placeholder="https://… where you manage it" /></label>
+      <label>Routing keywords <input id="agent-keywords" placeholder="comma separated words the router should match, e.g. market, stocks, morning" /></label>
+      <div class="form-grid">
+        <label>Message delivery
+          <select id="agent-delivery-mode">
+            <option value="auto">Auto (by how the agent reports in)</option>
+            <option value="inbox">Inbox: the agent pulls from /api/inbox</option>
+            <option value="webhook">Webhook: POST to a URL</option>
+            <option value="browser">Browser: type into the platform</option>
+            <option value="manual">Manual: I copy and paste it</option>
+          </select>
+        </label>
+        <label>Browser action name <input id="agent-delivery-action" placeholder="send_message" /></label>
+        <label>Webhook URL <input id="agent-webhook-url" placeholder="https://… (webhook mode)" /></label>
+        <label>Webhook bearer token <input id="agent-webhook-token" placeholder="optional" /></label>
+      </div>
       <label class="inline"><input type="checkbox" id="agent-enabled" checked /> Enabled</label>
       <div class="row end">
         <button class="btn ghost" type="button" data-close>Cancel</button>

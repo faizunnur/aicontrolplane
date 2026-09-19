@@ -35,6 +35,9 @@ Anything that *can* call an HTTP endpoint pushes results in directly instead.
 - **Attention feed.** Failed runs, sessions that need a login, unread notifications, plus webhook or Telegram alerts.
 - **Actions.** Open a task in the cloud browser, refresh its screenshot, and run your own click sequences
   ("Run now", "Pause") defined per platform in settings, without code changes.
+- **Messages.** Type an instruction; the router picks the responsible agent (Claude when a key is set, keywords
+  otherwise) or suggests candidates, then delivers it through the agent's inbox, a webhook, the cloud browser, or
+  leaves it for you to paste.
 - **Browser screen.** noVNC, proxied through the app on the same port and protected by the admin token.
   This is where you log in once, and again whenever a session expires.
 
@@ -53,6 +56,7 @@ Anything that *can* call an HTTP endpoint pushes results in directly instead.
    | `SYNC_INTERVAL_MIN` | no | Default 20. Keep it relaxed; sessions live longer that way. |
    | `ALERT_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | no | Any that are set are used. |
    | `IMAP_HOST`, `IMAP_USER`, `IMAP_PASS` | no | Enables email ingestion. See below. |
+   | `ANTHROPIC_API_KEY` | no | Lets Claude route your instructions to the right agent. Keyword routing works without it. |
 
    The full list with defaults is in `.env.example`.
 4. Generate a domain, give the service at least 2 GB of memory (Chromium), and deploy.
@@ -120,6 +124,36 @@ Ready-made helpers in `examples/`: `report.sh` for shells and cron, `claude-code
 to paste into a Claude Code routine, and `mcp-reporter/` a stdio MCP server exposing `report_run` for Cowork and
 Claude Desktop (`cd examples/mcp-reporter && npm install`).
 
+## Messages: tell an agent what to do
+
+The **Messages** box on the dashboard takes a plain instruction and gets it to the responsible agent.
+
+**Routing.** Two engines, used in this order:
+
+1. **Mention.** `@daily-digest …` or `@Daily digest …` goes straight to that agent.
+2. **Claude.** With `ANTHROPIC_API_KEY` set, the router sends the instruction plus a compact registry
+   (name, purpose, schedule, keywords per agent) to Claude and asks for a structured answer: the responsible
+   agent, a confidence, a one-line reason, alternatives, and, when nothing fits, a proposal for a new agent.
+   Without a key it falls back to keyword scoring over names, purposes, the **Routing keywords** field on each
+   agent, and platform mentions ("ask grok…").
+
+When confidence reaches `ROUTER_AUTO_THRESHOLD` (default 0.75) the message is assigned and delivered
+immediately. Below that you get suggestions with reasons and one-click **Assign** buttons, a picker for any
+agent, and a **Create agent** shortcut that pre-fills the form from the router's proposal and assigns on save.
+
+**Delivery.** Each agent has a delivery mode in its edit form. **Auto** picks by how the agent was registered:
+
+| Mode | How the instruction reaches the agent | Default for |
+|---|---|---|
+| `inbox` | The agent fetches `GET /api/inbox?platform=&key=` at the start of its run and acknowledges with `POST /api/inbox/:id/ack`. The bundled MCP reporter exposes this as `get_instructions` / `complete_instruction`. | Agents that push reports |
+| `webhook` | Posted immediately as JSON to the agent's URL (optional bearer token), including an `ack_url`. | Agents with a webhook URL set |
+| `browser` | Typed into the platform through the cloud browser using the platform's `send_message` action (`{{message}}` variable). Built-in defaults exist for ChatGPT, Claude and Grok and are editable in platform settings. | Agents discovered from a web platform |
+| `manual` | Stays on the dashboard with **Copy** and **Open** buttons; press **Mark done** after pasting. | Everything else |
+
+Every message shows its status (needs assignee, assigned, delivered, acknowledged, done, failed), the routing
+method and confidence, the agent's response when it acknowledges, and Retry / Reroute / Delete. Failed deliveries
+and unassignable instructions also land in the attention feed.
+
 ## Email ingestion
 
 Turn on email notifications for tasks on platforms that cannot push (ChatGPT scheduled tasks, for example),
@@ -138,6 +172,8 @@ All routes under `/api` need `Authorization: Bearer <ACP_ADMIN_TOKEN>` or the da
 | `GET/POST /api/agents`, `PUT/DELETE /api/agents/:id` | Registry |
 | `GET /api/runs?platform=&status=&agent_id=&limit=` | Run history |
 | `GET /api/events?unread=1`, `POST /api/events/:id/read`, `POST /api/events/read-all` | Attention feed |
+| `GET/POST /api/messages`, `POST /api/messages/:id/assign|retry|reroute|status`, `DELETE /api/messages/:id` | Instructions and their routing |
+| `GET /api/inbox?platform=&key=`, `POST /api/inbox/:id/ack` (ingest token) | Agents pull instructions and acknowledge them |
 | `GET /api/platforms`, `GET /api/platforms/:id`, `PUT /api/platforms/:id`, `DELETE /api/platforms/:id/overrides` | Platform config, discovered endpoints, recent captures |
 | `POST /api/sync`, `POST /api/platforms/:id/sync` | Sync all or one platform now |
 | `POST /api/platforms/:id/actions/:action` `{agent_id?}` | Built-ins `open`, `screenshot`, `sync`, plus custom actions |

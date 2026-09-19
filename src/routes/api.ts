@@ -8,22 +8,33 @@ import { config } from "../config.js";
 import {
   addEvent,
   allPlatformStates,
+  createMessage,
   deleteAgent,
+  deleteMessage,
+  findAgent,
   getAgent,
   getCapture,
+  getMessage,
   getPlatformState,
+  inboxFor,
   listAgents,
   listCaptures,
   listEvents,
+  listMessages,
   listRuns,
   markAllEventsRead,
   markEventRead,
+  openMessageCount,
   overviewCounts,
   recentSyncLogs,
   recordRun,
   updateAgent,
+  updateMessage,
   upsertAgent,
+  type MessageWithAgent,
 } from "../db.js";
+import { deliverMessage, describeMode, resolveMode } from "../deliver.js";
+import { routeMessage } from "../router.js";
 import { emailStatus, pollOnce } from "../ingest/email.js";
 import { deletePlatformOverride, getPlatform, getPlatforms, savePlatformOverride } from "../platforms.js";
 import { requireAdmin, requireIngest, clearSessionCookieHeader, sessionCookieHeader } from "../auth.js";
@@ -33,6 +44,33 @@ import { syncPlatform } from "../collect/collector.js";
 export const api = Router();
 
 const RUN_STATUS = z.enum(["success", "failed", "running", "needs_attention", "unknown"]);
+const DELIVERY = z
+  .object({
+    mode: z.enum(["auto", "inbox", "webhook", "browser", "manual"]).default("auto"),
+    webhook_url: z.string().max(2000).optional(),
+    webhook_token: z.string().max(500).optional(),
+    action: z.string().max(80).optional(),
+  })
+  .nullable();
+
+/** Expand JSON columns and add a human hint so the dashboard can render a message without extra calls. */
+function expandMessage(m: MessageWithAgent) {
+  const parse = (s: string | null) => {
+    try {
+      return s ? JSON.parse(s) : null;
+    } catch {
+      return null;
+    }
+  };
+  const agent = m.agent_id ? getAgent(m.agent_id) : undefined;
+  const mode = m.delivery_mode ?? (agent ? resolveMode(agent) : null);
+  return { ...m, suggestions: parse(m.suggestions) ?? [], routing: parse(m.routing), delivery_mode: mode, delivery_hint: mode ? describeMode(mode) : null };
+}
+
+async function assignAndDeliver(messageId: number, agentId: number) {
+  updateMessage(messageId, { agent_id: agentId, status: "assigned", error: null, delivered_at: null, acked_at: null });
+  return expandMessage(await deliverMessage(messageId));
+}
 
 function bad(res: Response, msg: string, code = 400) {
   res.status(code).json({ error: msg });
@@ -72,6 +110,8 @@ const ingestSchema = z.object({
     schedule: z.string().max(200).optional(),
     native_url: z.string().max(2000).optional(),
     status: z.string().max(60).optional(),
+    keywords: z.string().max(500).optional(),
+    delivery: DELIVERY.optional(),
   }),
   run: z
     .object({
@@ -109,6 +149,8 @@ api.post("/ingest", requireIngest, async (req, res) => {
     schedule: a.schedule,
     native_url: a.native_url,
     status: a.status,
+    keywords: a.keywords,
+    delivery: a.delivery === undefined ? undefined : a.delivery,
   });
   let runRow = null;
   if (run) {
@@ -144,9 +186,135 @@ api.post("/ingest", requireIngest, async (req, res) => {
   res.json({ ok: true, agent, run: runRow, event: eventRow });
 });
 
+/* ---------- inbox (agents pull their instructions; ingest token) ---------- */
+
+api.get("/inbox", requireIngest, (req, res) => {
+  const platform = String(req.query.platform ?? "").toLowerCase();
+  const key = String(req.query.key ?? "");
+  if (!platform || !key) return bad(res, "platform and key are required");
+  const agent = findAgent(platform, key);
+  if (!agent) return bad(res, "unknown agent", 404);
+  const now = new Date().toISOString();
+  const messages = inboxFor(agent.id).map((m) => {
+    if (m.status === "assigned") updateMessage(m.id, { status: "delivered", delivered_at: now });
+    return { id: m.id, text: m.text, created_at: m.created_at, ack_url: `/api/inbox/${m.id}/ack` };
+  });
+  res.json({ agent: { key: agent.key, name: agent.name, platform: agent.platform }, messages });
+});
+
+const ackSchema = z.object({
+  status: z.enum(["acknowledged", "done", "failed"]).default("done"),
+  response: z.string().max(20_000).optional(),
+});
+api.post("/inbox/:id/ack", requireIngest, (req, res) => {
+  const parsed = ackSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid ack", issues: parsed.error.issues });
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  const updated = updateMessage(m.id, {
+    status: parsed.data.status,
+    acked_at: new Date().toISOString(),
+    response: parsed.data.response ?? null,
+    error: parsed.data.status === "failed" ? (parsed.data.response ?? "agent reported failure") : null,
+  })!;
+  if (parsed.data.status === "failed") {
+    addEvent({
+      platform: updated.agent_platform,
+      kind: "message",
+      title: `${updated.agent_name ?? "Agent"} could not complete an instruction`,
+      body: `${parsed.data.response ?? ""}\n\n"${updated.text.slice(0, 200)}"`,
+      dedupe_key: `message_agent_failed:${updated.id}`,
+    });
+  }
+  res.json({ ok: true, message: expandMessage(updated) });
+});
+
 /* ---------- everything below is admin ---------- */
 
 api.use(requireAdmin);
+
+/* ---------- messages (instructions from you, routed to agents) ---------- */
+
+api.get("/messages", (req, res) => {
+  res.json(
+    listMessages({
+      status: typeof req.query.status === "string" ? req.query.status : undefined,
+      agent_id: req.query.agent_id ? num(req.query.agent_id, 0) : undefined,
+      limit: num(req.query.limit, 50),
+    }).map(expandMessage),
+  );
+});
+api.get("/messages/:id", (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  res.json(expandMessage(m));
+});
+api.post("/messages", async (req, res) => {
+  const text = String(req.body?.text ?? "").trim();
+  if (!text) return bad(res, "text is required");
+  if (text.length > 20_000) return bad(res, "text too long");
+  const auto = req.body?.auto !== false;
+  const msg = createMessage(text);
+
+  if (req.body?.agent_id) {
+    const agent = getAgent(num(req.body.agent_id, 0));
+    if (!agent) return bad(res, "unknown agent", 404);
+    updateMessage(msg.id, { routing: { method: "manual", confidence: 1, reason: "You chose the agent." } });
+    return res.json({ message: await assignAndDeliver(msg.id, agent.id), auto_assigned: false, chosen: true });
+  }
+
+  const routing = await routeMessage(text);
+  updateMessage(msg.id, {
+    suggestions: routing.suggestions,
+    routing: { method: routing.method, confidence: routing.confidence, reason: routing.reason, new_agent: routing.new_agent, llm_error: routing.llm_error },
+  });
+  if (auto && routing.top && routing.confidence >= config.router.autoThreshold) {
+    return res.json({ message: await assignAndDeliver(msg.id, routing.top.agent_id), auto_assigned: true });
+  }
+  addEvent({
+    kind: "message",
+    title: routing.top ? "Instruction needs your confirmation" : "Instruction has no matching agent",
+    body: text.slice(0, 300),
+    dedupe_key: `message_assign:${msg.id}`,
+  });
+  res.json({ message: expandMessage(getMessage(msg.id)!), auto_assigned: false });
+});
+api.post("/messages/:id/assign", async (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  const agent = getAgent(num(req.body?.agent_id, 0));
+  if (!agent) return bad(res, "unknown agent", 404);
+  res.json(await assignAndDeliver(m.id, agent.id));
+});
+api.post("/messages/:id/retry", async (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  if (!m.agent_id) return bad(res, "message has no agent; assign it first", 409);
+  res.json(await assignAndDeliver(m.id, m.agent_id));
+});
+api.post("/messages/:id/reroute", async (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  const routing = await routeMessage(m.text);
+  const updated = updateMessage(m.id, {
+    status: "needs_assignment",
+    agent_id: null,
+    delivery_mode: null,
+    error: null,
+    suggestions: routing.suggestions,
+    routing: { method: routing.method, confidence: routing.confidence, reason: routing.reason, new_agent: routing.new_agent, llm_error: routing.llm_error },
+  })!;
+  res.json(expandMessage(updated));
+});
+api.post("/messages/:id/status", (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  const status = String(req.body?.status ?? "");
+  if (!["done", "failed", "acknowledged", "delivered"].includes(status)) return bad(res, "invalid status");
+  const response = typeof req.body?.response === "string" ? req.body.response : undefined;
+  res.json(expandMessage(updateMessage(m.id, { status: status as "done", acked_at: new Date().toISOString(), response })!));
+});
+api.delete("/messages/:id", (req, res) => res.json({ ok: deleteMessage(num(req.params.id, 0)) }));
 
 api.get("/overview", async (_req, res) => {
   const platforms = getPlatforms();
@@ -169,13 +337,15 @@ api.get("/overview", async (_req, res) => {
     };
   });
   res.json({
-    counts: overviewCounts(),
+    counts: { ...overviewCounts(), openMessages: openMessageCount() },
     platforms: cards,
     attention: {
       runs: listRuns({ limit: 20 }).filter((r) => r.status === "failed" || r.status === "needs_attention"),
       events: listEvents({ unread: true, limit: 20 }),
       sessions: cards.filter((c) => c.state.session_status === "needs_login").map((c) => ({ platform: c.id, name: c.name })),
+      messages: [...listMessages({ status: "needs_assignment", limit: 10 }), ...listMessages({ status: "failed", limit: 10 })].map(expandMessage),
     },
+    router: { llm: config.router.llm, model: config.router.model, autoThreshold: config.router.autoThreshold },
     scheduler: schedulerStatus(),
     browser: await browser.status(),
     email: emailStatus(),
@@ -195,6 +365,8 @@ const agentSchema = z.object({
   native_url: z.string().max(2000).nullable().optional(),
   status: z.string().max(60).nullable().optional(),
   enabled: z.boolean().optional(),
+  keywords: z.string().max(500).nullable().optional(),
+  delivery: DELIVERY.optional(),
 });
 
 api.get("/agents", (req, res) => {

@@ -2,7 +2,19 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
-import type { Agent, AgentSource, EventRow, PlatformState, Run, RunStatus, SessionStatus } from "./types.js";
+import type {
+  Agent,
+  AgentDelivery,
+  AgentSource,
+  DeliveryMode,
+  EventRow,
+  MessageRow,
+  MessageStatus,
+  PlatformState,
+  Run,
+  RunStatus,
+  SessionStatus,
+} from "./types.js";
 
 fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
 export const db = new Database(config.dbPath);
@@ -90,7 +102,31 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'needs_assignment',
+  agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+  suggestions TEXT,
+  routing TEXT,
+  delivery_mode TEXT,
+  delivered_at TEXT,
+  acked_at TEXT,
+  response TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_status ON messages(status, created_at DESC);
 `);
+
+/** Additive migrations for databases created by earlier versions. */
+function ensureColumn(table: string, column: string, ddl: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+ensureColumn("agents", "keywords", "keywords TEXT");
+ensureColumn("agents", "delivery", "delivery TEXT");
 
 export const now = () => new Date().toISOString();
 
@@ -108,6 +144,8 @@ export interface AgentInput {
   status?: string | null;
   enabled?: boolean;
   meta?: unknown;
+  keywords?: string | null;
+  delivery?: AgentDelivery | null;
 }
 
 export function listAgents(opts: { platform?: string; includeDisabled?: boolean } = {}): (Agent & { last_run?: Run | null })[] {
@@ -148,6 +186,8 @@ export function upsertAgent(input: AgentInput): Agent {
          status = COALESCE(?, status),
          enabled = COALESCE(?, enabled),
          meta = COALESCE(?, meta),
+         keywords = COALESCE(?, keywords),
+         delivery = COALESCE(?, delivery),
          updated_at = ?
        WHERE id = ?`,
     ).run(
@@ -159,6 +199,8 @@ export function upsertAgent(input: AgentInput): Agent {
       input.status ?? null,
       input.enabled === undefined ? null : input.enabled ? 1 : 0,
       meta ?? null,
+      input.keywords ?? null,
+      input.delivery === undefined || input.delivery === null ? null : JSON.stringify(input.delivery),
       ts,
       existing.id,
     );
@@ -166,8 +208,8 @@ export function upsertAgent(input: AgentInput): Agent {
   }
   const res = db
     .prepare(
-      `INSERT INTO agents (platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, keywords, delivery, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.platform,
@@ -180,6 +222,8 @@ export function upsertAgent(input: AgentInput): Agent {
       input.status ?? null,
       input.enabled === false ? 0 : 1,
       meta ?? null,
+      input.keywords ?? null,
+      input.delivery ? JSON.stringify(input.delivery) : null,
       ts,
       ts,
     );
@@ -190,7 +234,7 @@ export function updateAgent(id: number, patch: Partial<AgentInput>): Agent | und
   const a = getAgent(id);
   if (!a) return undefined;
   db.prepare(
-    `UPDATE agents SET name=?, purpose=?, schedule=?, native_url=?, status=?, enabled=?, meta=?, platform=?, key=?, updated_at=? WHERE id=?`,
+    `UPDATE agents SET name=?, purpose=?, schedule=?, native_url=?, status=?, enabled=?, meta=?, platform=?, key=?, keywords=?, delivery=?, updated_at=? WHERE id=?`,
   ).run(
     patch.name ?? a.name,
     patch.purpose === undefined ? a.purpose : patch.purpose,
@@ -201,6 +245,8 @@ export function updateAgent(id: number, patch: Partial<AgentInput>): Agent | und
     patch.meta === undefined ? a.meta : JSON.stringify(patch.meta),
     patch.platform ?? a.platform,
     patch.key ?? a.key,
+    patch.keywords === undefined ? a.keywords : patch.keywords,
+    patch.delivery === undefined ? a.delivery : patch.delivery === null ? null : JSON.stringify(patch.delivery),
     now(),
     id,
   );
@@ -471,4 +517,87 @@ export function overviewCounts() {
 
 export function asSessionStatus(s: string): SessionStatus {
   return (["logged_in", "needs_login", "unknown", "error"] as const).includes(s as SessionStatus) ? (s as SessionStatus) : "unknown";
+}
+
+/* ---------- messages (instructions routed to agents) ---------- */
+
+export type MessageWithAgent = MessageRow & { agent_name: string | null; agent_platform: string | null; agent_key: string | null; agent_native_url: string | null };
+
+const MESSAGE_SELECT = `SELECT m.*, a.name AS agent_name, a.platform AS agent_platform, a.key AS agent_key, a.native_url AS agent_native_url
+  FROM messages m LEFT JOIN agents a ON a.id = m.agent_id`;
+
+export function createMessage(text: string): MessageRow {
+  const ts = now();
+  const res = db.prepare(`INSERT INTO messages (text, status, created_at, updated_at) VALUES (?, 'needs_assignment', ?, ?)`).run(text, ts, ts);
+  return getMessage(Number(res.lastInsertRowid))!;
+}
+
+export function getMessage(id: number): MessageWithAgent | undefined {
+  return db.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`).get(id) as MessageWithAgent | undefined;
+}
+
+export interface MessagePatch {
+  status?: MessageStatus;
+  agent_id?: number | null;
+  suggestions?: unknown;
+  routing?: unknown;
+  delivery_mode?: DeliveryMode | null;
+  delivered_at?: string | null;
+  acked_at?: string | null;
+  response?: string | null;
+  error?: string | null;
+}
+
+export function updateMessage(id: number, patch: MessagePatch): MessageWithAgent | undefined {
+  const m = getMessage(id);
+  if (!m) return undefined;
+  const json = (v: unknown, cur: string | null) => (v === undefined ? cur : v === null ? null : JSON.stringify(v));
+  db.prepare(
+    `UPDATE messages SET status=?, agent_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, updated_at=? WHERE id=?`,
+  ).run(
+    patch.status ?? m.status,
+    patch.agent_id === undefined ? m.agent_id : patch.agent_id,
+    json(patch.suggestions, m.suggestions),
+    json(patch.routing, m.routing),
+    patch.delivery_mode === undefined ? m.delivery_mode : patch.delivery_mode,
+    patch.delivered_at === undefined ? m.delivered_at : patch.delivered_at,
+    patch.acked_at === undefined ? m.acked_at : patch.acked_at,
+    patch.response === undefined ? m.response : patch.response,
+    patch.error === undefined ? m.error : patch.error,
+    now(),
+    id,
+  );
+  return getMessage(id);
+}
+
+export function listMessages(opts: { status?: string; agent_id?: number; limit?: number } = {}): MessageWithAgent[] {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.status) {
+    where.push("m.status = ?");
+    params.push(opts.status);
+  }
+  if (opts.agent_id) {
+    where.push("m.agent_id = ?");
+    params.push(opts.agent_id);
+  }
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+  return db
+    .prepare(`${MESSAGE_SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY m.created_at DESC LIMIT ?`)
+    .all(...params, limit) as MessageWithAgent[];
+}
+
+/** Messages waiting for an agent that pulls its instructions. */
+export function inboxFor(agentId: number): MessageWithAgent[] {
+  return db
+    .prepare(`${MESSAGE_SELECT} WHERE m.agent_id = ? AND m.delivery_mode = 'inbox' AND m.status IN ('assigned','delivered') ORDER BY m.created_at ASC`)
+    .all(agentId) as MessageWithAgent[];
+}
+
+export function deleteMessage(id: number): boolean {
+  return db.prepare("DELETE FROM messages WHERE id = ?").run(id).changes > 0;
+}
+
+export function openMessageCount(): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status IN ('needs_assignment','failed')`).get() as { n: number }).n;
 }

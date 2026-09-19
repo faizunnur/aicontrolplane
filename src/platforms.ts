@@ -23,7 +23,19 @@ export const DEFAULT_PLATFORMS: Record<string, PlatformConfig> = {
     loggedInSelector: "",
     nativeUrlTemplate: "",
     snapshotSelector: "main",
-    actions: {},
+    actions: {
+      send_message: {
+        label: "Send message",
+        description: "Type an instruction into the task's conversation and send it.",
+        steps: [
+          { type: "goto", url: "{{native_url}}" },
+          { type: "waitFor", selector: "#prompt-textarea" },
+          { type: "fill", selector: "#prompt-textarea", value: "{{message}}" },
+          { type: "wait", ms: 400 },
+          { type: "click", selector: 'button[data-testid="send-button"]' },
+        ],
+      },
+    },
     notes: "Scheduled tasks live under Scheduled in the sidebar. Task result emails can also be ingested via IMAP.",
   },
   claude: {
@@ -38,7 +50,19 @@ export const DEFAULT_PLATFORMS: Record<string, PlatformConfig> = {
     loggedInSelector: "",
     nativeUrlTemplate: "",
     snapshotSelector: "main",
-    actions: {},
+    actions: {
+      send_message: {
+        label: "Send message",
+        description: "Type an instruction into the open Claude conversation and send it.",
+        steps: [
+          { type: "goto", url: "{{native_url}}" },
+          { type: "waitFor", selector: 'div[contenteditable="true"]' },
+          { type: "fill", selector: 'div[contenteditable="true"]', value: "{{message}}" },
+          { type: "wait", ms: 400 },
+          { type: "press", selector: 'div[contenteditable="true"]', key: "Enter" },
+        ],
+      },
+    },
     notes: "Claude Code routines and remote sessions. Cowork desktop tasks report in via the push API or the MCP reporter.",
   },
   grok: {
@@ -53,7 +77,19 @@ export const DEFAULT_PLATFORMS: Record<string, PlatformConfig> = {
     loggedInSelector: "",
     nativeUrlTemplate: "",
     snapshotSelector: "main",
-    actions: {},
+    actions: {
+      send_message: {
+        label: "Send message",
+        description: "Type an instruction into the Grok composer and send it.",
+        steps: [
+          { type: "goto", url: "{{native_url}}" },
+          { type: "waitFor", selector: "textarea" },
+          { type: "fill", selector: "textarea", value: "{{message}}" },
+          { type: "wait", ms: 400 },
+          { type: "press", selector: "textarea", key: "Enter" },
+        ],
+      },
+    },
     notes: "Grok Bot routines. Point tasksUrl at your bots/routines page.",
   },
   muse: {

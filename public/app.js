@@ -4,7 +4,7 @@
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-  let state = { overview: null, agents: [], runs: [], events: [], platforms: [] };
+  let state = { overview: null, agents: [], runs: [], events: [], platforms: [], messages: [] };
   let refreshTimer = null;
 
   /* ---------- api ---------- */
@@ -91,7 +91,10 @@
       `<span class="pill"><b>${c.runs24h}</b>runs · 24h</span>`,
       `<span class="pill ${c.failed7d ? "bad" : ""}"><b>${c.failed7d}</b>failed · 7d</span>`,
       `<span class="pill ${c.unreadEvents ? "warn" : ""}"><b>${c.unreadEvents}</b>unread</span>`,
+      `<span class="pill ${c.openMessages ? "warn" : ""}"><b>${c.openMessages || 0}</b>messages open</span>`,
     ].join("");
+    const r = state.overview.router;
+    $("#router-status").textContent = r.llm ? `routing by ${r.model} · auto-assign at ${Math.round(r.autoThreshold * 100)}%` : `keyword routing · auto-assign at ${Math.round(r.autoThreshold * 100)}% · set ANTHROPIC_API_KEY for smarter routing`;
     const s = state.overview.scheduler;
     $("#scheduler-status").textContent = !s.enabled
       ? "auto-sync off"
@@ -214,6 +217,62 @@
         .join("") || '<p class="muted">No events yet. Failed runs, login prompts and ingested emails show up here.</p>';
   }
 
+  const msgBadge = (s) =>
+    ({
+      needs_assignment: '<span class="badge warn">needs assignee</span>',
+      assigned: '<span class="badge info">assigned</span>',
+      delivered: '<span class="badge info">delivered</span>',
+      acknowledged: '<span class="badge info">acknowledged</span>',
+      done: '<span class="badge ok">done</span>',
+      failed: '<span class="badge bad">failed</span>',
+    })[s] || `<span class="badge neutral">${esc(s)}</span>`;
+
+  function renderMessages() {
+    const sel = $("#message-agent");
+    const cur = sel.value;
+    sel.innerHTML =
+      '<option value="">Auto-route</option>' +
+      state.agents.filter((a) => a.enabled).map((a) => `<option value="${a.id}">${esc(a.name)} · ${esc(platformName(a.platform))}</option>`).join("");
+    sel.value = cur;
+
+    $("#messages").innerHTML =
+      state.messages
+        .slice(0, 20)
+        .map((m) => {
+          const who = m.agent_name ? `${esc(m.agent_name)} · ${esc(platformName(m.agent_platform))}` : "unassigned";
+          const route = m.routing ? `<span class="badge route" title="${esc(m.routing.reason || "")}">${esc(m.routing.method)}${m.routing.confidence != null ? " " + Math.round(m.routing.confidence * 100) + "%" : ""}</span>` : "";
+          const hint = m.delivery_mode ? ` · ${esc(m.delivery_hint || m.delivery_mode)}` : "";
+          let extra = "";
+          if (m.status === "needs_assignment") {
+            const sugg = (m.suggestions || [])
+              .map((s) => `<button class="btn small" data-assign="${m.id}" data-agent="${s.agent_id}" title="${esc(s.reason)}">Assign to ${esc(s.name)} <span class="muted">(${Math.round(s.score * 100)}%)</span></button>`)
+              .join("");
+            const newAgent = m.routing?.new_agent
+              ? `<button class="btn small ghost" data-new-agent="${m.id}" title="Create an agent for this">Create agent on ${esc(platformName(m.routing.new_agent.platform))}</button>`
+              : "";
+            const pick = `<select class="small" data-pick="${m.id}"><option value="">Pick any agent…</option>${state.agents.filter((a) => a.enabled).map((a) => `<option value="${a.id}">${esc(a.name)} · ${esc(platformName(a.platform))}</option>`).join("")}</select>`;
+            extra = `<div class="sub">${esc(m.routing?.reason || "")}</div><div class="suggest">${sugg}${newAgent}${pick}</div>`;
+          } else if (m.error) {
+            extra = `<div class="sub error">${esc(m.error)}</div>`;
+          }
+          if (m.response) extra += `<div class="response">${esc(m.response)}</div>`;
+          const manual = m.delivery_mode === "manual" && !["done", "failed"].includes(m.status);
+          const actions = [
+            manual ? `<button class="btn small" data-copy="${m.id}">Copy</button>` : "",
+            manual && m.agent_native_url ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(m.agent_native_url)}">Open</a>` : "",
+            m.status === "failed" && m.agent_id ? `<button class="btn small" data-msg-retry="${m.id}">Retry</button>` : "",
+            !["done"].includes(m.status) && m.agent_id ? `<button class="btn small ghost" data-msg-done="${m.id}">Mark done</button>` : "",
+            m.status !== "needs_assignment" ? `<button class="btn small ghost" data-msg-reroute="${m.id}" title="Clear the assignment and route again">Reroute</button>` : "",
+            `<button class="btn small ghost danger" data-msg-delete="${m.id}">Delete</button>`,
+          ].join("");
+          return `<div class="item msg ${m.status === "needs_assignment" ? "unread" : ""}"><div class="body">
+              <div class="title">${msgBadge(m.status)} ${route} <span class="muted small">${rel(m.created_at)} · ${who}${hint}</span></div>
+              <div class="text">${esc(m.text)}</div>${extra}</div>
+            <div class="actions">${actions}</div></div>`;
+        })
+        .join("") || '<p class="muted">No messages yet. Type an instruction above; it is routed to the responsible agent or you get suggestions.</p>';
+  }
+
   function renderIngestExample() {
     const base = state.overview.publicUrl || window.location.origin;
     $("#ingest-example").textContent = `curl -X POST ${base}/api/ingest \\
@@ -237,12 +296,19 @@
     try {
       // One cheap call first so an expired session shows the login overlay without a burst of 401s.
       await api("/session");
-      const [overview, agents, runs, events] = await Promise.all([api("/overview"), api("/agents?all=1"), api("/runs?limit=40"), api("/events?limit=40")]);
-      state = { overview, agents, runs, events, platforms: overview.platforms };
+      const [overview, agents, runs, events, messages] = await Promise.all([
+        api("/overview"),
+        api("/agents?all=1"),
+        api("/runs?limit=40"),
+        api("/events?limit=40"),
+        api("/messages?limit=30"),
+      ]);
+      state = { overview, agents, runs, events, messages, platforms: overview.platforms };
       renderFilters();
       renderPills();
       renderSetup();
       renderAttention();
+      renderMessages();
       renderPlatforms();
       renderAgents();
       renderRuns();
@@ -255,7 +321,9 @@
 
   /* ---------- actions ---------- */
   document.addEventListener("click", async (e) => {
-    const t = e.target.closest("[data-sync],[data-action],[data-settings],[data-shot],[data-read],[data-edit],[data-delete],[data-agent-action],[data-close]");
+    const t = e.target.closest(
+      "[data-sync],[data-action],[data-settings],[data-shot],[data-read],[data-edit],[data-delete],[data-agent-action],[data-close],[data-assign],[data-copy],[data-msg-retry],[data-msg-done],[data-msg-reroute],[data-msg-delete],[data-new-agent]",
+    );
     if (!t) {
       const ov = e.target.closest("[data-close-on-click]");
       if (ov && e.target === ov) ov.classList.add("hidden");
@@ -299,6 +367,38 @@
           toast("Agent deleted");
           await refresh();
         }
+      } else if (t.dataset.assign) {
+        t.disabled = true;
+        const m = await api(`/messages/${t.dataset.assign}/assign`, { method: "POST", body: { agent_id: Number(t.dataset.agent) } });
+        toast(m.status === "failed" ? `Delivery failed: ${m.error}` : `Assigned to ${m.agent_name}: ${m.delivery_hint}`, m.status === "failed");
+        await refresh();
+      } else if (t.dataset.copy) {
+        const m = state.messages.find((x) => x.id === Number(t.dataset.copy));
+        if (m) {
+          await navigator.clipboard.writeText(m.text).catch(() => prompt("Copy this instruction:", m.text));
+          toast("Copied. Paste it into the platform, then press Mark done.");
+        }
+      } else if (t.dataset.msgRetry) {
+        t.disabled = true;
+        const m = await api(`/messages/${t.dataset.msgRetry}/retry`, { method: "POST", body: {} });
+        toast(m.status === "failed" ? `Still failing: ${m.error}` : `Delivered: ${m.delivery_hint}`, m.status === "failed");
+        await refresh();
+      } else if (t.dataset.msgDone) {
+        await api(`/messages/${t.dataset.msgDone}/status`, { method: "POST", body: { status: "done" } });
+        await refresh();
+      } else if (t.dataset.msgReroute) {
+        t.disabled = true;
+        await api(`/messages/${t.dataset.msgReroute}/reroute`, { method: "POST", body: {} });
+        await refresh();
+      } else if (t.dataset.msgDelete) {
+        await api(`/messages/${t.dataset.msgDelete}`, { method: "DELETE" });
+        await refresh();
+      } else if (t.dataset.newAgent) {
+        const m = state.messages.find((x) => x.id === Number(t.dataset.newAgent));
+        const n = m?.routing?.new_agent;
+        openAgentModal(n ? { name: n.name, platform: n.platform, purpose: n.purpose, enabled: 1 } : null);
+        $("#agent-id").value = "";
+        $("#agent-form").dataset.thenAssign = t.dataset.newAgent;
       }
     } catch (err) {
       if (err.message !== "unauthorized") toast(err.message, true);
@@ -330,6 +430,44 @@
   });
   $("#agent-filter").addEventListener("change", renderAgents);
 
+  /* ---------- messages ---------- */
+  $("#message-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = $("#message-text").value.trim();
+    if (!text) return;
+    const agentId = $("#message-agent").value;
+    const btn = $("#message-send");
+    btn.disabled = true;
+    try {
+      const r = await api("/messages", { method: "POST", body: { text, ...(agentId ? { agent_id: Number(agentId) } : {}) } });
+      const m = r.message;
+      if (m.status === "needs_assignment") toast(m.suggestions?.length ? "Not sure who owns this. Pick from the suggestions." : "No matching agent. Pick one or create it.", false);
+      else if (m.status === "failed") toast(`Assigned to ${m.agent_name} but delivery failed: ${m.error}`, true);
+      else toast(`${r.auto_assigned ? "Routed to" : "Sent to"} ${m.agent_name}: ${m.delivery_hint}`);
+      $("#message-text").value = "";
+      $("#message-agent").value = "";
+      await refresh();
+    } catch (err) {
+      if (err.message !== "unauthorized") toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  $("#message-text").addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("#message-form").requestSubmit();
+  });
+  document.addEventListener("change", async (e) => {
+    const sel = e.target.closest("[data-pick]");
+    if (!sel || !sel.value) return;
+    try {
+      const m = await api(`/messages/${sel.dataset.pick}/assign`, { method: "POST", body: { agent_id: Number(sel.value) } });
+      toast(m.status === "failed" ? `Delivery failed: ${m.error}` : `Assigned to ${m.agent_name}: ${m.delivery_hint}`, m.status === "failed");
+      await refresh();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
   /* ---------- agent modal ---------- */
   function openAgentModal(agent) {
     $("#agent-modal-title").textContent = agent ? "Edit agent" : "Add agent";
@@ -340,7 +478,19 @@
     $("#agent-purpose").value = agent?.purpose ?? "";
     $("#agent-schedule").value = agent?.schedule ?? "";
     $("#agent-url").value = agent?.native_url ?? "";
+    $("#agent-keywords").value = agent?.keywords ?? "";
+    let d = {};
+    try {
+      d = agent?.delivery ? JSON.parse(agent.delivery) : {};
+    } catch {
+      d = {};
+    }
+    $("#agent-delivery-mode").value = d.mode || "auto";
+    $("#agent-delivery-action").value = d.action || "";
+    $("#agent-webhook-url").value = d.webhook_url || "";
+    $("#agent-webhook-token").value = d.webhook_token || "";
     $("#agent-enabled").checked = agent ? !!agent.enabled : true;
+    delete $("#agent-form").dataset.thenAssign;
     $("#agent-modal").classList.remove("hidden");
     $("#agent-name").focus();
   }
@@ -355,13 +505,28 @@
       purpose: $("#agent-purpose").value.trim() || null,
       schedule: $("#agent-schedule").value.trim() || null,
       native_url: $("#agent-url").value.trim() || null,
+      keywords: $("#agent-keywords").value.trim() || null,
+      delivery: {
+        mode: $("#agent-delivery-mode").value || "auto",
+        action: $("#agent-delivery-action").value.trim() || undefined,
+        webhook_url: $("#agent-webhook-url").value.trim() || undefined,
+        webhook_token: $("#agent-webhook-token").value.trim() || undefined,
+      },
       enabled: $("#agent-enabled").checked,
     };
     try {
-      if (id) await api(`/agents/${id}`, { method: "PUT", body });
-      else await api("/agents", { method: "POST", body });
+      let saved;
+      if (id) saved = await api(`/agents/${id}`, { method: "PUT", body });
+      else saved = await api("/agents", { method: "POST", body });
       $("#agent-modal").classList.add("hidden");
-      toast("Agent saved");
+      const thenAssign = $("#agent-form").dataset.thenAssign;
+      if (thenAssign && saved?.id) {
+        delete $("#agent-form").dataset.thenAssign;
+        const m = await api(`/messages/${thenAssign}/assign`, { method: "POST", body: { agent_id: saved.id } });
+        toast(m.status === "failed" ? `Agent saved, delivery failed: ${m.error}` : `Agent saved and instruction assigned: ${m.delivery_hint}`, m.status === "failed");
+      } else {
+        toast("Agent saved");
+      }
       await refresh();
     } catch (err) {
       toast(err.message, true);

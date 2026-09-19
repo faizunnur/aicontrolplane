@@ -22,6 +22,17 @@ app.use(express.json({ limit: "5mb" }));
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, browser: browser.isRunning(), at: new Date().toISOString() }));
 
+// When PUBLIC_URL is not configured, learn it from the first browser request so
+// webhook payloads and alerts can carry absolute links back to this deployment.
+app.use((req, _res, next) => {
+  if (!config.publicUrl && req.headers.host && !req.path.startsWith("/api/ingest") && !req.path.startsWith("/api/inbox")) {
+    const proto = req.headers["x-forwarded-proto"] === "https" || req.secure ? "https" : "http";
+    config.publicUrl = `${proto}://${req.headers.host}`;
+    log.info(`public url detected: ${config.publicUrl}`);
+  }
+  next();
+});
+
 app.use("/api", api);
 
 /* ---- noVNC: proxied through the app so it shares the single public port and the admin auth ---- */

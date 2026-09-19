@@ -28,12 +28,13 @@ export function availableActions(p: PlatformConfig) {
     out.push({ id, ...meta, builtin: true });
   }
   for (const [id, def] of Object.entries(p.actions ?? {})) {
+    if (id === "send_message") continue; // used by message delivery, needs a {{message}} variable
     out.push({ id, label: def.label ?? id, description: def.description ?? `${def.steps?.length ?? 0} step(s)`, builtin: false });
   }
   return out;
 }
 
-export async function runAction(p: PlatformConfig, action: string, agent?: Agent): Promise<ActionResult> {
+export async function runAction(p: PlatformConfig, action: string, agent?: Agent, extraVars: Record<string, string> = {}): Promise<ActionResult> {
   if (!browser.enabled) return { ok: false, action, message: "browser is disabled" };
 
   if (action === "open") {
@@ -60,6 +61,7 @@ export async function runAction(p: PlatformConfig, action: string, agent?: Agent
     name: agent?.name ?? "",
     tasksUrl: p.tasksUrl ?? "",
     appUrl: p.appUrl ?? "",
+    ...extraVars,
   };
   const sub = (s?: string) => (s ?? "").replace(/\{\{(\w+)\}\}/g, (_, k: string) => vars[k] ?? "");
 

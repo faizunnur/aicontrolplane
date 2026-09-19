@@ -73,6 +73,14 @@ export const config = {
     cooldownMin: num(process.env.ALERT_COOLDOWN_MIN, 360),
   },
 
+  router: {
+    /** LLM routing is on when an Anthropic credential is present, unless ROUTER_LLM forces it. */
+    llm: process.env.ROUTER_LLM ? bool(process.env.ROUTER_LLM, true) : !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    model: process.env.ROUTER_MODEL || "claude-opus-5",
+    /** Auto-assign when the best suggestion's confidence reaches this. */
+    autoThreshold: num(process.env.ROUTER_AUTO_THRESHOLD, 0.75),
+  },
+
   email: {
     host: process.env.IMAP_HOST || "",
     port: num(process.env.IMAP_PORT, 993),

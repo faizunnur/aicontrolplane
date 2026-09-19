@@ -2,6 +2,19 @@ export type SessionStatus = "logged_in" | "needs_login" | "unknown" | "error";
 export type RunStatus = "success" | "failed" | "running" | "needs_attention" | "unknown";
 export type AgentSource = "registry" | "discovered" | "push";
 
+export type DeliveryMode = "auto" | "inbox" | "webhook" | "browser" | "manual";
+
+/** How instructions reach an agent. Stored as JSON on the agent row. */
+export interface AgentDelivery {
+  mode: DeliveryMode;
+  /** webhook mode: where to POST the instruction. */
+  webhook_url?: string;
+  /** webhook mode: optional bearer token sent with the POST. */
+  webhook_token?: string;
+  /** browser mode: platform action to run; defaults to "send_message". */
+  action?: string;
+}
+
 export interface Agent {
   id: number;
   platform: string;
@@ -14,6 +27,40 @@ export interface Agent {
   status: string | null;
   enabled: number;
   meta: string | null;
+  /** Comma separated hints used by the router, e.g. "market, stocks, morning". */
+  keywords: string | null;
+  /** JSON AgentDelivery. */
+  delivery: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type MessageStatus = "needs_assignment" | "assigned" | "delivered" | "acknowledged" | "done" | "failed";
+
+export interface Suggestion {
+  agent_id: number;
+  key: string;
+  name: string;
+  platform: string;
+  /** 0..1 */
+  score: number;
+  reason: string;
+}
+
+export interface MessageRow {
+  id: number;
+  text: string;
+  status: MessageStatus;
+  agent_id: number | null;
+  /** JSON Suggestion[] */
+  suggestions: string | null;
+  /** JSON routing details: method, confidence, reason, new_agent, llm_error */
+  routing: string | null;
+  delivery_mode: DeliveryMode | null;
+  delivered_at: string | null;
+  acked_at: string | null;
+  response: string | null;
+  error: string | null;
   created_at: string;
   updated_at: string;
 }
