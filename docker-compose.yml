@@ -1,0 +1,26 @@
+# Local run of the same image Railway builds.
+#   docker compose up --build
+# Dashboard: http://localhost:8080   Browser screen: http://localhost:8080/vnc/
+services:
+  acp:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-change-me-admin}
+      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-change-me-ingest}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      SYNC_INTERVAL_MIN: ${SYNC_INTERVAL_MIN:-20}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      IMAP_HOST: ${IMAP_HOST:-}
+      IMAP_USER: ${IMAP_USER:-}
+      IMAP_PASS: ${IMAP_PASS:-}
+    volumes:
+      - acp-data:/data
+    shm_size: "1g"
+    restart: unless-stopped
+
+volumes:
+  acp-data:

@@ -1,0 +1,12 @@
+{
+  "name": "acp-mcp-reporter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tiny MCP server that lets Claude Cowork / Claude Desktop report task runs to the AI Control Plane.",
+  "bin": { "acp-mcp-reporter": "./index.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "zod": "^3.25.76"
+  }
+}

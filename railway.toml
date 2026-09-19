@@ -1,0 +1,11 @@
+# Railway service config. Attach a volume mounted at /data (Service -> Volumes)
+# so the browser profile, SQLite database and screenshots survive redeploys.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

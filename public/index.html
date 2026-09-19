@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Control Plane</title>
+  <meta name="description" content="One place to see and manage every AI agent across ChatGPT, Claude, Grok and your own platforms." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%235b8def'/%3E%3Ccircle cx='16' cy='16' r='5' fill='white'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="login" class="overlay hidden">
+    <form class="card login-card" id="login-form">
+      <h1>AI Control Plane</h1>
+      <p class="muted">Enter the admin token (ACP_ADMIN_TOKEN) to continue.</p>
+      <input type="password" id="login-token" placeholder="admin token" autocomplete="current-password" required />
+      <button class="btn primary" type="submit">Sign in</button>
+      <p class="error hidden" id="login-error">Invalid token.</p>
+    </form>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo"></span>
+      <span>AI Control Plane</span>
+    </div>
+    <div class="pills" id="pills"></div>
+    <div class="topbar-actions">
+      <button class="btn" id="btn-sync-all" title="Visit every platform's task page now">Sync all</button>
+      <a class="btn" id="btn-vnc" href="/vnc/" target="_blank" rel="noopener" title="Live browser screen: log in to platforms here">Browser screen</a>
+      <button class="btn ghost" id="btn-refresh" title="Refresh">↻</button>
+      <button class="btn ghost" id="btn-logout" title="Sign out">Sign out</button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section id="setup" class="card hidden">
+      <h2>Getting started</h2>
+      <ol class="steps">
+        <li><strong>Log in once.</strong> Open the <a href="/vnc/" target="_blank" rel="noopener">browser screen</a>, sign in to ChatGPT, Claude and Grok in the tabs you see. The session is kept on the persistent disk.</li>
+        <li><strong>Sync.</strong> Press <em>Sync all</em>. Each platform card gets a live screenshot, its session state, and any tasks the app exposes.</li>
+        <li><strong>Register the rest.</strong> Add agents that run elsewhere (Cowork, Muse, your own bots) with <em>Add agent</em>, and have them report runs to <code>POST /api/ingest</code>.</li>
+      </ol>
+    </section>
+
+    <section id="attention" class="card hidden">
+      <div class="section-head">
+        <h2>Needs attention</h2>
+        <button class="btn ghost small" id="btn-read-all">Mark all read</button>
+      </div>
+      <div id="attention-list" class="list"></div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>Platforms</h2>
+        <span class="muted" id="scheduler-status"></span>
+      </div>
+      <div id="platforms" class="grid"></div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>Agents</h2>
+        <div class="row">
+          <select id="agent-filter"><option value="">All platforms</option></select>
+          <button class="btn primary small" id="btn-add-agent">Add agent</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="agents-table">
+          <thead>
+            <tr><th>Agent</th><th>Platform</th><th>Schedule</th><th>Last run</th><th>Source</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted empty hidden" id="agents-empty">No agents yet. Sync a platform or add one manually.</p>
+    </section>
+
+    <div class="two-col">
+      <section class="card">
+        <div class="section-head"><h2>Recent runs</h2></div>
+        <div id="runs" class="list"></div>
+      </section>
+      <section class="card">
+        <div class="section-head"><h2>Events</h2></div>
+        <div id="events" class="list"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="section-head"><h2>Push runs from anywhere</h2></div>
+      <p class="muted">Any agent that can make an HTTP call can report in. Use the ingest token, not the admin token.</p>
+      <pre id="ingest-example"></pre>
+    </section>
+  </main>
+
+  <!-- Agent modal -->
+  <div id="agent-modal" class="overlay hidden">
+    <form class="card modal" id="agent-form">
+      <h2 id="agent-modal-title">Add agent</h2>
+      <input type="hidden" id="agent-id" />
+      <label>Name <input id="agent-name" required maxlength="200" /></label>
+      <label>Platform
+        <input id="agent-platform" list="platform-ids" required placeholder="chatgpt, claude, grok, muse, custom…" />
+        <datalist id="platform-ids"></datalist>
+      </label>
+      <label>Key <input id="agent-key" placeholder="stable id used by /api/ingest (auto from name)" /></label>
+      <label>Purpose <textarea id="agent-purpose" rows="2"></textarea></label>
+      <label>Schedule <input id="agent-schedule" placeholder="e.g. weekdays 09:00, every 6h, cron" /></label>
+      <label>Native link <input id="agent-url" placeholder="https://… where you manage it" /></label>
+      <label class="inline"><input type="checkbox" id="agent-enabled" checked /> Enabled</label>
+      <div class="row end">
+        <button class="btn ghost" type="button" data-close>Cancel</button>
+        <button class="btn primary" type="submit">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Platform settings drawer -->
+  <div id="platform-modal" class="overlay hidden">
+    <form class="card modal wide" id="platform-form">
+      <h2 id="platform-modal-title">Platform settings</h2>
+      <input type="hidden" id="pf-id" />
+      <div class="form-grid">
+        <label>Name <input id="pf-name" /></label>
+        <label>App URL <input id="pf-appUrl" placeholder="https://…" /></label>
+        <label>Tasks page URL <input id="pf-tasksUrl" placeholder="page that lists scheduled tasks / bots" /></label>
+        <label>Deep-link template <input id="pf-nativeUrlTemplate" placeholder="https://…/tasks/{{key}}" /></label>
+        <label>Session cookie name <input id="pf-sessionCookie" /></label>
+        <label>Cookie domain <input id="pf-cookieDomain" /></label>
+        <label>Logged-in selector <input id="pf-loggedInSelector" placeholder="optional CSS selector present only when signed in" /></label>
+        <label>Snapshot selector <input id="pf-snapshotSelector" placeholder="main" /></label>
+      </div>
+      <label>Capture URL patterns (regex, one per line) <textarea id="pf-capturePatterns" rows="3"></textarea></label>
+      <label>Login URL patterns (regex, one per line) <textarea id="pf-loginUrlPatterns" rows="2"></textarea></label>
+      <label>Custom actions (JSON) <textarea id="pf-actions" rows="5" placeholder='{"run_now": {"label": "Run now", "steps": [{"type":"goto","url":"{{native_url}}"},{"type":"click","selector":"text=Run now"}]}}'></textarea></label>
+      <label>Notes <input id="pf-notes" /></label>
+      <details id="pf-discovered">
+        <summary>Discovered JSON endpoints from the last sync</summary>
+        <p class="muted small">Endpoints marked ✓ matched the capture patterns. Add a pattern for the ones that carry your tasks.</p>
+        <div id="pf-discovered-list" class="list"></div>
+      </details>
+      <div class="row end">
+        <button class="btn ghost" type="button" id="pf-reset">Reset to defaults</button>
+        <button class="btn ghost" type="button" data-close>Cancel</button>
+        <button class="btn primary" type="submit">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Screenshot lightbox -->
+  <div id="shot-modal" class="overlay hidden" data-close-on-click>
+    <div class="shot-wrap"><img id="shot-img" alt="platform screenshot" /></div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
