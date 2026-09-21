@@ -3,7 +3,8 @@
 # then starts the control plane. With HEADLESS=true only the app starts.
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/data}"
+# A Railway volume announces where it is mounted; the app uses that path automatically.
+DATA_DIR="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 mkdir -p "$DATA_DIR"
 
 if [ "${HEADLESS:-false}" != "true" ]; then

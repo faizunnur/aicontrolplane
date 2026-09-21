@@ -17,7 +17,23 @@ function list(v: string | undefined): string[] {
 }
 
 const isProd = process.env.NODE_ENV === "production";
-const dataDir = path.resolve(process.env.DATA_DIR || "./data");
+
+/**
+ * Where state lives. A Railway volume announces its mount path; when one exists it always wins,
+ * so the volume can be mounted anywhere and a leftover DATA_DIR can't point the app elsewhere.
+ */
+function resolveDataDir(): string {
+  const volume = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+  const configured = process.env.DATA_DIR;
+  if (volume) {
+    if (configured && path.resolve(configured) !== path.resolve(volume)) {
+      console.warn(`[config] DATA_DIR=${configured} ignored: using the Railway volume at ${volume}`);
+    }
+    return path.resolve(volume);
+  }
+  return path.resolve(configured || (isProd ? "/data" : "./data"));
+}
+const dataDir = resolveDataDir();
 
 // Passwords and tokens: ACP_ADMIN_TOKEN / ACP_INGEST_TOKEN when set, otherwise created on first
 // visit and stored in the database (see auth.ts). Nothing is generated here anymore.
