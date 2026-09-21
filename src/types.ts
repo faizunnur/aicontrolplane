@@ -137,6 +137,8 @@ export interface PlatformConfig {
   cookieDomain: string;
   /** Optional CSS/text selector that only exists when logged in. */
   loggedInSelector: string;
+  /** Optional selector of a visible "Log in" / "Sign up" control that only exists when logged out. */
+  loggedOutSelector: string;
   /** Deep-link template for a discovered task; {{key}} is replaced with its id. Empty = tasksUrl. */
   nativeUrlTemplate: string;
   /** Text-only fallback: selector of the element whose innerText is snapshotted. */

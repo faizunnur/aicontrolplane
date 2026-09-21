@@ -300,6 +300,7 @@ const connectionPatch = z
     sendSelector: z.string().max(300),
     replySelector: z.string().max(500),
     busySelector: z.string().max(300),
+    loggedOutSelector: z.string().max(300),
     loginUrlPatterns: z.array(z.string().max(300)).max(30),
     sessionCookie: z.string().max(120),
     cookieDomain: z.string().max(120),
@@ -343,7 +344,7 @@ api.post("/connections/:id/connect", async (req, res) => {
   if (!p || !p.appUrl) return bad(res, "this AI has no web address to open", 404);
   if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
   await browser.withLock(() => browser.consolePage(p.id, p.appUrl));
-  res.json({ ok: true, screen: "/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify&reconnect=1" });
+  res.json({ ok: true, screen: "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1" });
 });
 /** After signing in: confirm the session and capture a screenshot. */
 api.post("/connections/:id/check", async (req, res) => {
@@ -657,6 +658,7 @@ const platformPatch = z
     sessionCookie: z.string().max(120),
     cookieDomain: z.string().max(120),
     loggedInSelector: z.string().max(300),
+    loggedOutSelector: z.string().max(300),
     nativeUrlTemplate: z.string().max(2000),
     snapshotSelector: z.string().max(300),
     notes: z.string().max(2000),

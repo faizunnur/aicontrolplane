@@ -20,6 +20,7 @@ import { compilePatterns } from "../platforms.js";
 import { sendAlert } from "../alerts.js";
 import type { PlatformConfig, SessionStatus } from "../types.js";
 import { normalizePayloads } from "./normalize.js";
+import { cleanError, detectLoginState } from "./session.js";
 
 const log = logger("collector");
 
@@ -230,18 +231,8 @@ async function collectOnce(p: PlatformConfig): Promise<SyncResult> {
   return { platform: p.id, ok: true, sessionStatus, finalUrl, agents, runs, captures: captured.length, discovered: discovered.size, message };
 }
 
-async function detectSession(p: PlatformConfig, page: Page, finalUrl: string, captured: Captured[], loginPatterns: RegExp[]): Promise<SessionStatus> {
-  if (loginPatterns.some((r) => r.test(finalUrl))) return "needs_login";
-  if (captured.some((c) => c.status === 401)) return "needs_login";
-  if (p.sessionCookie) {
-    const cookies = await browser.cookies(p.cookieDomain || undefined);
-    if (!cookies.some((c) => c.name === p.sessionCookie)) return "needs_login";
-  }
-  if (p.loggedInSelector) {
-    const n = await page.locator(p.loggedInSelector).count().catch(() => 0);
-    if (n === 0) return "needs_login";
-  }
-  return "logged_in";
+async function detectSession(p: PlatformConfig, page: Page, _finalUrl: string, captured: Captured[], _loginPatterns: RegExp[]): Promise<SessionStatus> {
+  return detectLoginState(p, page, { unauthorized: captured.some((c) => c.status === 401) });
 }
 
 async function screenshot(platformId: string, page: Page): Promise<string | null> {
@@ -269,13 +260,7 @@ async function textSnapshot(p: PlatformConfig, page: Page): Promise<string> {
   return "";
 }
 
-/** Playwright errors carry ANSI colour codes and multi-line call logs; keep the readable first line. */
-export function cleanError(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const stripped = raw.replace(/\u001b\[[0-9;]*m/g, "");
-  const first = stripped.split("\n").find((l) => l.trim()) ?? stripped;
-  return first.trim().slice(0, 500);
-}
+export { cleanError } from "./session.js";
 
 function tryParse(body: string): unknown {
   if (!body) return undefined;

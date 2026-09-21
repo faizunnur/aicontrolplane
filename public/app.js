@@ -356,7 +356,7 @@
   $("#btn-settings").addEventListener("click", () => openSettings("general"));
   async function fillAiForm(id) {
     const p = await api(`/platforms/${id}`);
-    for (const f of ["name", "purpose", "appUrl", "chatUrl", "tasksUrl", "composerSelector", "sendSelector", "replySelector", "busySelector", "sessionCookie", "cookieDomain"]) $(`#ai-${f}`).value = p[f] ?? "";
+    for (const f of ["name", "purpose", "appUrl", "chatUrl", "tasksUrl", "composerSelector", "sendSelector", "replySelector", "busySelector", "loggedOutSelector", "sessionCookie", "cookieDomain"]) $(`#ai-${f}`).value = p[f] ?? "";
     $("#ai-loginUrlPatterns").value = (p.loginUrlPatterns || []).join("\n");
     $("#ai-capturePatterns").value = (p.capturePatterns || []).join("\n");
     $("#ai-form").dataset.id = id;
@@ -367,7 +367,7 @@
     const id = e.target.dataset.id;
     const lines = (v) => v.split("\n").map((s) => s.trim()).filter(Boolean);
     const body = {};
-    for (const f of ["name", "purpose", "appUrl", "chatUrl", "tasksUrl", "composerSelector", "sendSelector", "replySelector", "busySelector", "sessionCookie", "cookieDomain"]) body[f] = $(`#ai-${f}`).value.trim();
+    for (const f of ["name", "purpose", "appUrl", "chatUrl", "tasksUrl", "composerSelector", "sendSelector", "replySelector", "busySelector", "loggedOutSelector", "sessionCookie", "cookieDomain"]) body[f] = $(`#ai-${f}`).value.trim();
     body.loginUrlPatterns = lines($("#ai-loginUrlPatterns").value);
     body.capturePatterns = lines($("#ai-capturePatterns").value);
     try { await api(`/connections/${id}`, { method: "PUT", body }); toast("Saved.", "ok"); await load(); } catch (err) { fail(err); }

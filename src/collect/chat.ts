@@ -4,9 +4,8 @@ import { browser } from "../browser/manager.js";
 import { config } from "../config.js";
 import { setPlatformState } from "../db.js";
 import { logger } from "../logger.js";
-import { compilePatterns } from "../platforms.js";
 import type { PlatformConfig } from "../types.js";
-import { cleanError } from "./collector.js";
+import { cleanError, detectLoginState } from "./session.js";
 
 const log = logger("chat");
 
@@ -54,8 +53,7 @@ async function chatOnce(p: PlatformConfig, text: string): Promise<ChatResult> {
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
   await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
 
-  const loginPatterns = compilePatterns(p.loginUrlPatterns);
-  if (loginPatterns.some((r) => r.test(page.url()))) {
+  if ((await detectLoginState(p, page)) === "needs_login") {
     setPlatformState(p.id, { session_status: "needs_login" });
     return { ok: false, error: `${p.name} needs you to sign in again`, url: page.url() };
   }
@@ -138,13 +136,8 @@ export async function checkConnection(p: PlatformConfig): Promise<"logged_in" | 
         await page.goto(p.appUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
       }
       await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
-      const loginPatterns = compilePatterns(p.loginUrlPatterns);
-      let status: "logged_in" | "needs_login" = "logged_in";
-      if (loginPatterns.some((r) => r.test(page.url()))) status = "needs_login";
-      else if (p.sessionCookie) {
-        const cookies = await browser.cookies(p.cookieDomain || undefined);
-        if (!cookies.some((c) => c.name === p.sessionCookie)) status = "needs_login";
-      }
+      await page.waitForTimeout(1_000); // let a single-page app finish deciding what to render
+      const status = (await detectLoginState(p, page)) === "needs_login" ? "needs_login" : "logged_in";
       await screenshot(p, page);
       setPlatformState(p.id, { session_status: status, last_error: null });
       if (status === "logged_in") void browser.backupSessions();
