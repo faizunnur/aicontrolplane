@@ -87,9 +87,16 @@
     <div class="panel screen-panel">
       <div class="panel-head">
         <h2 id="connect-title">Sign in</h2>
-        <button class="btn icon ghost" type="button" data-close aria-label="Close">✕</button>
+        <div class="row">
+          <div class="seg" role="group" aria-label="View">
+            <button class="seg-btn active" type="button" data-fit="scale">Fit</button>
+            <button class="seg-btn" type="button" data-fit="off">Actual size</button>
+          </div>
+          <a class="btn small ghost" id="connect-newtab" href="/vnc/" target="_blank" rel="noopener" title="Open the screen in its own tab (easier on a phone)">Open in new tab</a>
+          <button class="btn icon ghost" type="button" data-close aria-label="Close">✕</button>
+        </div>
       </div>
-      <p class="muted" id="connect-help">Sign in below exactly as you would on your laptop. When you can see your chats, press “I'm signed in”.</p>
+      <p class="muted small" id="connect-help">Sign in below exactly as you would on your laptop. Scroll with the mouse wheel over the page. When you can see your chats, press “I'm signed in”.</p>
       <iframe id="connect-frame" title="Browser screen" allow="clipboard-read; clipboard-write"></iframe>
       <div class="row end" id="connect-actions">
         <button class="btn ghost" type="button" data-close>Later</button>

@@ -23,7 +23,7 @@ ENV NODE_ENV=production \
     DISPLAY=:99 \
     HEADLESS=false \
     PORT=8080 \
-    SCREEN_GEOMETRY=1600x1000x24
+    SCREEN_GEOMETRY=1280x800x24
 
 EXPOSE 8080
 CMD ["bash", "docker/start.sh"]

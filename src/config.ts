@@ -57,7 +57,7 @@ export const config = {
     enabled: bool(process.env.BROWSER_ENABLED, true),
     headless: bool(process.env.HEADLESS, false),
     channel: process.env.BROWSER_CHANNEL || undefined,
-    windowSize: (process.env.SCREEN_GEOMETRY || "1600x1000x24").split("x").slice(0, 2).map(Number) as [number, number],
+    windowSize: (process.env.SCREEN_GEOMETRY || "1280x800x24").split("x").slice(0, 2).map(Number) as [number, number],
   },
 
   sync: {

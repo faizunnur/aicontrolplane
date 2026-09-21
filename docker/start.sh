@@ -14,7 +14,7 @@ if [ "${HEADLESS:-false}" != "true" ]; then
     if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
     sleep 0.2
   done
-  fluxbox >/dev/null 2>&1 &
+  # No window manager on purpose: Chromium then sits at 0,0 and fills the whole screen.
   x11vnc -display "$DISPLAY" -forever -shared -nopw -rfbport 5900 -localhost -quiet -noxdamage >/dev/null 2>&1 &
   websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 >/dev/null 2>&1 &
   echo "[start] virtual display + noVNC bridge up on 127.0.0.1:6080"

@@ -284,6 +284,21 @@
   });
 
   /* ---------- sign-in screen ---------- */
+  // scale = whole screen fits the panel; off = 1:1, pan by scrolling. Phones default to 1:1, otherwise Fit is unreadable.
+  let fitMode = window.innerWidth < 640 ? "off" : "scale";
+  try { fitMode = localStorage.getItem("acp-fit") || fitMode; } catch { /* keep default */ }
+  const screenUrl = (mode) => `/vnc/vnc.html?autoconnect=1&reconnect=1&path=vnc/websockify&resize=${mode}${mode === "off" ? "&view_clip=0" : ""}`;
+  function applyFit() {
+    for (const b of $$("[data-fit]")) b.classList.toggle("active", b.dataset.fit === fitMode);
+    if (!$("#connect-modal").hidden && $("#connect-frame").src !== "about:blank") $("#connect-frame").src = screenUrl(fitMode);
+  }
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-fit]");
+    if (!b) return;
+    fitMode = b.dataset.fit;
+    try { localStorage.setItem("acp-fit", fitMode); } catch { /* per-viewer only */ }
+    applyFit();
+  });
   async function openConnect(id, viewOnly = false) {
     const c = conn(id);
     if (!c) return;
@@ -292,11 +307,13 @@
     $("#connect-title").textContent = viewOnly ? c.name : `Sign in to ${c.name}`;
     $("#connect-help").hidden = viewOnly;
     $("#connect-done").hidden = viewOnly;
+    $("#connect-newtab").href = screenUrl("scale");
     $("#connect-frame").src = "about:blank";
     $("#connect-modal").hidden = false;
+    applyFit();
     try {
-      const r = await api(`/connections/${id}/connect`, { method: "POST", body: {} });
-      $("#connect-frame").src = r.screen;
+      await api(`/connections/${id}/connect`, { method: "POST", body: {} });
+      $("#connect-frame").src = screenUrl(fitMode);
     } catch (err) { fail(err); }
   }
   $("#connect-done").addEventListener("click", async (e) => {
