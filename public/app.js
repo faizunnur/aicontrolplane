@@ -1,11 +1,37 @@
-/* AI Control Plane dashboard. Vanilla JS, talks to /api. */
+/* AI Control Plane console. Vanilla JS over /api. */
 (() => {
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-  let state = { overview: null, agents: [], runs: [], events: [], platforms: [], messages: [] };
-  let refreshTimer = null;
+  let state = { overview: null, agents: [], runs: [], events: [], platforms: [], messages: [], stats: [] };
+
+  /* ---------- theme ---------- */
+  const THEMES = ["system", "light", "dark"];
+  const themeLabel = { system: "system", light: "light", dark: "dark" };
+  function applyTheme(t) {
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    else document.documentElement.removeAttribute("data-theme");
+    $("#btn-theme").title = `Theme: ${themeLabel[t]}`;
+    $("#btn-theme").textContent = t === "light" ? "☀" : t === "dark" ? "☾" : "◐";
+  }
+  let theme = "system";
+  try {
+    theme = localStorage.getItem("acp-theme") || "system";
+  } catch {
+    theme = "system";
+  }
+  applyTheme(theme);
+  $("#btn-theme").addEventListener("click", () => {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    try {
+      localStorage.setItem("acp-theme", theme);
+    } catch {
+      /* per-viewer convenience only */
+    }
+    applyTheme(theme);
+    renderChart();
+  });
 
   /* ---------- api ---------- */
   async function api(path, opts = {}) {
@@ -24,18 +50,30 @@
     return data;
   }
 
-  function toast(msg, bad = false) {
+  function toast(msg, kind = "") {
     const t = $("#toast");
     t.textContent = msg;
-    t.classList.toggle("bad", bad);
-    t.classList.remove("hidden");
+    t.className = `toast ${kind}`;
+    t.hidden = false;
     clearTimeout(t._h);
-    t._h = setTimeout(() => t.classList.add("hidden"), bad ? 6000 : 3500);
+    t._h = setTimeout(() => (t.hidden = true), kind === "bad" ? 7000 : 3500);
+  }
+  const fail = (err) => {
+    if (err && err.message !== "unauthorized") toast(err.message || String(err), "bad");
+  };
+  /** Run an async action with a spinner on the triggering button. */
+  async function busy(btn, fn) {
+    if (btn) btn.classList.add("busy");
+    try {
+      return await fn();
+    } finally {
+      if (btn) btn.classList.remove("busy");
+    }
   }
 
   /* ---------- login ---------- */
   function showLogin() {
-    $("#login").classList.remove("hidden");
+    $("#login").hidden = false;
     $("#login-token").focus();
   }
   $("#login-form").addEventListener("submit", async (e) => {
@@ -43,12 +81,12 @@
     const token = $("#login-token").value.trim();
     try {
       await api("/session", { method: "POST", body: { token } });
-      $("#login").classList.add("hidden");
-      $("#login-error").classList.add("hidden");
+      $("#login").hidden = true;
+      $("#login-error").hidden = true;
       $("#login-token").value = "";
       refresh();
     } catch {
-      $("#login-error").classList.remove("hidden");
+      $("#login-error").hidden = false;
     }
   });
   $("#btn-logout").addEventListener("click", async () => {
@@ -62,198 +100,252 @@
     const d = new Date(iso);
     if (isNaN(d)) return iso;
     const diff = (Date.now() - d.getTime()) / 1000;
-    if (diff < 60) return "just now";
+    if (diff < 45) return "just now";
     if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
     if (diff < 86400) return `${Math.floor(diff / 3600)} h ago`;
     if (diff < 86400 * 14) return `${Math.floor(diff / 86400)} d ago`;
     return d.toLocaleDateString();
   };
-  const sessionBadge = (s) =>
-    ({
-      logged_in: '<span class="badge ok">signed in</span>',
-      needs_login: '<span class="badge warn">login required</span>',
-      error: '<span class="badge bad">error</span>',
-    })[s] || '<span class="badge neutral">not synced</span>';
-  const runBadge = (s) =>
-    ({
-      success: '<span class="badge ok">success</span>',
-      failed: '<span class="badge bad">failed</span>',
-      needs_attention: '<span class="badge warn">needs attention</span>',
-      running: '<span class="badge info">running</span>',
-    })[s] || `<span class="badge neutral">${esc(s || "unknown")}</span>`;
-  const platformName = (id) => state.platforms.find((p) => p.id === id)?.name || id;
+  const abs = (iso) => (iso ? new Date(iso).toLocaleString() : "");
+  const when = (iso) => `<time class="meta" datetime="${esc(iso || "")}" title="${esc(abs(iso))}">${rel(iso)}</time>`;
+  const platformName = (id) => state.platforms.find((p) => p.id === id)?.name || id || "";
 
-  /* ---------- render ---------- */
-  function renderPills() {
-    const c = state.overview.counts;
-    $("#pills").innerHTML = [
-      `<span class="pill"><b>${c.agents}</b>agents</span>`,
-      `<span class="pill"><b>${c.runs24h}</b>runs · 24h</span>`,
-      `<span class="pill ${c.failed7d ? "bad" : ""}"><b>${c.failed7d}</b>failed · 7d</span>`,
-      `<span class="pill ${c.unreadEvents ? "warn" : ""}"><b>${c.unreadEvents}</b>unread</span>`,
-      `<span class="pill ${c.openMessages ? "warn" : ""}"><b>${c.openMessages || 0}</b>messages open</span>`,
-    ].join("");
+  const SESSION = {
+    logged_in: ["ok", "signed in"],
+    needs_login: ["warn", "login required"],
+    error: ["bad", "error"],
+    unknown: ["", "not synced"],
+  };
+  const sessionBadge = (s) => {
+    const [cls, label] = SESSION[s] || SESSION.unknown;
+    return `<span class="badge ${cls}">${label}</span>`;
+  };
+  const RUN = {
+    success: ["ok", "success"],
+    failed: ["bad", "failed"],
+    needs_attention: ["warn", "needs attention"],
+    running: ["run", "running"],
+  };
+  const runCls = (s) => (RUN[s] || ["", s])[0];
+  const runBadge = (s) => {
+    const [cls, label] = RUN[s] || ["", s || "unknown"];
+    return `<span class="badge ${cls}">${esc(label)}</span>`;
+  };
+  const MSG = {
+    needs_assignment: ["warn", "needs assignee"],
+    assigned: ["run", "assigned"],
+    delivered: ["run", "delivered"],
+    acknowledged: ["run", "acknowledged"],
+    done: ["ok", "done"],
+    failed: ["bad", "failed"],
+  };
+  const msgBadge = (s) => {
+    const [cls, label] = MSG[s] || ["", s];
+    return `<span class="badge ${cls}">${esc(label)}</span>`;
+  };
+
+  /* ---------- render: header ---------- */
+  function renderHealth() {
+    const syncable = state.platforms.filter((p) => p.syncable);
+    $("#health").innerHTML = syncable
+      .map((p) => {
+        const s = p.state.session_status;
+        const cls = s === "logged_in" ? "ok" : s === "needs_login" ? "warn" : s === "error" ? "bad" : "";
+        const label = (SESSION[s] || SESSION.unknown)[1];
+        return `<a href="#platform-${p.id}" title="${esc(p.name)}: ${label}, last sync ${rel(p.state.last_sync_at)}"><span class="dot ${cls}"></span>${esc(p.name)}</a>`;
+      })
+      .join("");
     const r = state.overview.router;
-    $("#router-status").textContent = r.llm ? `routing by ${r.model} · auto-assign at ${Math.round(r.autoThreshold * 100)}%` : `keyword routing · auto-assign at ${Math.round(r.autoThreshold * 100)}% · set ANTHROPIC_API_KEY for smarter routing`;
+    $("#router-status").textContent = r.llm ? `routed by ${r.model} · auto-assign from ${Math.round(r.autoThreshold * 100)}%` : `keyword routing · auto-assign from ${Math.round(r.autoThreshold * 100)}%`;
     const s = state.overview.scheduler;
-    $("#scheduler-status").textContent = !s.enabled
-      ? "auto-sync off"
-      : s.running
-        ? "syncing…"
-        : `auto-sync every ${s.intervalMin} min · next ${s.nextAt ? rel(s.nextAt).replace("ago", "").trim() || "soon" : "—"}`;
+    $("#scheduler-status").textContent = !s.enabled ? "auto-sync off" : s.running ? "syncing now…" : `auto-sync every ${s.intervalMin} min`;
     $("#btn-sync-all").disabled = !state.overview.browser.enabled || s.running;
-    $("#btn-vnc").classList.toggle("hidden", !state.overview.browser.enabled || state.overview.browser.headless);
+    $("#btn-vnc").hidden = !state.overview.browser.enabled || state.overview.browser.headless;
   }
 
+  /* ---------- render: summary ---------- */
+  function renderStats() {
+    const c = state.overview.counts;
+    const attention = state.overview.attention;
+    const open = (c.openMessages || 0) + c.unreadEvents + attention.sessions.length;
+    const tot = state.stats.reduce((n, d) => n + d.success + d.running + d.needs_attention + d.failed, 0);
+    const okRate = tot ? Math.round((state.stats.reduce((n, d) => n + d.success, 0) / tot) * 100) : null;
+    $("#stats").innerHTML = [
+      stat("Agents", c.agents, `${state.platforms.filter((p) => p.state.session_status === "logged_in").length} platforms signed in`),
+      stat("Runs · 24 h", c.runs24h, okRate === null ? "no runs in 14 days" : `${okRate}% succeeded over 14 d`),
+      stat("Failed · 7 d", c.failed7d, c.failed7d ? "open the attention list" : "nothing failed", c.failed7d ? "bad" : ""),
+      stat("Needs you", open, open ? `${c.openMessages || 0} messages · ${c.unreadEvents} events` : "all clear", open ? "warn" : ""),
+    ].join("");
+  }
+  const stat = (label, value, sub, cls = "") =>
+    `<div class="stat ${cls}"><span class="stat-label">${esc(label)}</span><span class="stat-value">${esc(value)}</span><span class="stat-sub">${esc(sub)}</span></div>`;
+
+  const SERIES = [
+    ["success", "Succeeded", "--ok"],
+    ["running", "Running", "--run"],
+    ["needs_attention", "Needs attention", "--warn"],
+    ["failed", "Failed", "--bad"],
+  ];
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  function renderChart() {
+    $("#chart-legend").innerHTML = SERIES.map(([, label, v]) => `<li><i style="background:${cssVar(v)}"></i>${label}</li>`).join("");
+    const days = state.stats;
+    const host = $("#chart");
+    const total = days.reduce((n, d) => n + d.success + d.running + d.needs_attention + d.failed, 0);
+    if (!days.length || !total) {
+      host.innerHTML = `<div class="chart-empty">No runs recorded in the last 14 days. Sync a platform or report a run.</div>`;
+      return;
+    }
+    const W = 640;
+    const H = 150;
+    const padL = 26;
+    const padR = 6;
+    const padT = 8;
+    const padB = 22;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const maxDay = Math.max(...days.map((d) => d.success + d.running + d.needs_attention + d.failed));
+    const yMax = Math.max(4, Math.ceil(maxDay / 2) * 2);
+    const slot = innerW / days.length;
+    const barW = Math.min(28, slot * 0.62);
+    const y = (v) => padT + innerH - (v / yMax) * innerH;
+    const ticks = [0, yMax / 2, yMax];
+    let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Stacked bars of runs per day by outcome">`;
+    for (const t of ticks) {
+      svg += `<line class="grid" x1="${padL}" x2="${W - padR}" y1="${y(t)}" y2="${y(t)}" />`;
+      svg += `<text class="axis" x="${padL - 6}" y="${y(t) + 3.5}" text-anchor="end">${t}</text>`;
+    }
+    days.forEach((d, i) => {
+      const x = padL + i * slot + (slot - barW) / 2;
+      let acc = 0;
+      let bars = "";
+      const segs = SERIES.map(([k, , v]) => [k, d[k], cssVar(v)]).filter(([, n]) => n > 0);
+      segs.forEach(([k, n, color], si) => {
+        const y1 = y(acc + n);
+        const y0 = y(acc);
+        const h = Math.max(0, y0 - y1 - (si < segs.length - 1 ? 2 : 0));
+        const top = si === segs.length - 1;
+        bars += top
+          ? `<path fill="${color}" d="M${x},${y0} v${-(h - 3)} a3,3 0 0 1 3,-3 h${barW - 6} a3,3 0 0 1 3,3 v${h - 3} z"><title>${k}</title></path>`
+          : `<rect fill="${color}" x="${x}" y="${y1}" width="${barW}" height="${h}" />`;
+        acc += n;
+      });
+      const date = new Date(d.day + "T00:00:00Z");
+      const label = i === days.length - 1 ? "today" : i % 2 === 0 ? String(date.getUTCDate()) : "";
+      svg += `<g class="col" data-i="${i}"><rect class="hit" x="${padL + i * slot}" y="${padT}" width="${slot}" height="${innerH}" />${bars}
+        ${label ? `<text class="axis" x="${padL + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle">${label}</text>` : ""}</g>`;
+    });
+    svg += `<line class="grid" x1="${padL}" x2="${W - padR}" y1="${y(0)}" y2="${y(0)}" style="stroke:var(--border-strong)" /></svg>`;
+    host.innerHTML = svg;
+
+    const tip = $("#chart-tip");
+    host.onmousemove = (e) => {
+      const col = e.target.closest(".col");
+      if (!col) {
+        tip.hidden = true;
+        return;
+      }
+      const d = days[Number(col.dataset.i)];
+      const sum = d.success + d.running + d.needs_attention + d.failed;
+      tip.innerHTML =
+        `<b>${new Date(d.day + "T00:00:00Z").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" })} · ${sum} run${sum === 1 ? "" : "s"}</b>` +
+        SERIES.map(([k, label, v]) => `<div class="tr"><span><i style="background:${cssVar(v)}"></i>${label}</span><span>${d[k]}</span></div>`).join("");
+      tip.hidden = false;
+      const fig = host.closest(".chart").getBoundingClientRect();
+      const tw = tip.offsetWidth || 150;
+      let left = e.clientX - fig.left + 14;
+      if (left + tw > fig.width - 8) left = e.clientX - fig.left - tw - 14;
+      tip.style.left = `${Math.max(4, left)}px`;
+      tip.style.top = `${Math.max(4, e.clientY - fig.top - 10)}px`;
+    };
+    host.onmouseleave = () => (tip.hidden = true);
+  }
+
+  /* ---------- render: setup stepper ---------- */
   function renderSetup() {
-    const anyLoggedIn = state.platforms.some((p) => p.state.session_status === "logged_in");
-    $("#setup").classList.toggle("hidden", anyLoggedIn || state.agents.length > 0);
+    const signedIn = state.platforms.some((p) => p.state.session_status === "logged_in");
+    const synced = state.platforms.some((p) => p.state.last_sync_at);
+    const registered = state.agents.length > 0;
+    const allDone = signedIn && synced && registered;
+    $("#setup").hidden = allDone;
+    if (allDone) return;
+    const steps = [
+      [signedIn, "Sign in once", state.overview.browser.enabled && !state.overview.browser.headless ? 'Open the <a href="/vnc/" target="_blank" rel="noopener">browser screen</a> and log in to each platform tab. Sessions persist on disk.' : "Run with the browser enabled to mirror web platforms, or register agents by hand."],
+      [synced, "Sync", "Press <em>Sync all</em>. Each platform gets a live screenshot, its session state, and any tasks it exposes."],
+      [registered, "Register the rest", "Add agents that run elsewhere with <em>Add agent</em>, or have them report in with one HTTP call."],
+    ];
+    $("#stepper").innerHTML = steps
+      .map(([done, title, sub], i) => `<li class="${done ? "done" : ""}"><span class="step-n">${done ? "✓" : i + 1}</span><div><div class="step-title">${title}</div><div class="step-sub">${sub}</div></div></li>`)
+      .join("");
   }
 
+  /* ---------- render: attention ---------- */
   function renderAttention() {
     const a = state.overview.attention;
     const items = [];
     for (const s of a.sessions) {
       items.push(
-        `<div class="item unread"><div class="body"><div class="title">${esc(s.name)} needs login</div><div class="sub">Open the browser screen and sign in. Sync afterwards.</div></div>
-         <div class="actions"><a class="btn small" href="/vnc/" target="_blank" rel="noopener">Browser screen</a></div></div>`,
+        `<div class="rowitem s-warn"><div class="body"><div class="title">${esc(s.name)} needs login</div><div class="sub">Open the browser screen, sign in, then sync.</div></div>
+         <div class="actions"><a class="btn small" href="/vnc/" target="_blank" rel="noopener">Browser screen</a><button class="btn small ghost" data-sync="${esc(s.platform)}">Sync</button></div></div>`,
       );
     }
-    for (const r of a.runs) {
+    for (const m of a.messages || []) {
+      const cls = m.status === "failed" ? "s-bad" : "s-accent";
       items.push(
-        `<div class="item"><div class="body"><div class="title">${esc(r.agent_name)} ${runBadge(r.status)}</div><div class="sub">${esc(r.summary || "")} · ${esc(platformName(r.platform))} · ${rel(r.finished_at || r.started_at || r.created_at)}</div></div>
+        `<div class="rowitem ${cls}"><div class="body"><div class="title">${m.status === "failed" ? "Instruction could not be delivered" : "Instruction needs an assignee"} ${msgBadge(m.status)}</div>
+         <div class="sub">“${esc(m.text.slice(0, 140))}”${m.error ? ` · ${esc(m.error)}` : ""}</div></div>
+         <div class="actions"><a class="btn small" href="#message-${m.id}">Open</a></div></div>`,
+      );
+    }
+    // A failed run that already raised an unread event is shown once, as the dismissible event.
+    const covered = new Set(a.events.filter((e) => e.kind === "run").map((e) => e.title));
+    for (const r of a.runs) {
+      if (covered.has(`${r.agent_name}: ${r.status.replace("_", " ")}`)) continue;
+      items.push(
+        `<div class="rowitem ${runCls(r.status) === "bad" ? "s-bad" : "s-warn"}"><div class="body"><div class="title">${esc(r.agent_name)} ${runBadge(r.status)}</div><div class="sub">${esc(r.summary || "")} · ${esc(platformName(r.platform))} · ${when(r.finished_at || r.started_at || r.created_at)}</div></div>
          <div class="actions">${r.output_url || r.agent_native_url ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(r.output_url || r.agent_native_url)}">Open</a>` : ""}</div></div>`,
       );
     }
     for (const e of a.events) {
+      if (e.kind === "message") continue;
       items.push(
-        `<div class="item unread"><div class="body"><div class="title">${esc(e.title)}</div><div class="sub">${esc((e.body || "").slice(0, 200))} · ${esc(platformName(e.platform || ""))} · ${rel(e.occurred_at)}</div></div>
-         <div class="actions">${e.link ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(e.link)}">Open</a>` : ""}<button class="btn small" data-read="${e.id}">Read</button></div></div>`,
+        `<div class="rowitem ${e.kind === "session" ? "s-warn" : e.kind === "sync_error" ? "s-bad" : "s-accent"}"><div class="body"><div class="title">${esc(e.title)}</div><div class="sub">${esc((e.body || "").slice(0, 160))} · ${esc(platformName(e.platform || ""))} · ${when(e.occurred_at)}</div></div>
+         <div class="actions">${e.link ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(e.link)}">Open</a>` : ""}<button class="btn small ghost" data-read="${e.id}">Dismiss</button></div></div>`,
       );
     }
-    $("#attention").classList.toggle("hidden", items.length === 0);
-    $("#attention-list").innerHTML = items.join("");
+    $("#attention-count").textContent = items.length ? items.length : "";
+    $("#btn-read-all").hidden = !a.events.length;
+    $("#attention-list").innerHTML = items.join("") || `<p class="empty">Nothing needs you right now.</p>`;
   }
 
-  function renderPlatforms() {
-    const html = state.platforms.map((p) => {
-      const s = p.state;
-      const shot = p.hasScreenshot
-        ? `<img class="shot" data-shot="${p.id}" src="/api/platforms/${p.id}/screenshot.png?t=${encodeURIComponent(s.last_sync_at || "")}" alt="${esc(p.name)} screenshot" loading="lazy" />`
-        : `<div class="shot-placeholder">${p.syncable ? "No screenshot yet. Press Sync." : "Registry-only platform. Set a tasks URL in settings to sync it through the browser."}</div>`;
-      const actions = p.actions
-        .filter((a) => a.id !== "sync")
-        .map((a) => `<button class="btn small" data-action="${a.id}" data-platform="${p.id}" title="${esc(a.description)}">${esc(a.label)}</button>`)
-        .join("");
-      return `<div class="card platform" data-platform-card="${p.id}">
-        <div class="platform-head"><h3>${esc(p.name)}</h3>${p.syncable ? sessionBadge(s.session_status) : '<span class="badge neutral">registry</span>'}</div>
-        ${shot}
-        <div class="platform-meta">
-          <span>${p.agents} agent${p.agents === 1 ? "" : "s"} · last sync ${rel(s.last_sync_at)}${s.last_error ? ` · <span class="error">${esc(s.last_error)}</span>` : ""}</span>
-          ${p.notes ? `<span>${esc(p.notes)}</span>` : ""}
-        </div>
-        <div class="row">
-          ${p.syncable ? `<button class="btn small primary" data-sync="${p.id}">Sync</button>` : ""}
-          ${actions}
-          <button class="btn small ghost" data-settings="${p.id}">Settings</button>
-        </div>
-      </div>`;
-    });
-    $("#platforms").innerHTML = html.join("");
-  }
-
-  function renderAgents() {
-    const filter = $("#agent-filter").value;
-    const rows = state.agents.filter((a) => !filter || a.platform === filter);
-    $("#agents-empty").classList.toggle("hidden", rows.length > 0);
-    const platformActions = (a) => {
-      const p = state.platforms.find((x) => x.id === a.platform);
-      if (!p) return "";
-      return p.actions
-        .filter((x) => x.id !== "sync" && x.id !== "screenshot")
-        .map((x) => `<button class="btn small ghost" data-agent-action="${x.id}" data-agent="${a.id}" data-platform="${p.id}" title="${esc(x.description)}">${esc(x.label)}</button>`)
-        .join("");
-    };
-    $("#agents-table tbody").innerHTML = rows
-      .map(
-        (a) => `<tr>
-          <td><div>${esc(a.name)}${a.enabled ? "" : ' <span class="badge neutral">disabled</span>'}${a.status ? ` <span class="badge neutral">${esc(a.status)}</span>` : ""}</div>${a.purpose ? `<div class="sub">${esc(a.purpose.slice(0, 140))}</div>` : ""}</td>
-          <td>${esc(platformName(a.platform))}</td>
-          <td>${esc(a.schedule || "—")}</td>
-          <td>${a.last_run ? `${runBadge(a.last_run.status)}<div class="sub">${rel(a.last_run.finished_at || a.last_run.started_at || a.last_run.created_at)}${a.last_run.summary ? " · " + esc(a.last_run.summary.slice(0, 80)) : ""}</div>` : '<span class="sub">no runs</span>'}</td>
-          <td><span class="badge neutral">${esc(a.source)}</span></td>
-          <td class="actions">
-            ${a.native_url ? `<a class="btn small ghost" target="_blank" rel="noopener" href="${esc(a.native_url)}">Link</a>` : ""}
-            ${platformActions(a)}
-            <button class="btn small ghost" data-edit="${a.id}">Edit</button>
-            <button class="btn small ghost danger" data-delete="${a.id}">Delete</button>
-          </td>
-        </tr>`,
-      )
-      .join("");
-  }
-
-  function renderRuns() {
-    $("#runs").innerHTML =
-      state.runs
-        .slice(0, 25)
-        .map(
-          (r) => `<div class="item"><div class="body"><div class="title">${esc(r.agent_name)} ${runBadge(r.status)}</div>
-            <div class="sub">${esc(platformName(r.platform))} · ${rel(r.finished_at || r.started_at || r.created_at)} · via ${esc(r.source)}${r.summary ? "<br/>" + esc(r.summary.slice(0, 220)) : ""}</div></div>
-            <div class="actions">${r.output_url ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(r.output_url)}">Output</a>` : ""}</div></div>`,
-        )
-        .join("") || '<p class="muted">No runs recorded yet.</p>';
-  }
-
-  function renderEvents() {
-    $("#events").innerHTML =
-      state.events
-        .slice(0, 25)
-        .map(
-          (e) => `<div class="item ${e.read ? "" : "unread"}"><div class="body"><div class="title">${esc(e.title)}</div>
-            <div class="sub">${esc(platformName(e.platform || ""))} · ${esc(e.kind)} · ${rel(e.occurred_at)}${e.body ? "<br/>" + esc(e.body.slice(0, 220)) : ""}</div></div>
-            <div class="actions">${e.link ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(e.link)}">Open</a>` : ""}${e.read ? "" : `<button class="btn small ghost" data-read="${e.id}">Read</button>`}</div></div>`,
-        )
-        .join("") || '<p class="muted">No events yet. Failed runs, login prompts and ingested emails show up here.</p>';
-  }
-
-  const msgBadge = (s) =>
-    ({
-      needs_assignment: '<span class="badge warn">needs assignee</span>',
-      assigned: '<span class="badge info">assigned</span>',
-      delivered: '<span class="badge info">delivered</span>',
-      acknowledged: '<span class="badge info">acknowledged</span>',
-      done: '<span class="badge ok">done</span>',
-      failed: '<span class="badge bad">failed</span>',
-    })[s] || `<span class="badge neutral">${esc(s)}</span>`;
-
+  /* ---------- render: messages ---------- */
   function renderMessages() {
     const sel = $("#message-agent");
     const cur = sel.value;
-    sel.innerHTML =
-      '<option value="">Auto-route</option>' +
-      state.agents.filter((a) => a.enabled).map((a) => `<option value="${a.id}">${esc(a.name)} · ${esc(platformName(a.platform))}</option>`).join("");
+    const agentOptions = state.agents.filter((a) => a.enabled).map((a) => `<option value="${a.id}">${esc(a.name)} · ${esc(platformName(a.platform))}</option>`).join("");
+    sel.innerHTML = '<option value="">Auto-route</option>' + agentOptions;
     sel.value = cur;
 
     $("#messages").innerHTML =
       state.messages
-        .slice(0, 20)
+        .slice(0, 15)
         .map((m) => {
+          const cls = { needs_assignment: "s-warn", failed: "s-bad", done: "s-ok" }[m.status] || "s-run";
           const who = m.agent_name ? `${esc(m.agent_name)} · ${esc(platformName(m.agent_platform))}` : "unassigned";
-          const route = m.routing ? `<span class="badge route" title="${esc(m.routing.reason || "")}">${esc(m.routing.method)}${m.routing.confidence != null ? " " + Math.round(m.routing.confidence * 100) + "%" : ""}</span>` : "";
-          const hint = m.delivery_mode ? ` · ${esc(m.delivery_hint || m.delivery_mode)}` : "";
+          const route = m.routing ? `<span class="badge plain mono" title="${esc(m.routing.reason || "")}">${esc(m.routing.method)}${m.routing.confidence != null ? ` ${Math.round(m.routing.confidence * 100)}%` : ""}</span>` : "";
           let extra = "";
           if (m.status === "needs_assignment") {
             const sugg = (m.suggestions || [])
-              .map((s) => `<button class="btn small" data-assign="${m.id}" data-agent="${s.agent_id}" title="${esc(s.reason)}">Assign to ${esc(s.name)} <span class="muted">(${Math.round(s.score * 100)}%)</span></button>`)
+              .map((s) => `<button class="btn small" data-assign="${m.id}" data-agent="${s.agent_id}" title="${esc(s.reason)}">→ ${esc(s.name)} <b>${Math.round(s.score * 100)}%</b></button>`)
               .join("");
-            const newAgent = m.routing?.new_agent
-              ? `<button class="btn small ghost" data-new-agent="${m.id}" title="Create an agent for this">Create agent on ${esc(platformName(m.routing.new_agent.platform))}</button>`
-              : "";
-            const pick = `<select class="small" data-pick="${m.id}"><option value="">Pick any agent…</option>${state.agents.filter((a) => a.enabled).map((a) => `<option value="${a.id}">${esc(a.name)} · ${esc(platformName(a.platform))}</option>`).join("")}</select>`;
+            const newAgent = m.routing?.new_agent ? `<button class="btn small ghost" data-new-agent="${m.id}">Create agent on ${esc(platformName(m.routing.new_agent.platform))}</button>` : "";
+            const pick = `<select data-pick="${m.id}" aria-label="Assign to"><option value="">Assign to…</option>${agentOptions}</select>`;
             extra = `<div class="sub">${esc(m.routing?.reason || "")}</div><div class="suggest">${sugg}${newAgent}${pick}</div>`;
           } else if (m.error) {
-            extra = `<div class="sub error">${esc(m.error)}</div>`;
+            extra = `<div class="sub" style="color:var(--bad)">${esc(m.error)}</div>`;
+          } else if (m.delivery_hint && m.status !== "done") {
+            extra = `<div class="sub">${esc(m.delivery_hint)}</div>`;
           }
           if (m.response) extra += `<div class="response">${esc(m.response)}</div>`;
           const manual = m.delivery_mode === "manual" && !["done", "failed"].includes(m.status);
@@ -261,18 +353,114 @@
             manual ? `<button class="btn small" data-copy="${m.id}">Copy</button>` : "",
             manual && m.agent_native_url ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(m.agent_native_url)}">Open</a>` : "",
             m.status === "failed" && m.agent_id ? `<button class="btn small" data-msg-retry="${m.id}">Retry</button>` : "",
-            !["done"].includes(m.status) && m.agent_id ? `<button class="btn small ghost" data-msg-done="${m.id}">Mark done</button>` : "",
-            m.status !== "needs_assignment" ? `<button class="btn small ghost" data-msg-reroute="${m.id}" title="Clear the assignment and route again">Reroute</button>` : "",
-            `<button class="btn small ghost danger" data-msg-delete="${m.id}">Delete</button>`,
+            m.status !== "done" && m.agent_id ? `<button class="btn small ghost" data-msg-done="${m.id}">Done</button>` : "",
+            `<details class="menu"><summary class="btn small ghost icon" aria-label="More">…</summary><div class="menu-list">
+               ${m.status !== "needs_assignment" ? `<button class="btn small ghost" data-msg-reroute="${m.id}">Reroute</button>` : ""}
+               <button class="btn small ghost danger" data-msg-delete="${m.id}">Delete</button></div></details>`,
           ].join("");
-          return `<div class="item msg ${m.status === "needs_assignment" ? "unread" : ""}"><div class="body">
-              <div class="title">${msgBadge(m.status)} ${route} <span class="muted small">${rel(m.created_at)} · ${who}${hint}</span></div>
+          return `<div class="rowitem ${cls}" id="message-${m.id}"><div class="body">
+              <div class="title">${msgBadge(m.status)} ${route} <span class="meta">${when(m.created_at)}</span><span class="meta">${who}</span></div>
               <div class="text">${esc(m.text)}</div>${extra}</div>
             <div class="actions">${actions}</div></div>`;
         })
-        .join("") || '<p class="muted">No messages yet. Type an instruction above; it is routed to the responsible agent or you get suggestions.</p>';
+        .join("") || `<p class="empty">No messages yet. Type an instruction above; it goes to the responsible agent, or you get suggestions.</p>`;
   }
 
+  /* ---------- render: platforms ---------- */
+  function renderPlatforms() {
+    $("#platforms").innerHTML = state.platforms
+      .map((p) => {
+        const s = p.state;
+        const shot = p.hasScreenshot
+          ? `<div class="tile-shot"><img data-shot="${p.id}" src="/api/platforms/${p.id}/screenshot.png?t=${encodeURIComponent(s.last_sync_at || "")}" alt="${esc(p.name)} task page" loading="lazy" /><span class="stamp">${rel(s.last_sync_at)}</span></div>`
+          : p.syncable
+            ? `<div class="tile-shot"><div class="placeholder">No screenshot yet. Sync to capture the task page.</div></div>`
+            : "";
+        const extras = p.actions
+          .filter((a) => a.id !== "sync" && a.id !== "open" && a.id !== "screenshot")
+          .map((a) => `<button class="btn small" data-action="${a.id}" data-platform="${p.id}" title="${esc(a.description)}">${esc(a.label)}</button>`)
+          .join("");
+        return `<article class="tile ${p.syncable ? "" : "compact"}" id="platform-${p.id}">
+          <div class="tile-head"><h3>${esc(p.name)}</h3>${p.syncable ? sessionBadge(s.session_status) : '<span class="badge plain">registry only</span>'}</div>
+          ${shot}
+          <div class="tile-meta">
+            <span>${p.agents} agent${p.agents === 1 ? "" : "s"}${s.last_error ? ` · <span class="error">${esc(s.last_error)}</span>` : ""}</span>
+            ${p.notes ? `<span>${esc(p.notes)}</span>` : ""}
+          </div>
+          <div class="tile-actions">
+            ${p.syncable ? `<button class="btn small primary" data-sync="${p.id}">Sync</button>` : ""}
+            ${p.tasksUrl || p.appUrl ? `<button class="btn small" data-action="open" data-platform="${p.id}" title="Bring this platform up on the browser screen">Open</button>` : ""}
+            ${extras}
+            <details class="menu"><summary class="btn small ghost">More</summary><div class="menu-list">
+              <button class="btn small ghost" data-action="screenshot" data-platform="${p.id}">Refresh screenshot</button>
+              <button class="btn small ghost" data-settings="${p.id}">Settings</button></div></details>
+          </div>
+        </article>`;
+      })
+      .join("");
+  }
+
+  /* ---------- render: agents ---------- */
+  function renderAgents() {
+    const filter = $("#agent-filter").value;
+    const rows = state.agents.filter((a) => !filter || a.platform === filter);
+    $("#agents-count").textContent = state.agents.length || "";
+    $("#agents-empty").hidden = rows.length > 0;
+    const history = (a) => {
+      const list = (a.recent_statuses || []).slice(0, 6).reverse();
+      const pad = Array(Math.max(0, 6 - list.length)).fill("");
+      return `<span class="history" title="Last ${list.length} runs, oldest to newest">${[...pad, ...list].map((s) => `<i class="${runCls(s)}"></i>`).join("")}</span>`;
+    };
+    const extras = (a) => {
+      const p = state.platforms.find((x) => x.id === a.platform);
+      return (p?.actions || [])
+        .filter((x) => x.id !== "sync" && x.id !== "screenshot")
+        .map((x) => `<button class="btn small ghost" data-agent-action="${x.id}" data-agent="${a.id}" data-platform="${p.id}" title="${esc(x.description)}">${esc(x.label)}</button>`)
+        .join("");
+    };
+    $("#agents-table tbody").innerHTML = rows
+      .map(
+        (a) => `<tr>
+          <td><div class="agent-name">${esc(a.name)}${a.enabled ? "" : '<span class="badge plain">disabled</span>'}${a.status && a.status !== "active" ? `<span class="badge plain">${esc(a.status)}</span>` : ""}</div>${a.purpose ? `<div class="sub">${esc(a.purpose.slice(0, 120))}</div>` : `<div class="sub mono">${esc(a.key)}</div>`}</td>
+          <td>${esc(platformName(a.platform))}<div class="sub">${esc(a.source)}</div></td>
+          <td class="mono">${esc(a.schedule || "—")}</td>
+          <td>${history(a)}</td>
+          <td>${a.last_run ? `${runBadge(a.last_run.status)}<div class="sub">${rel(a.last_run.finished_at || a.last_run.started_at || a.last_run.created_at)}${a.last_run.summary ? " · " + esc(a.last_run.summary.slice(0, 70)) : ""}</div>` : '<span class="sub">no runs yet</span>'}</td>
+          <td class="actions"><div class="row">
+            ${a.native_url ? `<a class="btn small ghost" target="_blank" rel="noopener" href="${esc(a.native_url)}">Link</a>` : ""}
+            <button class="btn small ghost" data-edit="${a.id}">Edit</button>
+            <details class="menu"><summary class="btn small ghost icon" aria-label="More">…</summary><div class="menu-list">
+              ${extras(a)}
+              <button class="btn small ghost danger" data-delete="${a.id}">Delete</button></div></details>
+          </div></td>
+        </tr>`,
+      )
+      .join("");
+  }
+
+  /* ---------- render: activity ---------- */
+  function renderRuns() {
+    $("#runs").innerHTML =
+      state.runs
+        .slice(0, 10)
+        .map(
+          (r) => `<div class="rowitem s-${runCls(r.status) || "neutral"}"><div class="body"><div class="title">${esc(r.agent_name)} ${runBadge(r.status)}</div>
+            <div class="sub">${esc(platformName(r.platform))} · via ${esc(r.source)} · ${when(r.finished_at || r.started_at || r.created_at)}${r.summary ? "<br/>" + esc(r.summary.slice(0, 200)) : ""}</div></div>
+            <div class="actions">${r.output_url ? `<a class="btn small ghost" target="_blank" rel="noopener" href="${esc(r.output_url)}">Output</a>` : ""}</div></div>`,
+        )
+        .join("") || '<p class="empty">No runs recorded yet.</p>';
+  }
+  function renderEvents() {
+    $("#events").innerHTML =
+      state.events
+        .slice(0, 10)
+        .map(
+          (e) => `<div class="rowitem ${e.read ? "" : e.kind === "session" ? "s-warn" : e.kind === "sync_error" || e.kind === "run" ? "s-bad" : "s-accent"}"><div class="body"><div class="title">${esc(e.title)}</div>
+            <div class="sub">${esc(platformName(e.platform || ""))} · ${esc(e.kind)} · ${when(e.occurred_at)}${e.body ? "<br/>" + esc(e.body.slice(0, 200)) : ""}</div></div>
+            <div class="actions">${e.link ? `<a class="btn small ghost" target="_blank" rel="noopener" href="${esc(e.link)}">Open</a>` : ""}${e.read ? "" : `<button class="btn small ghost" data-read="${e.id}">Dismiss</button>`}</div></div>`,
+        )
+        .join("") || '<p class="empty">No events yet. Failed runs, login prompts and ingested emails show up here.</p>';
+  }
   function renderIngestExample() {
     const base = state.overview.publicUrl || window.location.origin;
     $("#ingest-example").textContent = `curl -X POST ${base}/api/ingest \\
@@ -283,7 +471,6 @@
     "run":   { "status": "success", "summary": "Sent digest with 12 items", "output_url": "https://..." }
   }'`;
   }
-
   function renderFilters() {
     const sel = $("#agent-filter");
     const cur = sel.value;
@@ -294,18 +481,20 @@
 
   async function refresh() {
     try {
-      // One cheap call first so an expired session shows the login overlay without a burst of 401s.
       await api("/session");
-      const [overview, agents, runs, events, messages] = await Promise.all([
+      const [overview, agents, runs, events, messages, stats] = await Promise.all([
         api("/overview"),
         api("/agents?all=1"),
         api("/runs?limit=40"),
         api("/events?limit=40"),
         api("/messages?limit=30"),
+        api("/stats/runs?days=14"),
       ]);
-      state = { overview, agents, runs, events, messages, platforms: overview.platforms };
+      state = { overview, agents, runs, events, messages, stats, platforms: overview.platforms };
       renderFilters();
-      renderPills();
+      renderHealth();
+      renderStats();
+      renderChart();
       renderSetup();
       renderAttention();
       renderMessages();
@@ -315,46 +504,51 @@
       renderEvents();
       renderIngestExample();
     } catch (err) {
-      if (err.message !== "unauthorized") toast(err.message, true);
+      fail(err);
     }
   }
 
-  /* ---------- actions ---------- */
+  /* ---------- interactions ---------- */
   document.addEventListener("click", async (e) => {
+    // close open menus when clicking elsewhere
+    for (const d of $$("details.menu[open]")) if (!d.contains(e.target)) d.removeAttribute("open");
     const t = e.target.closest(
       "[data-sync],[data-action],[data-settings],[data-shot],[data-read],[data-edit],[data-delete],[data-agent-action],[data-close],[data-assign],[data-copy],[data-msg-retry],[data-msg-done],[data-msg-reroute],[data-msg-delete],[data-new-agent]",
     );
     if (!t) {
       const ov = e.target.closest("[data-close-on-click]");
-      if (ov && e.target === ov) ov.classList.add("hidden");
+      if (ov && e.target === ov) ov.hidden = true;
       return;
     }
+    const btn = t.tagName === "BUTTON" ? t : null;
     try {
       if (t.dataset.close !== undefined) {
-        t.closest(".overlay").classList.add("hidden");
+        t.closest(".overlay").hidden = true;
       } else if (t.dataset.sync) {
-        t.disabled = true;
-        toast(`Syncing ${platformName(t.dataset.sync)}…`);
-        const r = await api(`/platforms/${t.dataset.sync}/sync`, { method: "POST" });
-        toast(`${platformName(t.dataset.sync)}: ${r.message || (r.ok ? "synced" : "failed")}`, !r.ok);
+        await busy(btn, async () => {
+          const r = await api(`/platforms/${t.dataset.sync}/sync`, { method: "POST" });
+          toast(`${platformName(t.dataset.sync)}: ${r.message || (r.ok ? "synced" : "sync failed")}`, r.ok ? "ok" : "bad");
+        });
         await refresh();
       } else if (t.dataset.action) {
-        t.disabled = true;
-        const r = await api(`/platforms/${t.dataset.platform}/actions/${t.dataset.action}`, { method: "POST", body: {} });
-        toast(r.message, !r.ok);
-        if (t.dataset.action === "open" && r.ok && !state.overview.browser.headless) window.open("/vnc/", "_blank", "noopener");
+        await busy(btn, async () => {
+          const r = await api(`/platforms/${t.dataset.platform}/actions/${t.dataset.action}`, { method: "POST", body: {} });
+          toast(r.message, r.ok ? "ok" : "bad");
+          if (t.dataset.action === "open" && r.ok && !state.overview.browser.headless) window.open("/vnc/", "_blank", "noopener");
+        });
         await refresh();
       } else if (t.dataset.agentAction) {
-        t.disabled = true;
-        const r = await api(`/platforms/${t.dataset.platform}/actions/${t.dataset.agentAction}`, { method: "POST", body: { agent_id: Number(t.dataset.agent) } });
-        toast(r.message, !r.ok);
-        if (t.dataset.agentAction === "open" && r.ok && !state.overview.browser.headless) window.open("/vnc/", "_blank", "noopener");
+        await busy(btn, async () => {
+          const r = await api(`/platforms/${t.dataset.platform}/actions/${t.dataset.agentAction}`, { method: "POST", body: { agent_id: Number(t.dataset.agent) } });
+          toast(r.message, r.ok ? "ok" : "bad");
+          if (t.dataset.agentAction === "open" && r.ok && !state.overview.browser.headless) window.open("/vnc/", "_blank", "noopener");
+        });
         await refresh();
       } else if (t.dataset.settings) {
         await openPlatformSettings(t.dataset.settings);
       } else if (t.dataset.shot) {
         $("#shot-img").src = `/api/platforms/${t.dataset.shot}/screenshot.png?t=${Date.now()}`;
-        $("#shot-modal").classList.remove("hidden");
+        $("#shot-modal").hidden = false;
       } else if (t.dataset.read) {
         await api(`/events/${t.dataset.read}/read`, { method: "POST", body: {} });
         await refresh();
@@ -364,31 +558,32 @@
         const a = state.agents.find((x) => x.id === Number(t.dataset.delete));
         if (a && confirm(`Delete "${a.name}" and its run history?`)) {
           await api(`/agents/${a.id}`, { method: "DELETE" });
-          toast("Agent deleted");
+          toast("Agent deleted", "ok");
           await refresh();
         }
       } else if (t.dataset.assign) {
-        t.disabled = true;
-        const m = await api(`/messages/${t.dataset.assign}/assign`, { method: "POST", body: { agent_id: Number(t.dataset.agent) } });
-        toast(m.status === "failed" ? `Delivery failed: ${m.error}` : `Assigned to ${m.agent_name}: ${m.delivery_hint}`, m.status === "failed");
+        await busy(btn, async () => {
+          const m = await api(`/messages/${t.dataset.assign}/assign`, { method: "POST", body: { agent_id: Number(t.dataset.agent) } });
+          toast(m.status === "failed" ? `Delivery failed: ${m.error}` : `Sent to ${m.agent_name}. ${cap(m.delivery_hint)}`, m.status === "failed" ? "bad" : "ok");
+        });
         await refresh();
       } else if (t.dataset.copy) {
         const m = state.messages.find((x) => x.id === Number(t.dataset.copy));
         if (m) {
           await navigator.clipboard.writeText(m.text).catch(() => prompt("Copy this instruction:", m.text));
-          toast("Copied. Paste it into the platform, then press Mark done.");
+          toast("Copied. Paste it into the platform, then press Done.", "ok");
         }
       } else if (t.dataset.msgRetry) {
-        t.disabled = true;
-        const m = await api(`/messages/${t.dataset.msgRetry}/retry`, { method: "POST", body: {} });
-        toast(m.status === "failed" ? `Still failing: ${m.error}` : `Delivered: ${m.delivery_hint}`, m.status === "failed");
+        await busy(btn, async () => {
+          const m = await api(`/messages/${t.dataset.msgRetry}/retry`, { method: "POST", body: {} });
+          toast(m.status === "failed" ? `Still failing: ${m.error}` : `Delivered. ${cap(m.delivery_hint)}`, m.status === "failed" ? "bad" : "ok");
+        });
         await refresh();
       } else if (t.dataset.msgDone) {
         await api(`/messages/${t.dataset.msgDone}/status`, { method: "POST", body: { status: "done" } });
         await refresh();
       } else if (t.dataset.msgReroute) {
-        t.disabled = true;
-        await api(`/messages/${t.dataset.msgReroute}/reroute`, { method: "POST", body: {} });
+        await busy(btn, () => api(`/messages/${t.dataset.msgReroute}/reroute`, { method: "POST", body: {} }));
         await refresh();
       } else if (t.dataset.msgDelete) {
         await api(`/messages/${t.dataset.msgDelete}`, { method: "DELETE" });
@@ -401,26 +596,22 @@
         $("#agent-form").dataset.thenAssign = t.dataset.newAgent;
       }
     } catch (err) {
-      if (err.message !== "unauthorized") toast(err.message, true);
-    } finally {
-      if (t.tagName === "BUTTON") t.disabled = false;
+      fail(err);
     }
   });
+  const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) + "." : "");
 
-  $("#btn-sync-all").addEventListener("click", async () => {
+  $("#btn-sync-all").addEventListener("click", async (e) => {
     try {
-      $("#btn-sync-all").disabled = true;
-      toast("Syncing every platform… this takes a minute.");
-      const r = await api("/sync", { method: "POST", body: {} });
-      const summary = Object.values(r.results)
-        .map((x) => `${platformName(x.platform)}: ${x.message || (x.ok ? "ok" : "failed")}`)
-        .join(" · ");
-      toast(summary || "Nothing to sync. Set a tasks URL on a platform first.");
+      await busy(e.currentTarget, async () => {
+        toast("Syncing every platform. This takes about a minute.");
+        const r = await api("/sync", { method: "POST", body: {} });
+        const parts = Object.values(r.results).map((x) => `${platformName(x.platform)}: ${x.message || (x.ok ? "ok" : "failed")}`);
+        toast(parts.join(" · ") || "Nothing to sync. Set a tasks page URL on a platform first.", parts.length ? "ok" : "");
+      });
       await refresh();
     } catch (err) {
-      if (err.message !== "unauthorized") toast(err.message, true);
-    } finally {
-      $("#btn-sync-all").disabled = false;
+      fail(err);
     }
   });
   $("#btn-refresh").addEventListener("click", refresh);
@@ -436,21 +627,19 @@
     const text = $("#message-text").value.trim();
     if (!text) return;
     const agentId = $("#message-agent").value;
-    const btn = $("#message-send");
-    btn.disabled = true;
     try {
-      const r = await api("/messages", { method: "POST", body: { text, ...(agentId ? { agent_id: Number(agentId) } : {}) } });
-      const m = r.message;
-      if (m.status === "needs_assignment") toast(m.suggestions?.length ? "Not sure who owns this. Pick from the suggestions." : "No matching agent. Pick one or create it.", false);
-      else if (m.status === "failed") toast(`Assigned to ${m.agent_name} but delivery failed: ${m.error}`, true);
-      else toast(`${r.auto_assigned ? "Routed to" : "Sent to"} ${m.agent_name}: ${m.delivery_hint}`);
-      $("#message-text").value = "";
-      $("#message-agent").value = "";
+      await busy($("#message-send"), async () => {
+        const r = await api("/messages", { method: "POST", body: { text, ...(agentId ? { agent_id: Number(agentId) } : {}) } });
+        const m = r.message;
+        if (m.status === "needs_assignment") toast(m.suggestions?.length ? "Not sure who owns this. Pick from the suggestions." : "No matching agent. Pick one or create it.");
+        else if (m.status === "failed") toast(`Assigned to ${m.agent_name}, but delivery failed: ${m.error}`, "bad");
+        else toast(`${r.auto_assigned ? "Routed to" : "Sent to"} ${m.agent_name}. ${cap(m.delivery_hint)}`, "ok");
+        $("#message-text").value = "";
+        $("#message-agent").value = "";
+      });
       await refresh();
     } catch (err) {
-      if (err.message !== "unauthorized") toast(err.message, true);
-    } finally {
-      btn.disabled = false;
+      fail(err);
     }
   });
   $("#message-text").addEventListener("keydown", (e) => {
@@ -461,16 +650,16 @@
     if (!sel || !sel.value) return;
     try {
       const m = await api(`/messages/${sel.dataset.pick}/assign`, { method: "POST", body: { agent_id: Number(sel.value) } });
-      toast(m.status === "failed" ? `Delivery failed: ${m.error}` : `Assigned to ${m.agent_name}: ${m.delivery_hint}`, m.status === "failed");
+      toast(m.status === "failed" ? `Delivery failed: ${m.error}` : `Sent to ${m.agent_name}. ${cap(m.delivery_hint)}`, m.status === "failed" ? "bad" : "ok");
       await refresh();
     } catch (err) {
-      toast(err.message, true);
+      fail(err);
     }
   });
 
-  /* ---------- agent modal ---------- */
+  /* ---------- agent editor ---------- */
   function openAgentModal(agent) {
-    $("#agent-modal-title").textContent = agent ? "Edit agent" : "Add agent";
+    $("#agent-modal-title").textContent = agent?.id ? "Edit agent" : "Add agent";
     $("#agent-id").value = agent?.id ?? "";
     $("#agent-name").value = agent?.name ?? "";
     $("#agent-platform").value = agent?.platform ?? "";
@@ -491,7 +680,7 @@
     $("#agent-webhook-token").value = d.webhook_token || "";
     $("#agent-enabled").checked = agent ? !!agent.enabled : true;
     delete $("#agent-form").dataset.thenAssign;
-    $("#agent-modal").classList.remove("hidden");
+    $("#agent-modal").hidden = false;
     $("#agent-name").focus();
   }
   $("#btn-add-agent").addEventListener("click", () => openAgentModal(null));
@@ -515,21 +704,19 @@
       enabled: $("#agent-enabled").checked,
     };
     try {
-      let saved;
-      if (id) saved = await api(`/agents/${id}`, { method: "PUT", body });
-      else saved = await api("/agents", { method: "POST", body });
-      $("#agent-modal").classList.add("hidden");
+      const saved = id ? await api(`/agents/${id}`, { method: "PUT", body }) : await api("/agents", { method: "POST", body });
+      $("#agent-modal").hidden = true;
       const thenAssign = $("#agent-form").dataset.thenAssign;
       if (thenAssign && saved?.id) {
         delete $("#agent-form").dataset.thenAssign;
         const m = await api(`/messages/${thenAssign}/assign`, { method: "POST", body: { agent_id: saved.id } });
-        toast(m.status === "failed" ? `Agent saved, delivery failed: ${m.error}` : `Agent saved and instruction assigned: ${m.delivery_hint}`, m.status === "failed");
+        toast(m.status === "failed" ? `Agent saved, but delivery failed: ${m.error}` : `Agent saved and instruction sent. ${cap(m.delivery_hint)}`, m.status === "failed" ? "bad" : "ok");
       } else {
-        toast("Agent saved");
+        toast("Agent saved", "ok");
       }
       await refresh();
     } catch (err) {
-      toast(err.message, true);
+      fail(err);
     }
   });
 
@@ -538,17 +725,15 @@
     const p = await api(`/platforms/${id}`);
     $("#platform-modal-title").textContent = `${p.name} settings`;
     $("#pf-id").value = p.id;
-    for (const f of ["name", "appUrl", "tasksUrl", "nativeUrlTemplate", "sessionCookie", "cookieDomain", "loggedInSelector", "snapshotSelector", "notes"]) {
-      $(`#pf-${f}`).value = p[f] ?? "";
-    }
+    for (const f of ["name", "appUrl", "tasksUrl", "nativeUrlTemplate", "sessionCookie", "cookieDomain", "loggedInSelector", "snapshotSelector", "notes"]) $(`#pf-${f}`).value = p[f] ?? "";
     $("#pf-capturePatterns").value = (p.capturePatterns || []).join("\n");
     $("#pf-loginUrlPatterns").value = (p.loginUrlPatterns || []).join("\n");
     $("#pf-actions").value = Object.keys(p.actions || {}).length ? JSON.stringify(p.actions, null, 2) : "";
     const disc = (p.state?.meta?.discovered || []).slice(0, 60);
     $("#pf-discovered-list").innerHTML = disc.length
-      ? disc.map((d) => `<div class="item"><div class="body endpoint">${d.matched ? "✓ " : "· "}${esc(d.url)} <span class="muted">(${d.status}${d.size ? ", " + Math.round(d.size / 1024) + " KB" : ""})</span></div></div>`).join("")
-      : '<p class="muted small">Nothing captured yet. Sync this platform first.</p>';
-    $("#platform-modal").classList.remove("hidden");
+      ? disc.map((d) => `<div class="rowitem ${d.matched ? "s-ok" : ""}"><div class="body endpoint">${d.matched ? "✓ " : ""}${esc(d.url)} <span class="muted">(${d.status}${d.size ? ", " + Math.round(d.size / 1024) + " KB" : ""})</span></div></div>`).join("")
+      : '<p class="empty">Nothing captured yet. Sync this platform first.</p>';
+    $("#platform-modal").hidden = false;
   }
   $("#platform-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -560,7 +745,7 @@
       try {
         actions = JSON.parse(rawActions);
       } catch {
-        return toast("Custom actions must be valid JSON", true);
+        return toast("Actions must be valid JSON.", "bad");
       }
     }
     const body = {
@@ -579,29 +764,31 @@
     };
     try {
       await api(`/platforms/${id}`, { method: "PUT", body });
-      $("#platform-modal").classList.add("hidden");
-      toast("Platform saved");
+      $("#platform-modal").hidden = true;
+      toast("Settings saved", "ok");
       await refresh();
     } catch (err) {
-      toast(err.message, true);
+      fail(err);
     }
   });
   $("#pf-reset").addEventListener("click", async () => {
     const id = $("#pf-id").value;
-    if (!confirm("Reset this platform to built-in defaults?")) return;
+    if (!confirm("Reset this platform to the built-in defaults?")) return;
     await api(`/platforms/${id}/overrides`, { method: "DELETE" });
-    $("#platform-modal").classList.add("hidden");
-    toast("Defaults restored");
+    $("#platform-modal").hidden = true;
+    toast("Defaults restored", "ok");
     refresh();
   });
 
   /* ---------- boot ---------- */
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") $$(".overlay:not(#login)").forEach((o) => o.classList.add("hidden"));
+    if (e.key === "Escape") {
+      for (const o of $$(".overlay:not(#login)")) o.hidden = true;
+      for (const d of $$("details.menu[open]")) d.removeAttribute("open");
+    }
   });
   refresh();
-  refreshTimer = setInterval(() => {
-    if (document.visibilityState === "visible" && $$(".overlay:not(.hidden)").length === 0) refresh();
+  setInterval(() => {
+    if (document.visibilityState === "visible" && !$$(".overlay").some((o) => !o.hidden) && !$$("details.menu[open]").length) refresh();
   }, 30_000);
-  void refreshTimer;
 })();

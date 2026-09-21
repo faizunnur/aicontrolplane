@@ -507,11 +507,16 @@ export function setSetting(key: string, value: string) {
 
 export function overviewCounts() {
   const agents = db.prepare("SELECT COUNT(*) AS n FROM agents WHERE enabled = 1").get() as { n: number };
+  // Same effective timestamp as the runs chart, so the tiles and the bars agree.
   const failed = db
-    .prepare(`SELECT COUNT(*) AS n FROM runs WHERE status IN ('failed','needs_attention') AND created_at > datetime('now', '-7 days')`)
+    .prepare(
+      `SELECT COUNT(*) AS n FROM runs WHERE status IN ('failed','needs_attention') AND COALESCE(finished_at, started_at, created_at) > datetime('now', '-7 days')`,
+    )
     .get() as { n: number };
   const unread = db.prepare("SELECT COUNT(*) AS n FROM events WHERE read = 0").get() as { n: number };
-  const runs24h = db.prepare(`SELECT COUNT(*) AS n FROM runs WHERE created_at > datetime('now', '-1 day')`).get() as { n: number };
+  const runs24h = db
+    .prepare(`SELECT COUNT(*) AS n FROM runs WHERE COALESCE(finished_at, started_at, created_at) > datetime('now', '-1 day')`)
+    .get() as { n: number };
   return { agents: agents.n, failed7d: failed.n, unreadEvents: unread.n, runs24h: runs24h.n };
 }
 
@@ -600,4 +605,53 @@ export function deleteMessage(id: number): boolean {
 
 export function openMessageCount(): number {
   return (db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status IN ('needs_assignment','failed')`).get() as { n: number }).n;
+}
+
+/* ---------- stats ---------- */
+
+export interface DayStat {
+  day: string;
+  success: number;
+  failed: number;
+  needs_attention: number;
+  running: number;
+  unknown: number;
+}
+
+/** Runs per day for the last N days, bucketed by status. Days with no runs are included as zeros. */
+export function runStats(days = 14): DayStat[] {
+  const n = Math.min(Math.max(days, 1), 90);
+  const rows = db
+    .prepare(
+      `SELECT substr(COALESCE(finished_at, started_at, created_at), 1, 10) AS day, status, COUNT(*) AS n
+       FROM runs WHERE COALESCE(finished_at, started_at, created_at) >= date('now', ?)
+       GROUP BY day, status`,
+    )
+    .all(`-${n - 1} days`) as { day: string; status: string; n: number }[];
+  const out: DayStat[] = [];
+  const today = new Date();
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setUTCDate(today.getUTCDate() - i);
+    const day = d.toISOString().slice(0, 10);
+    const stat: DayStat = { day, success: 0, failed: 0, needs_attention: 0, running: 0, unknown: 0 };
+    for (const r of rows) if (r.day === day && r.status in stat) (stat as unknown as Record<string, number>)[r.status] += r.n;
+    out.push(stat);
+  }
+  return out;
+}
+
+/** Last few run statuses per agent, newest first, for the history dots on the agents table. */
+export function recentStatusesByAgent(limit = 6): Record<number, string[]> {
+  const rows = db
+    .prepare(
+      `SELECT agent_id, status FROM (
+         SELECT agent_id, status, ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY COALESCE(finished_at, started_at, created_at) DESC) AS rn
+         FROM runs
+       ) WHERE rn <= ?`,
+    )
+    .all(limit) as { agent_id: number; status: string }[];
+  const out: Record<number, string[]> = {};
+  for (const r of rows) (out[r.agent_id] ??= []).push(r.status);
+  return out;
 }

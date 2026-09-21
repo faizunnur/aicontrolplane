@@ -26,8 +26,10 @@ import {
   markEventRead,
   openMessageCount,
   overviewCounts,
+  recentStatusesByAgent,
   recentSyncLogs,
   recordRun,
+  runStats,
   updateAgent,
   updateMessage,
   upsertAgent,
@@ -370,8 +372,18 @@ const agentSchema = z.object({
 });
 
 api.get("/agents", (req, res) => {
-  res.json(listAgents({ platform: typeof req.query.platform === "string" ? req.query.platform : undefined, includeDisabled: req.query.all === "1" }));
+  const recent = recentStatusesByAgent(6);
+  res.json(
+    listAgents({ platform: typeof req.query.platform === "string" ? req.query.platform : undefined, includeDisabled: req.query.all === "1" }).map((a) => ({
+      ...a,
+      recent_statuses: recent[a.id] ?? [],
+    })),
+  );
 });
+
+/* ---------- stats ---------- */
+
+api.get("/stats/runs", (req, res) => res.json(runStats(num(req.query.days, 14))));
 api.post("/agents", (req, res) => {
   const parsed = agentSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid agent", issues: parsed.error.issues });
