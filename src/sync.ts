@@ -55,6 +55,8 @@ async function tick() {
     } else {
       await syncAll();
     }
+    // Even when nothing synced, keep the session backup fresh (e.g. after a manual login on the screen).
+    if (browser.isRunning()) await browser.backupSessions();
   } catch (err) {
     log.error("scheduled sync failed", err);
   } finally {

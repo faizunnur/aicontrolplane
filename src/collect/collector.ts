@@ -225,6 +225,8 @@ async function collectOnce(p: PlatformConfig): Promise<SyncResult> {
       ? "login required"
       : `captured ${captured.length} payloads, ${agents} tasks, ${runs} runs`;
   log.info(`sync ${p.id}: ${message} (${finalUrl})`);
+  // A logged-in session is worth keeping: snapshot cookies to the volume.
+  if (sessionStatus === "logged_in") void browser.backupSessions();
   return { platform: p.id, ok: true, sessionStatus, finalUrl, agents, runs, captures: captured.length, discovered: discovered.size, message };
 }
 

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
 import { isAdmin } from "./auth.js";
-import { browser, vncState } from "./browser/manager.js";
+import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
@@ -89,6 +89,12 @@ server.on("upgrade", (req, socket, head) => {
 server.listen(config.port, () => {
   log.info(`AI Control Plane listening on :${config.port} (data: ${config.dataDir})`);
   if (config.publicUrl) log.info(`public url: ${config.publicUrl}`);
+  const st = storageInfo();
+  if (st.persistent === false) {
+    log.warn(`DATA_DIR ${st.dataDir} is NOT on a mounted volume. Logins, the database and screenshots will be lost on redeploy. Attach a volume at ${st.dataDir}.`);
+  } else if (st.persistent === true) {
+    log.info(`data dir is on volume ${st.mount}${st.backupAt ? `, session backup from ${st.backupAt}` : ""}`);
+  }
   startScheduler();
   startEmailPoller();
   if (browser.enabled) {
@@ -101,7 +107,9 @@ async function shutdown(signal: string) {
   log.info(`${signal} received, shutting down`);
   stopScheduler();
   server.close();
-  await browser.close();
+  // Back up sessions and close Chromium cleanly so the profile on the volume is flushed,
+  // but never hang a redeploy: give it a few seconds, then exit regardless.
+  await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 8_000))]);
   process.exit(0);
 }
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

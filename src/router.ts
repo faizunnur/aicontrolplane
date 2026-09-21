@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-// The SDK's structured-output helper is built on Zod v4, which zod 3.25+ ships under this entry point.
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
 import { config } from "./config.js";
 import { listAgents } from "./db.js";
@@ -175,6 +175,69 @@ export async function llmRoute(text: string, agents: Agent[]): Promise<{ result:
   }
 }
 
+/* ---------- Claude Code provider (your subscription via CLAUDE_CODE_OAUTH_TOKEN) ---------- */
+
+// The Claude Code runtime validates the schema itself and rejects the "$schema" header Zod emits.
+const RouteJsonSchema = (({ $schema: _omit, ...rest }) => rest)(z.toJSONSchema(RouteSchema) as Record<string, unknown>);
+
+/**
+ * Same question, asked through the Claude Agent SDK. The SDK runs the bundled Claude Code
+ * runtime as a subprocess; it authenticates with CLAUDE_CODE_OAUTH_TOKEN from the environment.
+ * No tools, one turn, structured JSON back.
+ */
+export async function claudeCodeRoute(text: string, agents: Agent[]): Promise<{ result: z.infer<typeof RouteSchema> | null; error?: string }> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), config.router.timeoutMs);
+  try {
+    const q = query({
+      prompt: `Registry:\n${registryText(agents)}\n\nInstruction from the user:\n${text}`,
+      options: {
+        systemPrompt: SYSTEM,
+        maxTurns: 1,
+        allowedTools: [],
+        permissionMode: "dontAsk",
+        cwd: config.dataDir,
+        outputFormat: { type: "json_schema", schema: RouteJsonSchema },
+        abortController: abort,
+        ...(config.router.model ? { model: config.router.model } : {}),
+      },
+    });
+    let lastText = "";
+    for await (const m of q) {
+      if (m.type === "assistant") {
+        for (const block of m.message.content) if (block.type === "text") lastText = block.text;
+      } else if (m.type === "result") {
+        if (m.subtype !== "success") return { result: null, error: `Claude Code ended with ${m.subtype}` };
+        const candidates: unknown[] = [m.structured_output];
+        // Belt and braces: some runtimes return the JSON as the result text instead.
+        for (const s of [m.result, lastText]) {
+          if (typeof s !== "string") continue;
+          const match = s.match(/\{[\s\S]*\}/);
+          if (match) {
+            try {
+              candidates.push(JSON.parse(match[0]));
+            } catch {
+              /* not JSON */
+            }
+          }
+        }
+        for (const c of candidates) {
+          const parsed = RouteSchema.safeParse(c);
+          if (parsed.success) return { result: parsed.data };
+        }
+        return { result: null, error: "Claude Code answered without the expected JSON" };
+      }
+    }
+    return { result: null, error: "Claude Code returned no result" };
+  } catch (err) {
+    if (abort.signal.aborted) return { result: null, error: `Claude Code timed out after ${Math.round(config.router.timeoutMs / 1000)}s` };
+    const msg = err instanceof Error ? err.message : String(err);
+    return { result: null, error: /auth|login|token|401|403/i.test(msg) ? `Claude Code could not authenticate: ${msg}` : msg };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /* ---------- combined ---------- */
 
 export async function routeMessage(text: string): Promise<RoutingResult> {
@@ -189,7 +252,7 @@ export async function routeMessage(text: string): Promise<RoutingResult> {
   }
 
   if (config.router.llm) {
-    const { result, error } = await llmRoute(text, agents);
+    const { result, error } = config.router.provider === "claude-code" ? await claudeCodeRoute(text, agents) : await llmRoute(text, agents);
     if (result) {
       const byKey = (key: string | null, platform: string | null) =>
         agents.find((a) => a.key === key && (!platform || a.platform === platform)) ?? agents.find((a) => a.key === key);

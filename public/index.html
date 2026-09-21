@@ -37,6 +37,19 @@
   </header>
 
   <main class="page">
+    <section id="storage-warning" class="notice warn" hidden role="alert">
+      <div>
+        <strong>Logins will not survive the next redeploy.</strong>
+        <span id="storage-warning-text">The data directory is not on a mounted volume.</span>
+        Attach a volume at the data directory, or download your sessions now and restore them after deploying.
+      </div>
+      <div class="row">
+        <button class="btn small" id="btn-sessions-download">Download sessions</button>
+        <label class="btn small" for="sessions-file">Restore sessions</label>
+      </div>
+    </section>
+    <input type="file" id="sessions-file" accept="application/json" hidden />
+
     <section id="setup" class="setup" hidden aria-label="Getting started">
       <ol class="stepper" id="stepper"></ol>
     </section>
@@ -82,7 +95,18 @@
     <section aria-label="Platforms">
       <div class="section-head">
         <h2>Platforms</h2>
-        <span class="muted small" id="scheduler-status"></span>
+        <div class="row">
+          <span class="muted small" id="scheduler-status"></span>
+          <span class="muted small" id="storage-status"></span>
+          <details class="menu" id="sessions-menu">
+            <summary class="btn small ghost">Sessions</summary>
+            <div class="menu-list">
+              <button class="btn small ghost" id="btn-sessions-backup">Back up to volume now</button>
+              <button class="btn small ghost" id="btn-sessions-download-2">Download sessions file</button>
+              <label class="btn small ghost" for="sessions-file">Restore from file</label>
+            </div>
+          </details>
+        </div>
       </div>
       <div id="platforms" class="tiles"></div>
     </section>

@@ -131,11 +131,17 @@ The **Messages** box on the dashboard takes a plain instruction and gets it to t
 **Routing.** Two engines, used in this order:
 
 1. **Mention.** `@daily-digest …` or `@Daily digest …` goes straight to that agent.
-2. **Claude.** With `ANTHROPIC_API_KEY` set, the router sends the instruction plus a compact registry
-   (name, purpose, schedule, keywords per agent) to Claude and asks for a structured answer: the responsible
-   agent, a confidence, a one-line reason, alternatives, and, when nothing fits, a proposal for a new agent.
-   Without a key it falls back to keyword scoring over names, purposes, the **Routing keywords** field on each
-   agent, and platform mentions ("ask grok…").
+2. **Claude.** The router sends the instruction plus a compact registry (name, purpose, schedule, keywords per
+   agent) to Claude and asks for a structured answer: the responsible agent, a confidence, a one-line reason,
+   alternatives, and, when nothing fits, a proposal for a new agent. Give it Claude one of two ways:
+   - **Your Claude subscription.** Run `claude setup-token` on your laptop and set the result as
+     `CLAUDE_CODE_OAUTH_TOKEN`. The router then calls Claude through the Claude Agent SDK, which is bundled in the
+     image. No API bill; it draws on your plan's usage. The token is for your own use, so keep the deployment private.
+   - **An Anthropic API key** in `ANTHROPIC_API_KEY`, billed per token.
+
+   `ROUTER_PROVIDER` picks between them (`auto` prefers the API key when both exist). Without either, routing
+   falls back to keyword scoring over names, purposes, the **Routing keywords** field on each agent, and platform
+   mentions ("ask grok…").
 
 When confidence reaches `ROUTER_AUTO_THRESHOLD` (default 0.75) the message is assigned and delivered
 immediately. Below that you get suggestions with reasons and one-click **Assign** buttons, a picker for any
@@ -196,8 +202,23 @@ All routes under `/api` need `Authorization: Bearer <ACP_ADMIN_TOKEN>` or the da
 - The dashboard session cookie is HttpOnly and only ever carries a hash of the admin token. Agents get the separate ingest token and nothing else.
 - These are personal consumer accounts driven from one extra browser. Keep the sync interval relaxed and the usage read-mostly.
 
+## Keeping logins across redeploys
+
+Your platform logins live in the Chromium profile under `DATA_DIR` (`/data` in the image). Three layers keep them:
+
+1. **The volume.** Attach a Railway volume at `/data`. Without it every deploy starts from an empty profile. The
+   service logs a warning at boot and the dashboard shows a banner when the data directory is not a mount.
+2. **Automatic backup.** After every signed-in sync, every scheduler tick, and on shutdown, cookies are written to
+   `DATA_DIR/sessions.json`. If Chromium ever comes up with an empty profile while that file exists, it restores
+   the cookies on its own. Cookies are encrypted with Chromium's portable store, so the profile is not tied to one host.
+3. **Manual export.** **Platforms › Sessions** lets you download the sessions file and restore it later, for
+   example before moving to a new project or region. Treat the file like a password.
+
 ## Troubleshooting
 
+- **Logged out after a redeploy.** The data directory was not persistent. Attach a volume at `/data`, redeploy,
+  then sign in once through the browser screen (or restore a downloaded sessions file). Check the boot log line
+  that starts with `data dir is on volume`.
 - **Card says "login required" right after you logged in.** Press Sync again; the check runs on the next visit. If it persists, the cookie name in Settings may be wrong for that platform: clear the *Session cookie name* field to rely on redirect detection only.
 - **Signed in but 0 agents.** Open Settings and look at *Discovered JSON endpoints*. Add a capture pattern for the call that returns your tasks. The screenshot and text snapshot still show the page meanwhile.
 - **Browser screen shows 502.** The service is running with `HEADLESS=true` or outside the Docker image. The screen needs Xvfb, which the image provides.

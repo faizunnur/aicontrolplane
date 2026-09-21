@@ -73,13 +73,7 @@ export const config = {
     cooldownMin: num(process.env.ALERT_COOLDOWN_MIN, 360),
   },
 
-  router: {
-    /** LLM routing is on when an Anthropic credential is present, unless ROUTER_LLM forces it. */
-    llm: process.env.ROUTER_LLM ? bool(process.env.ROUTER_LLM, true) : !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
-    model: process.env.ROUTER_MODEL || "claude-opus-5",
-    /** Auto-assign when the best suggestion's confidence reaches this. */
-    autoThreshold: num(process.env.ROUTER_AUTO_THRESHOLD, 0.75),
-  },
+  router: routerConfig(),
 
   email: {
     host: process.env.IMAP_HOST || "",
@@ -92,6 +86,39 @@ export const config = {
     ingestAll: bool(process.env.EMAIL_INGEST_ALL, false),
   },
 };
+
+export type RouterProvider = "api" | "claude-code" | "none";
+
+/**
+ * Which Claude credential routes instructions.
+ *   api         - ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN through the Anthropic SDK
+ *   claude-code - CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) through the Claude Agent SDK,
+ *                 i.e. your Claude subscription
+ *   none        - keyword routing only
+ * ROUTER_PROVIDER forces one; otherwise it is picked from whichever credential is present.
+ */
+function routerConfig() {
+  const hasApi = !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
+  const hasOauth = !!process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const forced = (process.env.ROUTER_PROVIDER || "").toLowerCase();
+  let provider: RouterProvider = hasApi ? "api" : hasOauth ? "claude-code" : "none";
+  if (forced === "api" || forced === "claude-code" || forced === "none") provider = forced;
+  else if (forced === "auto" || forced === "") {
+    /* keep detection */
+  } else console.warn(`[config] ROUTER_PROVIDER "${forced}" is not api | claude-code | none; using ${provider}`);
+  if (process.env.ROUTER_LLM && !bool(process.env.ROUTER_LLM, true)) provider = "none";
+  if (provider === "claude-code" && !hasOauth) console.warn("[config] ROUTER_PROVIDER=claude-code but CLAUDE_CODE_OAUTH_TOKEN is not set");
+  if (provider === "api" && !hasApi) console.warn("[config] ROUTER_PROVIDER=api but no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN is set");
+  return {
+    provider,
+    llm: provider !== "none",
+    /** For the API provider this is the model id; for claude-code it is passed through only when set. */
+    model: process.env.ROUTER_MODEL || (provider === "claude-code" ? "" : "claude-opus-5"),
+    autoThreshold: num(process.env.ROUTER_AUTO_THRESHOLD, 0.75),
+    /** Wall-clock cap for one routing call. */
+    timeoutMs: num(process.env.ROUTER_TIMEOUT_MS, 60_000),
+  };
+}
 
 function parseSenderMap(raw: string | undefined): Record<string, string> {
   const def: Record<string, string> = {

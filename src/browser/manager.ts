@@ -51,6 +51,9 @@ class BrowserManager {
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        // Encrypt cookies with the portable "basic" store, never a machine keyring, so the
+        // profile stays readable when the container is rebuilt on another host.
+        "--password-store=basic",
         "--disable-blink-features=AutomationControlled",
         `--window-size=${w},${h}`,
         "--window-position=0,0",
@@ -64,9 +67,55 @@ class BrowserManager {
       this.context = null;
       this.consolePages.clear();
     });
-    // Close the initial blank tab once we have our own pages.
     this.context = ctx;
+    await this.restoreSessionsIfEmpty(ctx);
     return ctx;
+  }
+
+  /* ---------- session backup: survives a lost or corrupted profile ---------- */
+
+  private get backupFile() {
+    return path.join(config.dataDir, "sessions.json");
+  }
+
+  /** Write cookies + local storage to the volume. Called after successful syncs and on shutdown. */
+  async backupSessions(): Promise<number> {
+    if (!this.context) return 0;
+    try {
+      const state = await this.context.storageState();
+      const tmp = this.backupFile + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(state));
+      fs.renameSync(tmp, this.backupFile);
+      return state.cookies.length;
+    } catch (err) {
+      log.warn("session backup failed", err);
+      return 0;
+    }
+  }
+
+  /** If the profile came up with no cookies but a backup exists, restore it. */
+  private async restoreSessionsIfEmpty(ctx: BrowserContext) {
+    try {
+      if (!fs.existsSync(this.backupFile)) return;
+      const existing = await ctx.cookies();
+      if (existing.length > 0) return;
+      const state = JSON.parse(fs.readFileSync(this.backupFile, "utf8")) as { cookies?: Cookie[] };
+      const cookies = (state.cookies ?? []).filter((c) => c && c.name && c.domain);
+      if (!cookies.length) return;
+      await ctx.addCookies(cookies);
+      log.warn(`profile had no cookies; restored ${cookies.length} from sessions.json`);
+    } catch (err) {
+      log.warn("session restore failed", err);
+    }
+  }
+
+  /** How many cookies the profile holds per platform domain, for the storage diagnostics. */
+  async cookieCounts(domains: string[]): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    if (!this.context) return out;
+    const all = await this.context.cookies().catch(() => [] as Cookie[]);
+    for (const d of domains) out[d] = all.filter((c) => c.domain.includes(d)).length;
+    return out;
   }
 
   /** Serialise browser work so a sync never navigates a tab another job is using. */
@@ -145,10 +194,44 @@ class BrowserManager {
 
   async close() {
     const ctx = this.context;
+    if (!ctx) return;
+    await this.backupSessions();
     this.context = null;
     this.consolePages.clear();
-    if (ctx) await ctx.close().catch(() => undefined);
+    await ctx.close().catch(() => undefined);
   }
+}
+
+/**
+ * Is DATA_DIR on a mounted volume? On Linux we read /proc/mounts; anywhere else we
+ * cannot tell and return null. A false here means logins vanish on redeploy.
+ */
+export function storageInfo(): { dataDir: string; persistent: boolean | null; mount: string | null; backupAt: string | null } {
+  let persistent: boolean | null = null;
+  let mount: string | null = null;
+  try {
+    if (process.platform === "linux" && fs.existsSync("/proc/mounts")) {
+      const mounts = fs
+        .readFileSync("/proc/mounts", "utf8")
+        .split("\n")
+        .map((l) => l.split(" ")[1])
+        .filter(Boolean)
+        .filter((m) => m !== "/" && !m.startsWith("/proc") && !m.startsWith("/sys") && !m.startsWith("/dev") && m !== "/etc/hosts" && m !== "/etc/hostname" && m !== "/etc/resolv.conf");
+      const dir = path.resolve(config.dataDir);
+      mount = mounts.filter((m) => dir === m || dir.startsWith(m + "/")).sort((a, b) => b.length - a.length)[0] ?? null;
+      persistent = mount !== null;
+    }
+  } catch {
+    persistent = null;
+  }
+  let backupAt: string | null = null;
+  try {
+    const f = path.join(config.dataDir, "sessions.json");
+    if (fs.existsSync(f)) backupAt = fs.statSync(f).mtime.toISOString();
+  } catch {
+    backupAt = null;
+  }
+  return { dataDir: config.dataDir, persistent, mount, backupAt };
 }
 
 export const browser = new BrowserManager();

@@ -156,11 +156,19 @@
       })
       .join("");
     const r = state.overview.router;
-    $("#router-status").textContent = r.llm ? `routed by ${r.model} · auto-assign from ${Math.round(r.autoThreshold * 100)}%` : `keyword routing · auto-assign from ${Math.round(r.autoThreshold * 100)}%`;
+    const routedBy = r.provider === "claude-code" ? `routed by Claude (subscription${r.model ? `, ${r.model}` : ""})` : r.provider === "api" ? `routed by ${r.model} (API)` : "keyword routing";
+    $("#router-status").textContent = `${routedBy} · auto-assign from ${Math.round(r.autoThreshold * 100)}%`;
     const s = state.overview.scheduler;
     $("#scheduler-status").textContent = !s.enabled ? "auto-sync off" : s.running ? "syncing now…" : `auto-sync every ${s.intervalMin} min`;
     $("#btn-sync-all").disabled = !state.overview.browser.enabled || s.running;
     $("#btn-vnc").hidden = !state.overview.browser.enabled || state.overview.browser.headless;
+
+    const st = state.overview.storage || {};
+    const browserOn = state.overview.browser.enabled;
+    $("#storage-warning").hidden = !(browserOn && st.persistent === false);
+    $("#storage-warning-text").textContent = `${st.dataDir} is not on a mounted volume.`;
+    $("#sessions-menu").hidden = !browserOn;
+    $("#storage-status").textContent = !browserOn ? "" : st.persistent === true ? `sessions on volume${st.backupAt ? `, backed up ${rel(st.backupAt)}` : ""}` : st.backupAt ? `sessions backed up ${rel(st.backupAt)}` : "";
   }
 
   /* ---------- render: summary ---------- */
@@ -615,6 +623,54 @@
     }
   });
   $("#btn-refresh").addEventListener("click", refresh);
+
+  /* ---------- sessions: back up, download, restore ---------- */
+  async function downloadSessions(e) {
+    try {
+      await busy(e.currentTarget, async () => {
+        const state = await api("/browser/export-state");
+        const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `acp-sessions-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        toast(`Downloaded ${state.cookies?.length ?? 0} cookies. Keep this file private; it is your logins.`, "ok");
+      });
+    } catch (err) {
+      fail(err);
+    }
+  }
+  $("#btn-sessions-download").addEventListener("click", downloadSessions);
+  $("#btn-sessions-download-2").addEventListener("click", downloadSessions);
+  $("#btn-sessions-backup").addEventListener("click", async (e) => {
+    try {
+      await busy(e.currentTarget, async () => {
+        const r = await api("/browser/backup", { method: "POST", body: {} });
+        toast(`Backed up ${r.cookies} cookies to ${r.storage.dataDir}.`, "ok");
+      });
+      await refresh();
+    } catch (err) {
+      fail(err);
+    }
+  });
+  $("#sessions-file").addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed.cookies)) throw new Error("That file has no cookies array. Use a file downloaded from Sessions.");
+      const r = await api("/browser/import-state", { method: "POST", body: { cookies: parsed.cookies } });
+      toast(`Restored ${r.imported} cookies. Press Sync all to confirm the platforms are signed in.`, "ok");
+      await api("/browser/backup", { method: "POST", body: {} }).catch(() => null);
+      await refresh();
+    } catch (err) {
+      fail(err);
+    } finally {
+      e.target.value = "";
+    }
+  });
   $("#btn-read-all").addEventListener("click", async () => {
     await api("/events/read-all", { method: "POST", body: {} });
     refresh();

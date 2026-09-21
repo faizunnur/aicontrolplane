@@ -3,7 +3,7 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { availableActions, runAction } from "../actions.js";
 import { alertsConfigured, sendAlert } from "../alerts.js";
-import { browser, vncState } from "../browser/manager.js";
+import { browser, storageInfo, vncState } from "../browser/manager.js";
 import { config } from "../config.js";
 import {
   addEvent,
@@ -347,7 +347,8 @@ api.get("/overview", async (_req, res) => {
       sessions: cards.filter((c) => c.state.session_status === "needs_login").map((c) => ({ platform: c.id, name: c.name })),
       messages: [...listMessages({ status: "needs_assignment", limit: 10 }), ...listMessages({ status: "failed", limit: 10 })].map(expandMessage),
     },
-    router: { llm: config.router.llm, model: config.router.model, autoThreshold: config.router.autoThreshold },
+    router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
+    storage: storageInfo(),
     scheduler: schedulerStatus(),
     browser: await browser.status(),
     email: emailStatus(),
@@ -452,6 +453,7 @@ const platformPatch = z
     snapshotSelector: z.string().max(300),
     notes: z.string().max(2000),
     actions: z.record(
+      z.string(),
       z.object({
         label: z.string().max(80).optional(),
         description: z.string().max(300).optional(),
@@ -524,7 +526,16 @@ api.get("/sync/log", (_req, res) => res.json(recentSyncLogs(50)));
 
 /* ---------- browser ---------- */
 
-api.get("/browser", async (_req, res) => res.json({ ...(await browser.status()), vnc: { connections: vncState.connections } }));
+api.get("/browser", async (_req, res) => {
+  const domains = Object.values(getPlatforms())
+    .map((p) => p.cookieDomain)
+    .filter(Boolean);
+  res.json({ ...(await browser.status()), vnc: { connections: vncState.connections }, storage: storageInfo(), cookies: await browser.cookieCounts(domains) });
+});
+api.post("/browser/backup", async (_req, res) => {
+  if (!browser.enabled) return bad(res, "browser is disabled", 409);
+  res.json({ ok: true, cookies: await browser.backupSessions(), storage: storageInfo() });
+});
 api.post("/browser/import-state", async (req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);
   const cookies = Array.isArray(req.body?.cookies) ? req.body.cookies : [];
