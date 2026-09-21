@@ -38,10 +38,25 @@ import {
 import { deliverMessage, describeMode, resolveMode } from "../deliver.js";
 import { routeMessage } from "../router.js";
 import { emailStatus, pollOnce } from "../ingest/email.js";
-import { deletePlatformOverride, getPlatform, getPlatforms, savePlatformOverride } from "../platforms.js";
-import { requireAdmin, requireIngest, clearSessionCookieHeader, sessionCookieHeader } from "../auth.js";
+import { deletePlatformOverride, getPlatform, getPlatforms, savePlatformOverride, visiblePlatforms } from "../platforms.js";
+import {
+  adminFromEnv,
+  changeAdminPassword,
+  clearSessionCookieHeader,
+  createAdminPassword,
+  ingestToken,
+  requireAdmin,
+  requireIngest,
+  rotateIngestToken,
+  sessionCookieHeader,
+  setupRequired,
+  verifyAdmin,
+} from "../auth.js";
 import { isSyncRunning, schedulerStatus, syncAll } from "../sync.js";
 import { syncPlatform } from "../collect/collector.js";
+import { checkConnection } from "../collect/chat.js";
+import { deliverToConnection } from "../deliver.js";
+import { connectedPlatforms, routeToConnection } from "../router.js";
 
 export const api = Router();
 
@@ -85,11 +100,19 @@ function secure(req: Request) {
   return req.secure || req.headers["x-forwarded-proto"] === "https";
 }
 
-/* ---------- auth ---------- */
+/* ---------- auth & first run ---------- */
 
+api.get("/setup", (_req, res) => res.json({ setupRequired: setupRequired(), passwordFromEnv: adminFromEnv() }));
+api.post("/setup", (req, res) => {
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (password.length < 8) return bad(res, "Use at least 8 characters.");
+  if (!createAdminPassword(password)) return bad(res, "A password already exists. Sign in instead.", 409);
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req)));
+  res.json({ ok: true });
+});
 api.post("/session", (req, res) => {
-  const token = typeof req.body?.token === "string" ? req.body.token : "";
-  if (token !== config.adminToken) return bad(res, "invalid token", 401);
+  const token = typeof req.body?.token === "string" ? req.body.token : typeof req.body?.password === "string" ? req.body.password : "";
+  if (!verifyAdmin(token)) return res.status(401).json({ error: "That password was not accepted.", setup: setupRequired() });
   res.setHeader("Set-Cookie", sessionCookieHeader(secure(req)));
   res.json({ ok: true });
 });
@@ -234,6 +257,191 @@ api.post("/inbox/:id/ack", requireIngest, (req, res) => {
 /* ---------- everything below is admin ---------- */
 
 api.use(requireAdmin);
+
+/* ---------- the app: connections, chat, home ---------- */
+
+function connectionCard(p: ReturnType<typeof getPlatform> & object) {
+  const s = getPlatformState(p.id);
+  const tasks = listAgents({ platform: p.id });
+  const status = !p.appUrl ? "none" : s.session_status;
+  return {
+    id: p.id,
+    name: p.name,
+    purpose: p.purpose,
+    appUrl: p.appUrl,
+    canChat: !!p.composerSelector,
+    canSync: !!p.tasksUrl,
+    builtin: ["chatgpt", "claude", "grok"].includes(p.id),
+    status, // logged_in | needs_login | error | unknown | none
+    lastSync: s.last_sync_at,
+    lastError: s.last_error,
+    hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)),
+    tasks: tasks.map((a) => ({
+      id: a.id,
+      name: a.name,
+      schedule: a.schedule,
+      status: a.status,
+      native_url: a.native_url,
+      last_run: a.last_run ? { status: a.last_run.status, at: a.last_run.finished_at || a.last_run.started_at || a.last_run.created_at, summary: a.last_run.summary } : null,
+    })),
+  };
+}
+
+api.get("/connections", (_req, res) => res.json(visiblePlatforms().map(connectionCard)));
+
+const connectionPatch = z
+  .object({
+    name: z.string().min(1).max(80),
+    purpose: z.string().max(300),
+    appUrl: z.string().max(2000),
+    chatUrl: z.string().max(2000),
+    tasksUrl: z.string().max(2000),
+    composerSelector: z.string().max(300),
+    sendSelector: z.string().max(300),
+    replySelector: z.string().max(500),
+    busySelector: z.string().max(300),
+    loginUrlPatterns: z.array(z.string().max(300)).max(30),
+    sessionCookie: z.string().max(120),
+    cookieDomain: z.string().max(120),
+    capturePatterns: z.array(z.string().max(300)).max(30),
+    hidden: z.boolean(),
+  })
+  .partial();
+api.post("/connections", (req, res) => {
+  const parsed = connectionPatch.safeParse(req.body);
+  if (!parsed.success || !parsed.data.name) return bad(res, "name is required");
+  const id = (typeof req.body?.id === "string" && req.body.id ? req.body.id : parsed.data.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+  if (!id || getPlatform(id)?.appUrl) return bad(res, "an AI with that name already exists");
+  const appUrl = parsed.data.appUrl || "";
+  if (appUrl && !/^https?:\/\//.test(appUrl)) return bad(res, "URL must start with http:// or https://");
+  savePlatformOverride(id, { ...parsed.data, hidden: false, chatUrl: parsed.data.chatUrl || appUrl, composerSelector: parsed.data.composerSelector || (appUrl ? "textarea, div[contenteditable=\"true\"]" : ""), replySelector: parsed.data.replySelector || "" });
+  res.json(connectionCard(getPlatform(id)!));
+});
+api.put("/connections/:id", (req, res) => {
+  const p = getPlatform(req.params.id);
+  if (!p) return bad(res, "unknown AI", 404);
+  const parsed = connectionPatch.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid settings", issues: parsed.error.issues });
+  savePlatformOverride(p.id, parsed.data);
+  res.json(connectionCard(getPlatform(p.id)!));
+});
+api.delete("/connections/:id", (req, res) => {
+  const p = getPlatform(req.params.id);
+  if (!p) return bad(res, "unknown AI", 404);
+  if (["chatgpt", "claude", "grok"].includes(p.id)) savePlatformOverride(p.id, { hidden: true });
+  else deletePlatformOverride(p.id);
+  res.json({ ok: true });
+});
+api.post("/connections/:id/restore", (req, res) => {
+  deletePlatformOverride(req.params.id);
+  const p = getPlatform(req.params.id);
+  res.json(p ? connectionCard(p) : { ok: true });
+});
+/** Bring the AI's sign-in page up on the browser screen; the UI then embeds that screen. */
+api.post("/connections/:id/connect", async (req, res) => {
+  const p = getPlatform(req.params.id);
+  if (!p || !p.appUrl) return bad(res, "this AI has no web address to open", 404);
+  if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
+  await browser.withLock(() => browser.consolePage(p.id, p.appUrl));
+  res.json({ ok: true, screen: "/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify&reconnect=1" });
+});
+/** After signing in: confirm the session and capture a screenshot. */
+api.post("/connections/:id/check", async (req, res) => {
+  const p = getPlatform(req.params.id);
+  if (!p || !p.appUrl) return bad(res, "unknown AI", 404);
+  const status = await checkConnection(p);
+  res.json({ ...connectionCard(getPlatform(p.id)!), status });
+});
+
+/* chat */
+api.get("/chat", (req, res) => res.json(listMessages({ limit: num(req.query.limit, 40) }).map(expandMessage).reverse()));
+api.post("/chat", async (req, res) => {
+  const text = String(req.body?.text ?? "").trim();
+  if (!text) return bad(res, "Type an instruction first.");
+  if (text.length > 20_000) return bad(res, "That instruction is too long.");
+  const chosen = typeof req.body?.platform === "string" && req.body.platform ? req.body.platform : null;
+  const msg = createMessage(text);
+  if (chosen) {
+    if (!getPlatform(chosen)) return bad(res, "unknown AI", 404);
+    updateMessage(msg.id, { routing: { method: "manual", confidence: 1, reason: "You chose it." } });
+    // Respond right away; the reply lands in the thread when the AI answers.
+    res.json({ message: expandMessage(getMessage(msg.id)!), routed: chosen });
+    void deliverToConnection(msg.id, chosen);
+    return;
+  }
+  const routing = await routeToConnection(text);
+  updateMessage(msg.id, {
+    suggestions: routing.options,
+    routing: { method: routing.method, confidence: routing.top?.confidence ?? 0, reason: routing.reason, llm_error: routing.llm_error },
+  });
+  if (routing.top && routing.top.confidence >= config.router.autoThreshold) {
+    res.json({ message: expandMessage(getMessage(msg.id)!), routed: routing.top.platform });
+    void deliverToConnection(msg.id, routing.top.platform);
+    return;
+  }
+  res.json({ message: expandMessage(getMessage(msg.id)!), routed: null });
+});
+api.post("/chat/:id/send", async (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  const platform = String(req.body?.platform ?? "");
+  if (!getPlatform(platform)) return bad(res, "unknown AI", 404);
+  res.json({ ok: true });
+  void deliverToConnection(m.id, platform);
+});
+api.delete("/chat/:id", (req, res) => res.json({ ok: deleteMessage(num(req.params.id, 0)) }));
+
+/* one call for the whole app */
+api.get("/home", async (_req, res) => {
+  const connections = visiblePlatforms().map(connectionCard);
+  const runs = listRuns({ limit: 15 }).map((r) => ({ kind: "run", at: r.finished_at || r.started_at || r.created_at, platform: r.platform, title: r.agent_name, status: r.status, summary: r.summary, link: r.output_url || r.agent_native_url }));
+  const events = listEvents({ limit: 15 }).map((e) => ({ kind: e.kind, at: e.occurred_at, platform: e.platform, title: e.title, status: e.kind === "run" ? "failed" : e.kind === "session" ? "needs_attention" : "info", summary: e.body, link: e.link, id: e.id, read: !!e.read }));
+  const activity = [...runs, ...events].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 20);
+  const attention = [
+    ...connections.filter((c) => c.status === "needs_login").map((c) => ({ kind: "session", platform: c.id, title: `${c.name} needs you to sign in again`, action: "connect" })),
+    ...listMessages({ status: "needs_assignment", limit: 10 }).map((m) => ({ kind: "message", id: m.id, title: "Which AI should do this?", body: m.text, action: "choose" })),
+    ...listMessages({ status: "failed", limit: 10 }).map((m) => ({ kind: "message", id: m.id, title: "Could not send an instruction", body: m.error ?? m.text, action: "retry" })),
+    ...listEvents({ unread: true, limit: 10 }).filter((e) => e.kind === "run").map((e) => ({ kind: "run", id: e.id, platform: e.platform, title: e.title, body: e.body, link: e.link, action: "dismiss" })),
+  ];
+  res.json({
+    connections,
+    chat: listMessages({ limit: 40 }).map(expandMessage).reverse(),
+    attention,
+    activity,
+    router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
+    storage: storageInfo(),
+    browser: await browser.status(),
+    scheduler: schedulerStatus(),
+    alerts: { configured: alertsConfigured() },
+    email: emailStatus(),
+    publicUrl: config.publicUrl,
+    connectedCount: connectedPlatforms().length,
+  });
+});
+
+/* settings */
+api.get("/settings", (_req, res) => {
+  res.json({
+    passwordFromEnv: adminFromEnv(),
+    ingestToken: ingestToken(),
+    ingestTokenFromEnv: !!process.env.ACP_INGEST_TOKEN,
+    router: { provider: config.router.provider, model: config.router.model, llm: config.router.llm },
+    alerts: { webhook: !!config.alerts.webhookUrl, telegram: !!(config.alerts.telegramToken && config.alerts.telegramChatId) },
+    email: emailStatus(),
+    storage: storageInfo(),
+    syncIntervalMin: config.sync.intervalMin,
+  });
+});
+api.post("/settings/password", (req, res) => {
+  const current = String(req.body?.current ?? "");
+  const next = String(req.body?.next ?? "");
+  if (next.length < 8) return bad(res, "Use at least 8 characters.");
+  if (adminFromEnv()) return bad(res, "The password is set by ACP_ADMIN_TOKEN on the server; change it there.", 409);
+  if (!changeAdminPassword(current, next)) return bad(res, "Current password is wrong.", 401);
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req)));
+  res.json({ ok: true });
+});
+api.post("/settings/ingest-token/rotate", (_req, res) => res.json({ ingestToken: rotateIngestToken(), fromEnv: !!process.env.ACP_INGEST_TOKEN }));
 
 /* ---------- messages (instructions from you, routed to agents) ---------- */
 

@@ -2,7 +2,7 @@ export type SessionStatus = "logged_in" | "needs_login" | "unknown" | "error";
 export type RunStatus = "success" | "failed" | "running" | "needs_attention" | "unknown";
 export type AgentSource = "registry" | "discovered" | "push";
 
-export type DeliveryMode = "auto" | "inbox" | "webhook" | "browser" | "manual";
+export type DeliveryMode = "auto" | "inbox" | "webhook" | "browser" | "manual" | "chat";
 
 /** How instructions reach an agent. Stored as JSON on the agent row. */
 export interface AgentDelivery {
@@ -51,6 +51,8 @@ export interface MessageRow {
   id: number;
   text: string;
   status: MessageStatus;
+  /** Target AI (platform id) when the instruction was sent to a connection's chat. */
+  platform: string | null;
   agent_id: number | null;
   /** JSON Suggestion[] */
   suggestions: string | null;
@@ -143,4 +145,18 @@ export interface PlatformConfig {
   actions: Record<string, PlatformActionDef>;
   /** Shown on the dashboard card. */
   notes: string;
+  /** One line: what you use this AI for. The router reads it. */
+  purpose: string;
+  /** Where a fresh conversation starts. Empty = appUrl. */
+  chatUrl: string;
+  /** The message box on a conversation page. */
+  composerSelector: string;
+  /** Send button. Empty = press Enter in the composer. */
+  sendSelector: string;
+  /** Elements holding the AI's replies; the last one is read back. */
+  replySelector: string;
+  /** Present while the AI is still generating (usually a Stop button). */
+  busySelector: string;
+  /** Hidden from the Connect list (for built-ins the user removed). */
+  hidden: boolean;
 }

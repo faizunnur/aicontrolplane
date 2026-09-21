@@ -127,6 +127,7 @@ function ensureColumn(table: string, column: string, ddl: string) {
 }
 ensureColumn("agents", "keywords", "keywords TEXT");
 ensureColumn("agents", "delivery", "delivery TEXT");
+ensureColumn("messages", "platform", "platform TEXT");
 
 export const now = () => new Date().toISOString();
 
@@ -543,6 +544,7 @@ export function getMessage(id: number): MessageWithAgent | undefined {
 
 export interface MessagePatch {
   status?: MessageStatus;
+  platform?: string | null;
   agent_id?: number | null;
   suggestions?: unknown;
   routing?: unknown;
@@ -558,9 +560,10 @@ export function updateMessage(id: number, patch: MessagePatch): MessageWithAgent
   if (!m) return undefined;
   const json = (v: unknown, cur: string | null) => (v === undefined ? cur : v === null ? null : JSON.stringify(v));
   db.prepare(
-    `UPDATE messages SET status=?, agent_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, updated_at=? WHERE id=?`,
+    `UPDATE messages SET status=?, platform=?, agent_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, updated_at=? WHERE id=?`,
   ).run(
     patch.status ?? m.status,
+    patch.platform === undefined ? m.platform : patch.platform,
     patch.agent_id === undefined ? m.agent_id : patch.agent_id,
     json(patch.suggestions, m.suggestions),
     json(patch.routing, m.routing),

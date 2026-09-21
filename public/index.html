@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>AI Control Plane</title>
-  <meta name="description" content="One place to see, steer and message every AI agent across ChatGPT, Claude, Grok and your own platforms." />
+  <meta name="description" content="Connect your AIs, tell them what to do from one chat, and watch them from one dashboard." />
   <meta name="color-scheme" content="light dark" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23167a74'/%3E%3Ccircle cx='16' cy='16' r='5' fill='white'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -13,249 +13,174 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div id="login" class="overlay" hidden>
-    <form class="panel login-panel" id="login-form">
+  <!-- Gate: create a password on first run, or sign in -->
+  <div id="gate" class="gate" hidden>
+    <form class="gate-card" id="gate-form">
       <div class="brand"><span class="mark" aria-hidden="true"></span><span class="wordmark">AI Control Plane</span></div>
-      <p class="muted">Enter the admin token to open the console.</p>
-      <label for="login-token">Admin token</label>
-      <input type="password" id="login-token" autocomplete="current-password" required />
-      <button class="btn primary" type="submit">Open console</button>
-      <p class="form-error" id="login-error" hidden>That token was not accepted.</p>
+      <h1 id="gate-title">Welcome</h1>
+      <p class="muted" id="gate-text"></p>
+      <label class="visually-hidden" for="gate-password">Password</label>
+      <input type="password" id="gate-password" autocomplete="current-password" placeholder="Password" required />
+      <button class="btn primary big" type="submit" id="gate-submit">Continue</button>
+      <p class="form-error" id="gate-error" hidden></p>
     </form>
   </div>
 
-  <header class="topbar">
-    <a class="brand" href="/"><span class="mark" aria-hidden="true"></span><span class="wordmark">AI Control Plane</span></a>
-    <nav class="health" id="health" aria-label="Platform sessions"></nav>
-    <div class="topbar-actions">
-      <button class="btn primary" id="btn-sync-all" title="Visit every platform's task page now">Sync all</button>
-      <a class="btn" id="btn-vnc" href="/vnc/" target="_blank" rel="noopener" title="Live screen of the cloud browser. Sign in to platforms here.">Browser screen</a>
-      <button class="btn icon" id="btn-theme" title="Theme: system" aria-label="Switch theme">◐</button>
-      <button class="btn icon" id="btn-refresh" title="Refresh" aria-label="Refresh">↻</button>
-      <button class="btn ghost" id="btn-logout">Sign out</button>
+  <header class="top">
+    <a class="brand" href="#chat"><span class="mark" aria-hidden="true"></span><span class="wordmark">AI Control Plane</span></a>
+    <nav class="tabs" role="tablist" aria-label="Screens">
+      <a class="tab" href="#chat" data-tab="chat" role="tab">Chat</a>
+      <a class="tab" href="#dashboard" data-tab="dashboard" role="tab">Dashboard <span class="tab-badge" id="badge-attention" hidden></span></a>
+      <a class="tab" href="#connect" data-tab="connect" role="tab">Connect <span class="tab-badge" id="badge-connect" hidden></span></a>
+    </nav>
+    <div class="top-actions">
+      <button class="btn icon" id="btn-theme" title="Theme" aria-label="Switch theme">◐</button>
+      <button class="btn icon" id="btn-settings" title="Settings" aria-label="Settings">⚙</button>
     </div>
   </header>
 
-  <main class="page">
-    <section id="storage-warning" class="notice warn" hidden role="alert">
-      <div>
-        <strong>Logins will not survive the next redeploy.</strong>
-        <span id="storage-warning-text">The data directory is not on a mounted volume.</span>
-        Attach a volume at the data directory, or download your sessions now and restore them after deploying.
-      </div>
-      <div class="row">
-        <button class="btn small" id="btn-sessions-download">Download sessions</button>
-        <label class="btn small" for="sessions-file">Restore sessions</label>
-      </div>
-    </section>
-    <input type="file" id="sessions-file" accept="application/json" hidden />
-
-    <section id="setup" class="setup" hidden aria-label="Getting started">
-      <ol class="stepper" id="stepper"></ol>
-    </section>
-
-    <section class="summary" aria-label="Summary">
-      <div class="stats" id="stats"></div>
-      <figure class="chart">
-        <figcaption class="chart-head">
-          <span class="chart-title">Runs, last 14 days</span>
-          <ul class="legend" id="chart-legend" aria-label="Run outcomes"></ul>
-        </figcaption>
-        <div class="chart-body" id="chart"></div>
-        <div class="tooltip" id="chart-tip" hidden></div>
-      </figure>
-    </section>
-
-    <section class="deck">
-      <div class="deck-col">
-        <div class="section-head">
-          <h2>Needs attention <span class="count" id="attention-count"></span></h2>
-          <button class="btn ghost small" id="btn-read-all">Mark all read</button>
+  <main class="main">
+    <!-- CHAT -->
+    <section class="screen screen-chat" id="screen-chat" hidden>
+      <div class="thread" id="thread" aria-live="polite"></div>
+      <form class="composer" id="composer">
+        <div class="targets" id="targets" role="radiogroup" aria-label="Send to"></div>
+        <div class="composer-box">
+          <label class="visually-hidden" for="chat-text">Instruction</label>
+          <textarea id="chat-text" rows="1" placeholder="Tell your AIs what to do…" required></textarea>
+          <button class="btn primary" type="submit" id="chat-send" aria-label="Send">Send</button>
         </div>
-        <div id="attention-list" class="rows"></div>
-      </div>
-      <div class="deck-col">
-        <div class="section-head">
-          <h2>Messages</h2>
-          <span class="muted small" id="router-status"></span>
-        </div>
-        <form id="message-form" class="composer">
-          <label class="visually-hidden" for="message-text">Instruction</label>
-          <textarea id="message-text" rows="2" placeholder="Tell an agent what to do. &quot;Add Tesla to the competitor watch&quot; or &quot;@daily-digest include weekend news&quot;" required></textarea>
-          <div class="composer-row">
-            <select id="message-agent" aria-label="Route to"><option value="">Auto-route</option></select>
-            <span class="muted small hint">Ctrl+Enter to send</span>
-            <button class="btn primary" type="submit" id="message-send">Send</button>
+      </form>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section class="screen screen-dashboard" id="screen-dashboard" hidden>
+      <div id="attention" class="attention"></div>
+      <div class="ai-cards" id="ai-cards"></div>
+      <section class="activity">
+        <h2>Recent activity</h2>
+        <div id="activity" class="rows"></div>
+      </section>
+    </section>
+
+    <!-- CONNECT -->
+    <section class="screen screen-connect" id="screen-connect" hidden>
+      <p class="lead">Sign in to each AI once. The sign-in happens on a private screen inside this page and stays saved, so you never open those sites again.</p>
+      <div id="connections" class="connections"></div>
+      <details class="add-ai">
+        <summary>Add another AI</summary>
+        <form id="add-ai-form" class="add-ai-form">
+          <div class="form-grid">
+            <div><label for="add-name">Name</label><input id="add-name" required maxlength="40" placeholder="Muse" /></div>
+            <div><label for="add-url">Web address</label><input id="add-url" required placeholder="https://…" /></div>
           </div>
+          <label for="add-purpose">What you use it for</label>
+          <input id="add-purpose" placeholder="one line, helps route your instructions" maxlength="300" />
+          <div class="row end"><button class="btn primary" type="submit">Add AI</button></div>
         </form>
-        <div id="messages" class="rows"></div>
-      </div>
-    </section>
-
-    <section aria-label="Platforms">
-      <div class="section-head">
-        <h2>Platforms</h2>
-        <div class="row">
-          <span class="muted small" id="scheduler-status"></span>
-          <span class="muted small" id="storage-status"></span>
-          <details class="menu" id="sessions-menu">
-            <summary class="btn small ghost">Sessions</summary>
-            <div class="menu-list">
-              <button class="btn small ghost" id="btn-sessions-backup">Back up to volume now</button>
-              <button class="btn small ghost" id="btn-sessions-download-2">Download sessions file</button>
-              <label class="btn small ghost" for="sessions-file">Restore from file</label>
-            </div>
-          </details>
-        </div>
-      </div>
-      <div id="platforms" class="tiles"></div>
-    </section>
-
-    <section aria-label="Agents">
-      <div class="section-head">
-        <h2>Agents <span class="count" id="agents-count"></span></h2>
-        <div class="row">
-          <select id="agent-filter" aria-label="Filter by platform"><option value="">All platforms</option></select>
-          <button class="btn primary small" id="btn-add-agent">Add agent</button>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table id="agents-table">
-          <thead>
-            <tr><th>Agent</th><th>Platform</th><th>Schedule</th><th>History</th><th>Last run</th><th class="th-actions"><span class="visually-hidden">Actions</span></th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="empty" id="agents-empty" hidden>No agents yet. Sync a platform to discover its tasks, or add one by hand.</p>
-    </section>
-
-    <section class="two-col" aria-label="Activity">
-      <div>
-        <div class="section-head"><h2>Recent runs</h2></div>
-        <div id="runs" class="rows"></div>
-      </div>
-      <div>
-        <div class="section-head"><h2>Events</h2></div>
-        <div id="events" class="rows"></div>
-      </div>
-    </section>
-
-    <section class="howto">
-      <details>
-        <summary>Report runs from anywhere</summary>
-        <p class="muted">Any agent that can make an HTTP call can report in. Use the ingest token, never the admin token.</p>
-        <pre id="ingest-example"></pre>
       </details>
     </section>
   </main>
 
-  <!-- Agent editor -->
-  <div id="agent-modal" class="overlay" hidden>
-    <form class="panel modal" id="agent-form">
-      <h2 id="agent-modal-title">Add agent</h2>
-      <input type="hidden" id="agent-id" />
-      <label for="agent-name">Name</label>
-      <input id="agent-name" required maxlength="200" />
-      <div class="form-grid">
-        <div>
-          <label for="agent-platform">Platform</label>
-          <input id="agent-platform" list="platform-ids" required placeholder="chatgpt, claude, grok, muse, custom" />
-          <datalist id="platform-ids"></datalist>
-        </div>
-        <div>
-          <label for="agent-key">Key</label>
-          <input id="agent-key" placeholder="stable id agents report with (auto from name)" />
-        </div>
+  <!-- Sign-in / view screen for one AI -->
+  <div id="connect-modal" class="overlay" hidden>
+    <div class="panel screen-panel">
+      <div class="panel-head">
+        <h2 id="connect-title">Sign in</h2>
+        <button class="btn icon ghost" type="button" data-close aria-label="Close">✕</button>
       </div>
-      <label for="agent-purpose">Purpose</label>
-      <textarea id="agent-purpose" rows="2" placeholder="What it does, in a sentence. The router reads this."></textarea>
-      <div class="form-grid">
-        <div>
-          <label for="agent-schedule">Schedule</label>
-          <input id="agent-schedule" placeholder="weekdays 09:00, every 6h, cron…" />
-        </div>
-        <div>
-          <label for="agent-url">Native link</label>
-          <input id="agent-url" placeholder="https://… where you manage it" />
-        </div>
+      <p class="muted" id="connect-help">Sign in below exactly as you would on your laptop. When you can see your chats, press “I'm signed in”.</p>
+      <iframe id="connect-frame" title="Browser screen" allow="clipboard-read; clipboard-write"></iframe>
+      <div class="row end" id="connect-actions">
+        <button class="btn ghost" type="button" data-close>Later</button>
+        <button class="btn primary" type="button" id="connect-done">I'm signed in</button>
       </div>
-      <label for="agent-keywords">Routing keywords</label>
-      <input id="agent-keywords" placeholder="comma separated: market, stocks, morning" />
-      <fieldset class="fieldset">
-        <legend>How instructions reach it</legend>
-        <div class="form-grid">
-          <div>
-            <label for="agent-delivery-mode">Delivery</label>
-            <select id="agent-delivery-mode">
-              <option value="auto">Auto, by how it reports in</option>
-              <option value="inbox">Inbox: it pulls from /api/inbox</option>
-              <option value="webhook">Webhook: POST to a URL</option>
-              <option value="browser">Browser: typed into the platform</option>
-              <option value="manual">Manual: I copy and paste</option>
-            </select>
-          </div>
-          <div>
-            <label for="agent-delivery-action">Browser action</label>
-            <input id="agent-delivery-action" placeholder="send_message" />
-          </div>
-          <div>
-            <label for="agent-webhook-url">Webhook URL</label>
-            <input id="agent-webhook-url" placeholder="https://…" />
-          </div>
-          <div>
-            <label for="agent-webhook-token">Webhook bearer token</label>
-            <input id="agent-webhook-token" placeholder="optional" />
-          </div>
-        </div>
-      </fieldset>
-      <label class="check"><input type="checkbox" id="agent-enabled" checked /> Enabled</label>
-      <div class="row end">
-        <button class="btn ghost" type="button" data-close>Cancel</button>
-        <button class="btn primary" type="submit">Save agent</button>
-      </div>
-    </form>
+    </div>
   </div>
 
-  <!-- Platform settings -->
-  <div id="platform-modal" class="overlay" hidden>
-    <form class="panel modal wide" id="platform-form">
-      <h2 id="platform-modal-title">Platform settings</h2>
-      <input type="hidden" id="pf-id" />
-      <div class="form-grid">
-        <div><label for="pf-name">Name</label><input id="pf-name" /></div>
-        <div><label for="pf-appUrl">App URL</label><input id="pf-appUrl" placeholder="https://…" /></div>
-        <div><label for="pf-tasksUrl">Tasks page URL</label><input id="pf-tasksUrl" placeholder="page that lists scheduled tasks or bots" /></div>
-        <div><label for="pf-nativeUrlTemplate">Deep-link template</label><input id="pf-nativeUrlTemplate" placeholder="https://…/tasks/{{key}}" /></div>
-        <div><label for="pf-sessionCookie">Session cookie name</label><input id="pf-sessionCookie" /></div>
-        <div><label for="pf-cookieDomain">Cookie domain</label><input id="pf-cookieDomain" /></div>
-        <div><label for="pf-loggedInSelector">Signed-in selector</label><input id="pf-loggedInSelector" placeholder="optional CSS selector present only when signed in" /></div>
-        <div><label for="pf-snapshotSelector">Snapshot selector</label><input id="pf-snapshotSelector" placeholder="main" /></div>
+  <!-- Settings -->
+  <div id="settings-modal" class="overlay" hidden>
+    <div class="panel modal settings">
+      <div class="panel-head"><h2>Settings</h2><button class="btn icon ghost" type="button" data-close aria-label="Close">✕</button></div>
+      <nav class="subtabs" id="settings-tabs">
+        <button class="subtab active" data-stab="general">General</button>
+        <button class="subtab" data-stab="ai">AI setup</button>
+        <button class="subtab" data-stab="developer">Developer</button>
+      </nav>
+
+      <div class="stab" id="stab-general">
+        <h3>Password</h3>
+        <form id="password-form" class="stack">
+          <p class="muted small" id="password-note"></p>
+          <div class="form-grid">
+            <div><label for="pw-current">Current</label><input type="password" id="pw-current" autocomplete="current-password" /></div>
+            <div><label for="pw-next">New</label><input type="password" id="pw-next" autocomplete="new-password" minlength="8" /></div>
+          </div>
+          <div class="row end"><button class="btn" type="submit">Change password</button></div>
+        </form>
+
+        <h3>How instructions are routed</h3>
+        <p class="muted small" id="router-note"></p>
+
+        <h3>Notifications</h3>
+        <p class="muted small" id="alerts-note"></p>
+
+        <h3>Saved sign-ins</h3>
+        <p class="muted small" id="storage-note"></p>
+        <div class="row">
+          <button class="btn small" id="btn-backup">Back up now</button>
+          <button class="btn small" id="btn-download">Download</button>
+          <label class="btn small" for="sessions-file">Restore</label>
+          <input type="file" id="sessions-file" accept="application/json" hidden />
+        </div>
       </div>
-      <label for="pf-capturePatterns">Capture URL patterns <span class="muted">(regex, one per line)</span></label>
-      <textarea id="pf-capturePatterns" rows="3"></textarea>
-      <label for="pf-loginUrlPatterns">Login URL patterns <span class="muted">(regex, one per line)</span></label>
-      <textarea id="pf-loginUrlPatterns" rows="2"></textarea>
-      <label for="pf-actions">Actions <span class="muted">(JSON; steps may use {{native_url}}, {{key}}, {{name}}, {{tasksUrl}}, {{message}})</span></label>
-      <textarea id="pf-actions" rows="6" placeholder='{"run_now": {"label": "Run now", "steps": [{"type":"goto","url":"{{native_url}}"},{"type":"click","selector":"text=Run now"}]}}'></textarea>
-      <label for="pf-notes">Notes</label>
-      <input id="pf-notes" />
-      <details id="pf-discovered">
-        <summary>JSON endpoints seen on the last sync</summary>
-        <p class="muted small">✓ marks endpoints that matched the capture patterns. Add a pattern for the ones that carry your tasks.</p>
-        <div id="pf-discovered-list" class="rows"></div>
-      </details>
-      <div class="row end">
-        <button class="btn ghost" type="button" id="pf-reset">Reset to defaults</button>
-        <button class="btn ghost" type="button" data-close>Cancel</button>
-        <button class="btn primary" type="submit">Save settings</button>
+
+      <div class="stab" id="stab-ai" hidden>
+        <p class="muted small">Everything the app needs to drive an AI's website. Change these only if a site changed its layout and chat stopped working.</p>
+        <label for="ai-select">AI</label>
+        <select id="ai-select"></select>
+        <form id="ai-form" class="stack">
+          <div class="form-grid">
+            <div><label for="ai-name">Name</label><input id="ai-name" /></div>
+            <div><label for="ai-purpose">What you use it for</label><input id="ai-purpose" /></div>
+            <div><label for="ai-appUrl">Web address</label><input id="ai-appUrl" /></div>
+            <div><label for="ai-chatUrl">New chat address</label><input id="ai-chatUrl" /></div>
+            <div><label for="ai-tasksUrl">Scheduled tasks page</label><input id="ai-tasksUrl" /></div>
+            <div><label for="ai-composerSelector">Message box selector</label><input id="ai-composerSelector" class="mono" /></div>
+            <div><label for="ai-sendSelector">Send button selector <span class="muted">(empty = Enter)</span></label><input id="ai-sendSelector" class="mono" /></div>
+            <div><label for="ai-replySelector">Reply selector</label><input id="ai-replySelector" class="mono" /></div>
+            <div><label for="ai-busySelector">“Still writing” selector</label><input id="ai-busySelector" class="mono" /></div>
+            <div><label for="ai-sessionCookie">Session cookie name</label><input id="ai-sessionCookie" class="mono" /></div>
+            <div><label for="ai-cookieDomain">Cookie domain</label><input id="ai-cookieDomain" class="mono" /></div>
+          </div>
+          <label for="ai-loginUrlPatterns">Sign-in page patterns <span class="muted">(one per line)</span></label>
+          <textarea id="ai-loginUrlPatterns" rows="2" class="mono"></textarea>
+          <label for="ai-capturePatterns">Task data patterns <span class="muted">(one per line)</span></label>
+          <textarea id="ai-capturePatterns" rows="2" class="mono"></textarea>
+          <div class="row end">
+            <button class="btn ghost danger" type="button" id="ai-remove">Remove this AI</button>
+            <button class="btn ghost" type="button" id="ai-restore">Restore defaults</button>
+            <button class="btn primary" type="submit">Save</button>
+          </div>
+        </form>
       </div>
-    </form>
+
+      <div class="stab" id="stab-developer" hidden>
+        <h3>Report from your own agents</h3>
+        <p class="muted small">Anything that can make an HTTP call can report a run or pick up instructions. Use this token, never your password.</p>
+        <div class="row">
+          <code id="ingest-token" class="token">…</code>
+          <button class="btn small" id="btn-copy-token">Copy</button>
+          <button class="btn small ghost" id="btn-rotate-token">New token</button>
+        </div>
+        <pre id="ingest-example"></pre>
+        <p class="muted small">Agents can also fetch instructions you send them: <code>GET /api/inbox?platform=&amp;key=</code> and acknowledge with <code>POST /api/inbox/:id/ack</code>. The <code>examples/</code> folder has a shell script, a Claude Code routine prompt and an MCP server for Cowork.</p>
+      </div>
+    </div>
   </div>
 
-  <!-- Screenshot lightbox -->
   <div id="shot-modal" class="overlay" hidden data-close-on-click>
-    <div class="shot-wrap"><img id="shot-img" alt="Platform screenshot" /></div>
+    <div class="shot-wrap"><img id="shot-img" alt="Screenshot" /></div>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

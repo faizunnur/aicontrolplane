@@ -19,21 +19,11 @@ function list(v: string | undefined): string[] {
 const isProd = process.env.NODE_ENV === "production";
 const dataDir = path.resolve(process.env.DATA_DIR || "./data");
 
-let adminToken = process.env.ACP_ADMIN_TOKEN || "";
-if (!adminToken) {
-  if (isProd) {
-    adminToken = randomBytes(24).toString("hex");
-    console.warn(`[config] ACP_ADMIN_TOKEN not set. Generated one for this boot: ${adminToken}`);
-  } else {
-    adminToken = "dev";
-    console.warn("[config] ACP_ADMIN_TOKEN not set. Using 'dev' (development only).");
-  }
-}
-let ingestToken = process.env.ACP_INGEST_TOKEN || "";
-if (!ingestToken) {
-  ingestToken = isProd ? randomBytes(24).toString("hex") : "dev-ingest";
-  console.warn(`[config] ACP_INGEST_TOKEN not set. Using: ${ingestToken}`);
-}
+// Passwords and tokens: ACP_ADMIN_TOKEN / ACP_INGEST_TOKEN when set, otherwise created on first
+// visit and stored in the database (see auth.ts). Nothing is generated here anymore.
+const adminToken = process.env.ACP_ADMIN_TOKEN || "";
+const ingestToken = process.env.ACP_INGEST_TOKEN || "";
+void randomBytes;
 
 export const config = {
   isProd,

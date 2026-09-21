@@ -1,5 +1,6 @@
 import { runAction } from "./actions.js";
 import { browser } from "./browser/manager.js";
+import { chatWithConnection, checkConnection } from "./collect/chat.js";
 import { config } from "./config.js";
 import { addEvent, getAgent, getMessage, getPlatformState, updateMessage, type MessageWithAgent } from "./db.js";
 import { logger } from "./logger.js";
@@ -32,12 +33,47 @@ export function resolveMode(agent: Agent): Exclude<DeliveryMode, "auto"> {
 
 export function describeMode(mode: DeliveryMode): string {
   return {
+    chat: "sent in the AI's chat; the answer comes back here",
     auto: "decided per agent",
     inbox: "the agent fetches it from its inbox on its next run",
     webhook: "posted to the agent's webhook",
     browser: "typed into the platform through the cloud browser",
     manual: "copy it and paste it into the platform yourself",
   }[mode];
+}
+
+/**
+ * Send an instruction to a connected AI's chat and wait for its answer.
+ * The message row is updated as it goes: assigned → delivered → done (with the reply) or failed.
+ */
+export async function deliverToConnection(messageId: number, platformId: string): Promise<MessageWithAgent> {
+  const msg = getMessage(messageId);
+  if (!msg) throw new Error("message not found");
+  const p = getPlatform(platformId);
+  if (!p) throw new Error(`unknown AI ${platformId}`);
+  updateMessage(msg.id, { platform: p.id, agent_id: null, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null });
+  // Never sit on a two-minute chat attempt against an AI that is not signed in: look first.
+  let status = getPlatformState(p.id).session_status;
+  if (status !== "logged_in") status = await checkConnection(p);
+  if (status !== "logged_in") {
+    const error = status === "needs_login" ? `${p.name} needs you to sign in again. Open Connect.` : `${p.name} is not connected yet. Open Connect and sign in.`;
+    addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
+    return updateMessage(msg.id, { status: "failed", error })!;
+  }
+  const r = await chatWithConnection(p, msg.text);
+  const now = new Date().toISOString();
+  if (!r.ok) {
+    log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
+    addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: `${r.error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
+    return updateMessage(msg.id, { status: "failed", error: r.error ?? "unknown error" })!;
+  }
+  return updateMessage(msg.id, {
+    status: "done",
+    delivered_at: now,
+    acked_at: now,
+    response: r.reply ? (r.partial ? r.reply + "\n\n(reply was still being written when I stopped waiting)" : r.reply) : "Sent. No reply text could be read back; open the AI to see it.",
+    error: null,
+  })!;
 }
 
 /** Deliver an assigned message. Updates the row and returns it. Never throws. */
