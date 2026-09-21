@@ -9,6 +9,7 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
 import { startEmailPoller } from "./ingest/email.js";
+import { persistEnabled, saveToDatabase, startPersistLoop, stopPersistLoop } from "./persist.js";
 import { startScheduler, stopScheduler } from "./sync.js";
 
 const log = logger("server");
@@ -90,11 +91,14 @@ server.listen(config.port, () => {
   log.info(`AI Control Plane listening on :${config.port} (data: ${config.dataDir})`);
   if (config.publicUrl) log.info(`public url: ${config.publicUrl}`);
   const st = storageInfo();
-  if (st.persistent === false) {
-    log.warn(`DATA_DIR ${st.dataDir} is NOT on a mounted volume. Logins, the database and screenshots will be lost on redeploy. Attach a volume at ${st.dataDir}.`);
-  } else if (st.persistent === true) {
+  if (st.persistedBy === "none" && st.persistent === false) {
+    log.warn(`DATA_DIR ${st.dataDir} is NOT on a mounted volume and no DATABASE_URL is set. Logins, chat history and settings will be lost on redeploy. Attach a volume at ${st.dataDir} or add a Postgres database.`);
+  } else if (st.persistedBy === "volume") {
     log.info(`data dir is on volume ${st.mount}${st.backupAt ? `, session backup from ${st.backupAt}` : ""}`);
+  } else if (st.persistedBy === "database") {
+    log.info("state is mirrored to the Postgres database; no volume needed");
   }
+  if (persistEnabled) startPersistLoop();
   startScheduler();
   startEmailPoller();
   if (browser.enabled) {
@@ -106,10 +110,12 @@ server.listen(config.port, () => {
 async function shutdown(signal: string) {
   log.info(`${signal} received, shutting down`);
   stopScheduler();
+  stopPersistLoop();
   server.close();
-  // Back up sessions and close Chromium cleanly so the profile on the volume is flushed,
-  // but never hang a redeploy: give it a few seconds, then exit regardless.
-  await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 8_000))]);
+  // Back up sessions and close Chromium cleanly, then push the final state to Postgres,
+  // but never hang a redeploy: a few seconds each, then exit regardless.
+  await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 6_000))]);
+  await Promise.race([saveToDatabase(true), new Promise((r) => setTimeout(r, 5_000))]);
   process.exit(0);
 }
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

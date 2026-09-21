@@ -225,7 +225,8 @@
   function renderDashboard() {
     const a = home.attention;
     $("#attention").innerHTML = [
-      home.browser.enabled && home.storage?.persistent === false ? `<div class="notice warn"><div class="body"><strong>Your sign-ins will be lost on the next deploy.</strong><div class="sub">The server's data folder is not on a persistent disk. Attach a volume at ${esc(home.storage.dataDir)}, or download your sign-ins from Settings.</div></div><button class="btn small" data-open-settings="general">Open Settings</button></div>` : "",
+      home.storage?.persistedBy === "none" ? `<div class="notice warn"><div class="body"><strong>Your sign-ins and chats will be lost on the next deploy.</strong><div class="sub">Nothing keeps this server's data folder. Easiest fix: add a Postgres database to the Railway project and reference its DATABASE_URL in this service. Or attach a volume at ${esc(home.storage.dataDir)}.</div></div><button class="btn small" data-open-settings="general">Open Settings</button></div>` : "",
+      home.storage?.database?.lastError ? `<div class="notice bad"><div class="body"><strong>The database backup is failing.</strong><div class="sub">${esc(home.storage.database.lastError)}</div></div></div>` : "",
       ...a.map((x) => {
         const cls = x.kind === "session" ? "warn" : x.kind === "run" ? "bad" : x.action === "retry" ? "bad" : "warn";
         const btn = x.action === "connect" ? `<button class="btn small primary" data-connect="${esc(x.platform)}">Sign in</button>`
@@ -327,8 +328,9 @@
         : "Instructions go to the AI you name, or to the only connected AI. To let Claude decide between several, set CLAUDE_CODE_OAUTH_TOKEN (from “claude setup-token”) or ANTHROPIC_API_KEY on the server.";
       $("#alerts-note").textContent = settings.alerts.telegram || settings.alerts.webhook ? `Failures and sign-outs are sent to ${[settings.alerts.telegram ? "Telegram" : "", settings.alerts.webhook ? "your webhook" : ""].filter(Boolean).join(" and ")}.` : "Not set up. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or ALERT_WEBHOOK_URL, on the server to get notified when something fails or an AI signs you out.";
       const st = settings.storage;
-      $("#storage-note").textContent = st.persistent === true ? `Sign-ins are saved on a persistent disk${st.backupAt ? ` and were backed up ${rel(st.backupAt)}` : ""}.`
-        : st.persistent === false ? `Warning: ${st.dataDir} is not persistent. Sign-ins will be lost on redeploy unless you attach a volume there. Download a copy to be safe.`
+      $("#storage-note").textContent = st.persistedBy === "database" ? `Sign-ins, chats and settings are mirrored to your Postgres database${st.database.lastSaveAt ? ` (last saved ${rel(st.database.lastSaveAt)})` : ""}. No volume needed.`
+        : st.persistedBy === "volume" ? `Sign-ins are saved on a persistent disk${st.backupAt ? ` and were backed up ${rel(st.backupAt)}` : ""}.`
+        : st.persistedBy === "none" ? `Warning: nothing keeps ${st.dataDir} between deploys. Add a Postgres database (reference DATABASE_URL in this service) or attach a volume there. Download a copy of your sign-ins to be safe.`
         : `Sign-ins are saved under ${st.dataDir}${st.backupAt ? `, backed up ${rel(st.backupAt)}` : ""}.`;
       $("#ingest-token").textContent = settings.ingestToken;
       $("#btn-rotate-token").hidden = settings.ingestTokenFromEnv;

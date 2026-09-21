@@ -3,6 +3,7 @@ import path from "node:path";
 import { chromium, type BrowserContext, type Cookie, type Page } from "playwright";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
+import { persistStatus, saveToDatabase } from "../persist.js";
 
 const log = logger("browser");
 
@@ -86,6 +87,7 @@ class BrowserManager {
       const tmp = this.backupFile + ".tmp";
       fs.writeFileSync(tmp, JSON.stringify(state));
       fs.renameSync(tmp, this.backupFile);
+      void saveToDatabase().catch(() => undefined);
       return state.cookies.length;
     } catch (err) {
       log.warn("session backup failed", err);
@@ -206,7 +208,15 @@ class BrowserManager {
  * Is DATA_DIR on a mounted volume? On Linux we read /proc/mounts; anywhere else we
  * cannot tell and return null. A false here means logins vanish on redeploy.
  */
-export function storageInfo(): { dataDir: string; persistent: boolean | null; mount: string | null; backupAt: string | null } {
+export function storageInfo(): {
+  dataDir: string;
+  persistent: boolean | null;
+  mount: string | null;
+  backupAt: string | null;
+  /** What keeps state across redeploys. "unknown" when the platform cannot tell (e.g. local dev). */
+  persistedBy: "volume" | "database" | "none" | "unknown";
+  database: { enabled: boolean; lastSaveAt: string | null; lastError: string | null };
+} {
   let persistent: boolean | null = null;
   let mount: string | null = null;
   try {
@@ -231,7 +241,9 @@ export function storageInfo(): { dataDir: string; persistent: boolean | null; mo
   } catch {
     backupAt = null;
   }
-  return { dataDir: config.dataDir, persistent, mount, backupAt };
+  const database = persistStatus();
+  const persistedBy = database.enabled && !database.lastError ? "database" : persistent === true ? "volume" : persistent === false ? "none" : "unknown";
+  return { dataDir: config.dataDir, persistent, mount, backupAt, persistedBy, database };
 }
 
 export const browser = new BrowserManager();

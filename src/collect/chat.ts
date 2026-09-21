@@ -125,8 +125,18 @@ export async function checkConnection(p: PlatformConfig): Promise<"logged_in" | 
   if (!browser.enabled || !p.appUrl) return "error";
   return browser.withLock(async () => {
     try {
-      const page = await browser.consolePage(p.id);
-      await page.goto(p.appUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      let page = await browser.consolePage(p.id);
+      try {
+        await page.goto(p.appUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      } catch (err) {
+        // A crashed or stalled tab gets one fresh try before we call it an error.
+        const msg = cleanError(err);
+        if (!/Timeout|Target closed|has been closed|crashed/i.test(msg)) throw err;
+        log.warn(`check ${p.id}: ${msg}; retrying on a fresh tab`);
+        await browser.resetConsolePage(p.id);
+        page = await browser.consolePage(p.id);
+        await page.goto(p.appUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      }
       await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
       const loginPatterns = compilePatterns(p.loginUrlPatterns);
       let status: "logged_in" | "needs_login" = "logged_in";

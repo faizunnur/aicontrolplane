@@ -38,10 +38,15 @@ Everything else lives behind the gear icon.
 ### On Railway (recommended)
 
 1. Create a service from this repository. The `Dockerfile` and `railway.toml` are picked up automatically.
-2. Add a **volume mounted at `/data`**. That is where your sign-ins live. Without it every deploy signs you out,
-   and the app will show a warning banner.
-3. Give the service at least 2 GB of memory (it runs Chromium) and generate a domain.
-4. Open the domain. Create your password. Go to Connect and sign in to your AIs. That's it.
+2. Keep your data between deploys, one of two ways:
+   - **Postgres (easiest).** Add a Postgres database to the project and, in this service's variables, add
+     `DATABASE_URL` referencing it (`${{Postgres.DATABASE_URL}}`). Sign-ins, chats and settings are mirrored
+     there and restored on every boot. No volume needed.
+   - **Volume.** Attach a volume mounted at `/data`.
+   Without either, every deploy signs you out and the dashboard shows a warning banner.
+3. Do not set `DATA_DIR` on Railway; the image already uses `/data`.
+4. Give the service at least 2 GB of memory (it runs Chromium; "Page crashed" means it needs more) and generate a domain.
+5. Open the domain. Create your password. Go to Connect and sign in to your AIs. That's it.
 
 Optional variables, all set in the Railway service:
 
@@ -77,9 +82,12 @@ When you press Enter without choosing an AI:
 
 ## Keeping sign-ins across redeploys
 
-Sign-ins live in the browser profile under `/data`. Three layers protect them: the volume, an automatic backup
-file the app restores from if the profile ever comes up empty, and Settings › Saved sign-ins where you can
-download the file and restore it later. Treat that file like a password.
+Sign-ins live in the browser profile under `/data`. With `DATABASE_URL` set, the app mirrors its small state
+(the SQLite database with chats, tasks and your password; the AI settings; the sign-in cookies) into one table
+in Postgres every minute when something changed and on shutdown, and restores it before starting. With a
+volume instead, the same files simply stay on disk. In both cases an automatic backup file is restored into the
+browser profile if it ever comes up empty, and Settings › Saved sign-ins lets you download and restore the
+sign-ins by hand. Treat that file like a password.
 
 ## When a site changes its layout
 
