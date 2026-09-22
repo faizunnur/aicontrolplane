@@ -3,10 +3,11 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
 import { config } from "./config.js";
-import { getPlatformState, listAgents } from "./db.js";
+import { getPlatformState, listTasks } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatforms, visiblePlatforms } from "./platforms.js";
-import type { Agent, PlatformConfig, Suggestion } from "./types.js";
+import { getProvider } from "./providers/registry.js";
+import type { Task, PlatformConfig, Suggestion } from "./types.js";
 
 const log = logger("router");
 
@@ -34,15 +35,10 @@ export function connectedPlatforms(): PlatformConfig[] {
   return visiblePlatforms().filter((p) => p.composerSelector && getPlatformState(p.id).session_status === "logged_in");
 }
 
-const ALIASES: Record<string, string[]> = {
-  chatgpt: ["chatgpt", "gpt", "openai", "chat gpt"],
-  claude: ["claude", "anthropic", "cowork", "claude code"],
-  grok: ["grok", "xai", "x.ai"],
-};
-
 function mentioned(text: string, p: PlatformConfig): boolean {
   const lower = text.toLowerCase();
-  const names = [p.id.toLowerCase(), p.name.toLowerCase(), ...(ALIASES[p.id] ?? [])];
+  // The provider adapter knows the names people use for it ("gpt", "anthropic", "x.ai", …).
+  const names = getProvider(p.id)?.aliases ?? [p.id.toLowerCase(), p.name.toLowerCase()];
   return names.some((n) => n && (lower.includes(`@${n}`) || new RegExp(`(^|\\b)(ask|tell|use|in|on|via|with|to)\\s+${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(lower) || new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[,:]`).test(lower)));
 }
 
@@ -160,7 +156,7 @@ function bag(parts: (string | null | undefined)[]): Set<string> {
   return out;
 }
 
-export function keywordRoute(text: string, agents: Agent[]): { suggestions: Suggestion[]; mention: Suggestion | null } {
+export function keywordRoute(text: string, agents: Task[]): { suggestions: Suggestion[]; mention: Suggestion | null } {
   const platforms = getPlatforms();
   const stems = tokenize(text).map(stem);
   const lower = text.toLowerCase();
@@ -171,7 +167,7 @@ export function keywordRoute(text: string, agents: Agent[]): { suggestions: Sugg
     let score = 0;
     const nameLower = a.name.toLowerCase();
     if (lower.includes(`@${a.key.toLowerCase()}`) || lower.includes(`@${nameLower}`)) {
-      mention = { agent_id: a.id, key: a.key, name: a.name, platform: a.platform, score: 1, reason: "mentioned explicitly" };
+      mention = { task_id: a.id, key: a.key, name: a.name, platform: a.platform, score: 1, reason: "mentioned explicitly" };
     } else if (nameLower.length >= 6 && lower.includes(nameLower)) {
       score += 6;
       reasons.push("name appears in the instruction");
@@ -184,7 +180,7 @@ export function keywordRoute(text: string, agents: Agent[]): { suggestions: Sugg
     if (purposeHits.length) score += purposeHits.length, reasons.push(`purpose mentions "${[...new Set(purposeHits)].slice(0, 3).join(", ")}"`);
     const p = platforms[a.platform];
     if (stems.some((t) => bag([a.platform, p?.name]).has(t))) score += 2, reasons.push(`platform "${p?.name ?? a.platform}" named`);
-    if (score > 0) scored.push({ agent_id: a.id, key: a.key, name: a.name, platform: a.platform, score, reason: reasons.join("; ") });
+    if (score > 0) scored.push({ task_id: a.id, key: a.key, name: a.name, platform: a.platform, score, reason: reasons.join("; ") });
   }
   scored.sort((x, y) => y.score - x.score);
   const s1 = scored[0]?.score ?? 0;
@@ -214,7 +210,7 @@ Rules:
 - confidence is your honest probability that this agent is the right one. Use 0.9+ only when it is unambiguous.
 - Keep reason to one sentence written for the user, not for a machine.`;
 
-function registryText(agents: Agent[]): string {
+function registryText(agents: Task[]): string {
   const platforms = getPlatforms();
   return [...agents]
     .sort((a, b) => a.platform.localeCompare(b.platform) || a.key.localeCompare(b.key))
@@ -229,11 +225,11 @@ function registryText(agents: Agent[]): string {
 }
 
 export async function routeMessage(text: string): Promise<RoutingResult> {
-  const agents = listAgents().filter((a) => a.enabled);
+  const agents = listTasks().filter((a) => a.enabled);
   if (agents.length === 0) return { method: "none", suggestions: [], top: null, confidence: 0, reason: "No agents registered yet.", new_agent: null };
   const kw = keywordRoute(text, agents);
   if (kw.mention) {
-    const rest = kw.suggestions.filter((s) => s.agent_id !== kw.mention!.agent_id);
+    const rest = kw.suggestions.filter((s) => s.task_id !== kw.mention!.task_id);
     return { method: "mention", suggestions: [kw.mention, ...rest], top: kw.mention, confidence: 1, reason: kw.mention.reason, new_agent: null };
   }
   if (config.router.llm) {
@@ -243,12 +239,12 @@ export async function routeMessage(text: string): Promise<RoutingResult> {
         agents.find((a) => a.key === key && (!platform || a.platform === platform)) ?? agents.find((a) => a.key === key);
       const suggestions: Suggestion[] = [];
       const topAgent = byKey(result.agent_key, result.platform);
-      if (topAgent) suggestions.push({ agent_id: topAgent.id, key: topAgent.key, name: topAgent.name, platform: topAgent.platform, score: Math.max(0, Math.min(1, result.confidence)), reason: result.reason });
+      if (topAgent) suggestions.push({ task_id: topAgent.id, key: topAgent.key, name: topAgent.name, platform: topAgent.platform, score: Math.max(0, Math.min(1, result.confidence)), reason: result.reason });
       for (const alt of result.alternatives ?? []) {
         const a = byKey(alt.agent_key, alt.platform);
-        if (a && !suggestions.some((s) => s.agent_id === a.id)) suggestions.push({ agent_id: a.id, key: a.key, name: a.name, platform: a.platform, score: 0.4, reason: alt.reason });
+        if (a && !suggestions.some((s) => s.task_id === a.id)) suggestions.push({ task_id: a.id, key: a.key, name: a.name, platform: a.platform, score: 0.4, reason: alt.reason });
       }
-      for (const s of kw.suggestions) if (!suggestions.some((x) => x.agent_id === s.agent_id)) suggestions.push({ ...s, score: Math.min(s.score, 0.35) });
+      for (const s of kw.suggestions) if (!suggestions.some((x) => x.task_id === s.task_id)) suggestions.push({ ...s, score: Math.min(s.score, 0.35) });
       return { method: "llm", suggestions: suggestions.slice(0, 5), top: topAgent ? suggestions[0] : null, confidence: topAgent ? suggestions[0].score : 0, reason: result.reason, new_agent: result.new_agent ?? null };
     }
     log.warn(`llm routing unavailable: ${error}`);
@@ -270,6 +266,26 @@ function keywordResult(suggestions: Suggestion[], text: string): RoutingResult {
     reason: top ? `Best keyword match: ${top.reason}.` : "No agent's name, purpose or keywords match this instruction.",
     new_agent: top ? null : { platform: named?.id ?? "custom", name: text.slice(0, 40), purpose: text.slice(0, 200) },
   };
+}
+
+/* =====================================================================
+   Is this message for the control plane or for a provider? (used by src/intents.ts)
+   ===================================================================== */
+
+const IntentSchema = z.object({
+  kind: z.enum(["control_question", "task_command", "provider_chat"]).describe("control_question: asks about the state of the user's agents, tasks, runs or approvals; task_command: run/pause/resume/stop/continue a task or approve/reject a request; provider_chat: anything to be answered by an AI assistant"),
+  topic: z.enum(["running", "scheduled", "completed", "failed", "attention", "approvals", "agents", "summary", "status"]).nullable().describe("for control_question"),
+  action: z.enum(["run", "pause", "resume", "stop", "continue", "approve", "reject"]).nullable().describe("for task_command"),
+  target: z.string().nullable().describe("for task_command: the task or agent named, as the user wrote it"),
+  provider: z.string().nullable().describe("provider id the message is about, if one is named"),
+  timeframe: z.enum(["today", "yesterday", "week", "all"]).nullable(),
+});
+const INTENT_SYSTEM = `You classify one message typed into an AI control plane that manages the user's AI agents, their scheduled tasks and runs across providers. Decide whether the message asks the control plane about its own state (control_question), tells the control plane to act on a task or approval (task_command), or is meant for an AI assistant to answer (provider_chat). Questions about the world, requests for writing, research or opinions are provider_chat even when they mention an AI's name. Be strict: only messages about the user's own agents, tasks, runs or approvals are control questions.`;
+
+export async function classifyWithClaude(text: string, providers: { id: string; name: string }[], taskNames: string[]) {
+  const user = `Providers: ${providers.map((p) => `${p.id} (${p.name})`).join(", ") || "none"}\nKnown tasks: ${taskNames.slice(0, 40).join("; ") || "none"}\n\nMessage:\n${text}`;
+  const { result } = await askJson(INTENT_SYSTEM, user, IntentSchema);
+  return result;
 }
 
 /* =====================================================================
@@ -303,7 +319,7 @@ async function askJson<T extends z.ZodTypeAny>(system: string, user: string, sch
   }
 }
 
-/** Same question through the Claude Agent SDK, authenticated by CLAUDE_CODE_OAUTH_TOKEN (your subscription). */
+/** Same question through the Claude Task SDK, authenticated by CLAUDE_CODE_OAUTH_TOKEN (your subscription). */
 async function askClaudeCode<T extends z.ZodTypeAny>(system: string, user: string, schema: T): Promise<{ result: z.infer<T> | null; error?: string }> {
   // The Claude Code runtime validates the schema itself and rejects the "$schema" header Zod emits.
   const { $schema: _omit, ...jsonSchema } = z.toJSONSchema(schema) as Record<string, unknown>;

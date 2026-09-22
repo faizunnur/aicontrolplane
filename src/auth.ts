@@ -2,14 +2,18 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "./config.js";
-import { getSetting, setSetting } from "./db.js";
+import { addAudit, deleteAllSessions, deleteSession, findSession, getSetting, insertSession, purgeExpiredSessions, setSetting, touchSession } from "./db.js";
 
 export const SESSION_COOKIE = "acp_session";
+/** A login lasts this long without use. */
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 
 /*
   Credentials come from the environment when set (ACP_ADMIN_TOKEN / ACP_INGEST_TOKEN),
   otherwise from a password the user creates on first visit, stored hashed in the database.
-  The ingest token is generated at that moment and shown under Settings › Developer.
+  A login creates a session: a random token, stored hashed, sent as an HttpOnly cookie, and
+  revocable one by one (logout) or all at once (password change). The ingest token is generated
+  on first run and shown under Settings › Developer.
 */
 
 export function tokenHash(token: string): string {
@@ -47,10 +51,13 @@ export function createAdminPassword(password: string): boolean {
   if (!envIngest && !getSetting("ingest_token")) setSetting("ingest_token", randomBytes(24).toString("hex"));
   return true;
 }
+/** Changing the password signs every browser out; the caller issues a fresh session for this one. */
 export function changeAdminPassword(current: string, next: string): boolean {
   if (envAdmin) return false;
   if (!verifyAdmin(current)) return false;
   setSetting("admin_password_hash", tokenHash(next));
+  deleteAllSessions();
+  addAudit({ actor: "you", action: "auth.password_changed" });
   return true;
 }
 export function ingestToken(): string {
@@ -66,6 +73,7 @@ export function rotateIngestToken(): string {
   if (envIngest) return envIngest;
   const t = randomBytes(24).toString("hex");
   setSetting("ingest_token", t);
+  addAudit({ actor: "you", action: "auth.ingest_token_rotated" });
   return t;
 }
 
@@ -89,21 +97,55 @@ function bearer(req: IncomingMessage): string | undefined {
   return m?.[1];
 }
 
-/** The session cookie carries a hash of (hash of password); it changes when the password does. */
-function sessionValue(): string | null {
-  const h = adminHash();
-  return h ? tokenHash("session:" + h) : null;
+/* ---------- sessions ---------- */
+
+export function clientIp(req: IncomingMessage): string {
+  const fwd = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim();
+  return first || req.socket?.remoteAddress || "unknown";
 }
 
+/** Start a session for this browser. Returns the raw token to put in the cookie; only its hash is stored. */
+export function createSession(req: IncomingMessage): string {
+  purgeExpiredSessions();
+  const token = randomBytes(32).toString("base64url");
+  insertSession({ token_hash: tokenHash(token), expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(), user_agent: String(req.headers["user-agent"] ?? "").slice(0, 300) || null, ip: clientIp(req) });
+  addAudit({ actor: "you", action: "auth.login", detail: clientIp(req) });
+  return token;
+}
+
+const touched = new Map<number, number>();
+function sessionFromCookie(req: IncomingMessage) {
+  const raw = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+  if (!raw) return undefined;
+  const s = findSession(tokenHash(raw));
+  if (!s) return undefined;
+  // Note activity at most once a minute per session; the row is not worth a write per request.
+  const last = touched.get(s.id) ?? 0;
+  if (Date.now() - last > 60_000) {
+    touched.set(s.id, Date.now());
+    touchSession(s.id);
+  }
+  return s;
+}
+
+/** End this browser's session. */
+export function revokeSession(req: IncomingMessage): boolean {
+  const raw = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+  if (!raw) return false;
+  const ok = deleteSession(tokenHash(raw));
+  if (ok) addAudit({ actor: "you", action: "auth.logout" });
+  return ok;
+}
+
+/**
+ * Admin access: the password as a bearer token (for scripts), or a live session cookie (the UI).
+ * Never a token in the URL: it would land in logs and browser history.
+ */
 export function isAdmin(req: IncomingMessage): boolean {
   const b = bearer(req);
   if (b && verifyAdmin(b)) return true;
-  const sv = sessionValue();
-  const c = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-  if (sv && c && safeEqual(c, sv)) return true;
-  const q = (req as Request).query?.token;
-  if (typeof q === "string" && verifyAdmin(q)) return true;
-  return false;
+  return sessionFromCookie(req) !== undefined;
 }
 
 export function isIngest(req: IncomingMessage): boolean {
@@ -124,14 +166,26 @@ export function requireIngest(req: Request, res: Response, next: NextFunction) {
   res.status(401).json({ error: "unauthorized: send Authorization: Bearer <ingest token>" });
 }
 
-export function sessionCookieHeader(secure: boolean): string {
-  const parts = [`${SESSION_COOKIE}=${sessionValue() ?? ""}`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=2592000"];
+export function sessionCookieHeader(secure: boolean, token: string): string {
+  const parts = [`${SESSION_COOKIE}=${token}`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`];
   if (secure) parts.push("Secure");
   return parts.join("; ");
 }
 
 export function clearSessionCookieHeader(): string {
   return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+/** True when a browser request's Origin (if any) does not belong to this deployment. */
+export function crossOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (typeof origin !== "string" || !origin) return false;
+  const host = req.headers.host;
+  try {
+    return new URL(origin).host !== host;
+  } catch {
+    return true;
+  }
 }
 
 // Keep config in sync for modules that only need to know whether an env token exists.

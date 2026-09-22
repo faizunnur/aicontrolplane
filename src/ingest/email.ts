@@ -2,9 +2,9 @@ import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { sendAlert } from "../alerts.js";
 import { config } from "../config.js";
-import { addEvent, listAgents, recordRun } from "../db.js";
+import { addEvent, listTasks, recordRun } from "../db.js";
 import { logger } from "../logger.js";
-import { mapRunStatus } from "../collect/normalize.js";
+import { mapRunStatus } from "../providers/browser/normalize.js";
 
 const log = logger("email");
 
@@ -102,7 +102,10 @@ export async function pollOnce(): Promise<number> {
         if (agent) {
           const status = mapRunStatus(subject + " " + text.slice(0, 300));
           recordRun({
-            agent_id: agent.id,
+            task_id: agent.id,
+            kind: "email",
+            provider: platform,
+            trigger: "push",
             external_id: `email:${messageId}`,
             status: status === "unknown" ? "success" : status,
             finished_at: occurred,
@@ -132,7 +135,7 @@ export async function pollOnce(): Promise<number> {
 
 function matchAgent(platform: string, subject: string, text: string) {
   const hay = (subject + "\n" + text.slice(0, 1_000)).toLowerCase();
-  const candidates = listAgents({ platform, includeDisabled: true }).filter((a) => a.name.length >= 4);
+  const candidates = listTasks({ platform, includeDisabled: true }).filter((a) => a.name.length >= 4);
   candidates.sort((a, b) => b.name.length - a.name.length);
   return candidates.find((a) => hay.includes(a.name.toLowerCase()));
 }

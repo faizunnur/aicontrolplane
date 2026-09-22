@@ -1,4 +1,4 @@
-/* AI Control Plane — workspace: AIs + chats · conversation · live browser */
+/* AI Control Plane — navigation, command chat, live execution, settings */
 (() => {
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -18,10 +18,13 @@
   let target = ""; // "" = auto
   let approvalMode = "auto";
   let browserState = null;
-  let attention = [];
-  let activity = [];
+  let overview = null; // counts, running, attention (kept fresh over SSE)
+  let agents = [];
+  let view = "chat"; // chat | overview | agents | tasks | runs | approvals | activity | notifications
+  let viewFilter = "";
   let signingIn = null; // platform id while the sign-in ribbon shows
   const openActivity = new Map(); // message id -> user toggled open/closed
+  const runningRuns = new Map(); // run id -> { ...run, current_step }
   const app = $("#app");
 
   /* ---------- theme (dark by default) ---------- */
@@ -52,7 +55,7 @@
       showGate(data.setup ? "setup" : "login");
       throw new Error("unauthorized");
     }
-    if (!res.ok) throw new Error(data.error || res.statusText);
+    if (!res.ok) throw new Error(data.reason ? `${data.reason}` : data.error || res.statusText);
     return data;
   }
   function toast(msg, kind = "") {
@@ -90,9 +93,10 @@
     return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
   };
   const conn = (id) => connections.find((c) => c.id === id);
-  const aiName = (id) => conn(id)?.name || id || "an AI";
+  const aiName = (id) => conn(id)?.name || (id === "custom" ? "Custom agents" : id) || "an AI";
   const statusOf = (c) => c.status === "logged_in" ? { dot: "ok", label: "Connected" } : c.status === "needs_login" ? { dot: "warn", label: "Signed out" } : c.status === "error" ? { dot: "bad", label: "Problem" } : { dot: "", label: "Not connected" };
   const isRunning = (m) => m.status === "assigned" || m.status === "delivered";
+  const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
   /* ---------- gate ---------- */
   let gateMode = "login";
@@ -100,7 +104,7 @@
     gateMode = mode;
     $("#gate").hidden = false;
     $("#gate-title").textContent = mode === "setup" ? "Create your password" : "Welcome back";
-    $("#gate-text").textContent = mode === "setup" ? "This is the only password you need. It protects your chats and your saved sign-ins." : "Enter your password to open the workspace.";
+    $("#gate-text").textContent = mode === "setup" ? "This is the only password you need. It protects your chats and your saved sign-ins." : "Enter your password to open the control plane.";
     $("#gate-submit").textContent = mode === "setup" ? "Create password" : "Open";
     $("#gate-password").setAttribute("autocomplete", mode === "setup" ? "new-password" : "current-password");
     $("#gate-password").setAttribute("minlength", mode === "setup" ? "8" : "1");
@@ -133,8 +137,10 @@
     conversations = h.conversations;
     approvalMode = h.approvalMode;
     browserState = h.browser;
-    attention = h.attention;
-    activity = h.activity;
+    overview = h.overview;
+    agents = h.agents || [];
+    runningRuns.clear();
+    for (const r of h.overview?.running ?? []) runningRuns.set(r.id, r);
     if (conversationId === null) { current = null; messages = []; }
     else { current = h.conversation; messages = h.messages; }
     renderAll();
@@ -148,14 +154,37 @@
     renderTargets();
     renderThread();
     renderTabs();
-    renderBadge();
-    live.setState && live.setState(browserState);
+    renderCounts();
+    renderLiveContext();
+    if (view !== "chat") renderView();
   }
-  function renderBadge() {
-    const n = connections.filter((c) => c.status === "needs_login").length + attention.filter((x) => x.kind !== "session").length;
-    $("#badge-attention").hidden = !n;
-    $("#badge-attention").textContent = n;
+
+  /* ---------- counts in the sidebar ---------- */
+  function renderCounts() {
+    const c = overview?.counts ?? {};
+    const attention = (overview?.attention ?? []).length;
+    const set = (key, n, hideZero = true) => { for (const el of $$(`[data-count="${key}"]`)) { el.textContent = n; el.hidden = hideZero && !n; } };
+    set("attention", attention);
+    set("agents", c.agents ?? 0);
+    set("tasks", c.tasks ?? 0);
+    set("running", c.running ?? runningRuns.size);
+    set("awaiting_approval", c.awaiting_approval ?? 0);
+    set("unread", c.unread ?? 0);
+    const custom = agents.filter((a) => a.kind === "custom");
+    $("#custom-agents-sub").textContent = custom.length ? `${custom.length} registered${custom.some((a) => a.running) ? " · working" : ""}` : "none registered";
+    document.title = (c.running ? `(${c.running}) ` : "") + "AI Control Plane";
   }
+  const refreshOverview = debounce(async () => {
+    try {
+      overview = await api("/overview");
+      runningRuns.clear();
+      for (const r of overview.running) runningRuns.set(r.id, r);
+      renderCounts();
+      renderLiveContext();
+      if (view === "overview") renderView();
+    } catch (err) { fail(err); }
+  }, 400);
+  const refreshView = debounce(() => { if (view !== "chat") renderView(); }, 500);
 
   /* ---------- live updates (server-sent events) ---------- */
   let es = null;
@@ -178,11 +207,11 @@
       const c = JSON.parse(e.data);
       const i = connections.findIndex((x) => x.id === c.id);
       if (i >= 0) connections[i] = c; else connections.push(c);
-      renderAiList(); renderTargets(); renderBadge();
+      renderAiList(); renderTargets(); refreshOverview();
     });
     es.addEventListener("browser", (e) => {
       browserState = JSON.parse(e.data);
-      renderAiList(); renderEngine(); renderTabs(); renderRibbons();
+      renderAiList(); renderEngine(); renderTabs(); renderRibbons(); renderLiveContext();
     });
     es.addEventListener("conversation", (e) => {
       const { action, conversation: c } = JSON.parse(e.data);
@@ -201,6 +230,19 @@
       const s = JSON.parse(e.data);
       if (s.approvalMode) { approvalMode = s.approvalMode; renderMode(); renderEngine(); }
     });
+    es.addEventListener("run", (e) => {
+      const r = JSON.parse(e.data);
+      if (r.status === "running") runningRuns.set(r.id, { ...(runningRuns.get(r.id) || {}), ...r });
+      else runningRuns.delete(r.id);
+      renderLiveContext(); refreshOverview(); refreshView();
+    });
+    es.addEventListener("run-event", (e) => {
+      const ev = JSON.parse(e.data);
+      const r = runningRuns.get(ev.run_id);
+      if (r && ev.type === "step" && (ev.status === "running" || ev.status === "waiting")) { r.current_step = ev.label; r.current_step_status = ev.status; renderLiveContext(); }
+      if (view === "activity" || view === "runs") refreshView();
+    });
+    for (const k of ["approval", "task", "agent", "agent-deleted", "task-deleted", "notification"]) es.addEventListener(k, () => { refreshOverview(); refreshView(); if (k === "agent" || k === "agent-deleted") api("/agents").then((a) => { agents = a; renderCounts(); }).catch(() => null); });
   }
   function onMessage(m) {
     if (!current || m.conversation_id !== current.id) return;
@@ -264,19 +306,60 @@
   initGutter($("#gutter-right"), "browser");
   $("#btn-side-collapse").addEventListener("click", () => { app.classList.add("side-collapsed"); store.set("acp-side", "closed"); reflectCollapse(); });
   $("#btn-side-open").addEventListener("click", () => { app.classList.remove("side-collapsed"); store.set("acp-side", "open"); reflectCollapse(); });
-  const showBrowser = () => { app.classList.remove("browser-collapsed"); store.set("acp-browser", "open"); reflectCollapse(); if (isNarrow()) setView("browser"); };
+  const showBrowser = () => { app.classList.remove("browser-collapsed"); store.set("acp-browser", "open"); reflectCollapse(); if (isNarrow()) setPanel("browser"); };
   $("#btn-browser-close").addEventListener("click", () => { app.classList.add("browser-collapsed"); store.set("acp-browser", "closed"); reflectCollapse(); });
   $("#btn-browser-open").addEventListener("click", showBrowser);
   $("#btn-browser-fab").addEventListener("click", showBrowser);
   const isNarrow = () => window.matchMedia("(max-width: 960px)").matches;
-  function setView(v) {
+  function setPanel(v) {
     app.dataset.view = v;
     for (const b of $$(".mobile-nav .seg-btn")) b.classList.toggle("active", b.dataset.view === v);
   }
-  $(".mobile-nav").addEventListener("click", (e) => { const b = e.target.closest("[data-view]"); if (b) setView(b.dataset.view); });
+  $(".mobile-nav").addEventListener("click", (e) => { const b = e.target.closest("[data-view]"); if (b) setPanel(b.dataset.view); });
   applyWidths();
 
-  /* ---------- left: AIs ---------- */
+  /* ---------- navigation between the command chat and the views ---------- */
+  function setView(v, filter = "") {
+    if (!Views.titles[v] && v !== "chat") v = "chat";
+    view = v;
+    viewFilter = filter;
+    for (const a of $$("[data-nav]")) a.classList.toggle("active", a.dataset.nav === v && (!a.dataset.filter || a.dataset.filter === filter));
+    const isChat = v === "chat";
+    $("#thread").hidden = !isChat;
+    $("#composer").hidden = !isChat;
+    $("#view").hidden = isChat;
+    $("#mode").hidden = !isChat && v !== "approvals";
+    renderHeader();
+    if (!isChat) renderView();
+    else scrollThread();
+    if (isNarrow()) setPanel("chat");
+    const hash = v === "chat" ? "#chat" : `#${v}${filter ? `?${filter}` : ""}`;
+    if (location.hash !== hash) history.replaceState(null, "", hash);
+  }
+  function viewFromHash() {
+    const [name, filter] = (location.hash || "#chat").replace("#", "").split("?");
+    return { name: name || "chat", filter: filter ? decodeURIComponent(filter) : "" };
+  }
+  window.addEventListener("hashchange", () => { const h = viewFromHash(); if (h.name !== view || h.filter !== viewFilter) setView(h.name, h.filter); });
+  const viewCtx = { api, esc, icon, rel, dur, aiName, conn, get filter() { return viewFilter; }, set filter(v) { viewFilter = v; }, overview: null };
+  let viewSeq = 0;
+  async function renderView() {
+    const root = $("#view");
+    const seq = ++viewSeq;
+    const keepScroll = root.scrollTop;
+    try {
+      const tmp = document.createElement("div");
+      await Views.render(view, tmp, viewCtx);
+      if (seq !== viewSeq) return; // a newer render is on its way
+      root.innerHTML = tmp.innerHTML;
+      root.scrollTop = keepScroll;
+      tickTimers();
+    } catch (err) {
+      if (seq === viewSeq) root.innerHTML = `<div class="view-empty"><strong>Could not load this view</strong><span>${esc(err.message)}</span></div>`;
+    }
+  }
+
+  /* ---------- left: providers ---------- */
   function renderAiList() {
     const busyP = browserState?.busy?.platform;
     const rows = connections.filter((c) => c.appUrl || c.builtin).map((c) => {
@@ -289,12 +372,13 @@
         <div class="sub ${busyLabel ? "busy" : ""}">${esc(busyLabel || st.label)}${c.lastError && c.status !== "logged_in" && !busyLabel ? ` · ${esc(c.lastError)}` : ""}</div></div>
         <span class="dot ${busyLabel ? "run" : st.dot}"></span>
         <details class="menu"><summary class="btn icon ghost" aria-label="More" style="width:24px;height:24px">${icon("more", "sm")}</summary><div class="menu-list">
-          ${c.status === "logged_in" ? `<button class="btn small" data-view-ai="${c.id}">${icon("eye", "sm")} Show in browser</button><button class="btn small" data-check="${c.id}">${icon("check", "sm")} Check sign-in</button><button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in</button>`}
+          ${c.status === "logged_in" ? `<button class="btn small" data-view-ai="${c.id}">${icon("eye", "sm")} Show in browser</button><button class="btn small" data-check="${c.id}">${icon("check", "sm")} Check sign-in</button>${c.canSync ? `<button class="btn small" data-refresh="${c.id}">${icon("reload", "sm")} Look at its tasks now</button>` : ""}<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in</button>`}
+          <a class="btn small" href="#tasks" data-nav="tasks">${icon("tasks", "sm")} Its tasks</a>
           <button class="btn small" data-open-settings="ai" data-ai-id="${c.id}">${icon("edit", "sm")} Edit</button>
           <button class="btn small danger" data-remove="${c.id}">${icon("trash", "sm")} Remove</button></div></details>
       </div>`;
     });
-    $("#ai-list").innerHTML = rows.join("") || `<div class="side-empty">No AIs yet. Add one with +.</div>`;
+    $("#ai-list").innerHTML = rows.join("") || `<div class="side-empty">No providers yet. Add one with +.</div>`;
   }
   function renderEngine() {
     const b = browserState;
@@ -302,7 +386,7 @@
     const tabs = b?.pages?.length ?? 0;
     const bl = !b || b.enabled === false ? ["", "Cloud browser off"] : b.running ? ["ok", `Cloud browser on · ${tabs} tab${tabs === 1 ? "" : "s"}`] : ["warn", "Cloud browser starting…"];
     const rl = r?.llm ? `Routing by Claude${r.provider === "claude-code" ? " (subscription)" : ""}` : "Routing by name or keywords";
-    const ml = approvalMode === "manual" ? "Asks you before sending" : "Acts on its own";
+    const ml = approvalMode === "manual" ? "Asks you before acting" : "Acts on its own";
     $("#engine").innerHTML = `<div class="line"><span class="dot ${bl[0]}"></span><b>${esc(bl[1])}</b></div><div class="line">${icon("bolt", "sm")}<b>${esc(rl)}</b></div><div class="line">${icon(approvalMode === "manual" ? "hand" : "check", "sm")}<b>${esc(ml)}</b></div>`;
   }
 
@@ -318,13 +402,13 @@
     const el = $("#chat-list");
     if (!conversations.length) { el.innerHTML = `<div class="side-empty">Your chats show up here.</div>`; return; }
     let lastGroup = "";
-    el.innerHTML = conversations.map((c) => {
+    el.innerHTML = conversations.slice(0, 60).map((c) => {
       const at = c.last_message_at || c.created_at;
       const g = groupOf(at);
       const head = g !== lastGroup ? `<div class="chat-group">${g}</div>` : "";
       lastGroup = g;
       const dot = c.active ? `<span class="dot run"></span>` : c.last_status === "failed" ? `<span class="dot bad" title="Something failed"></span>` : c.last_status === "needs_assignment" ? `<span class="dot warn" title="Needs you"></span>` : "";
-      return `${head}<div class="chat-row ${current && current.id === c.id ? "active" : ""}" data-conv="${c.id}" role="button" tabindex="0">
+      return `${head}<div class="chat-row ${view === "chat" && current && current.id === c.id ? "active" : ""}" data-conv="${c.id}" role="button" tabindex="0">
         <div class="info"><div class="title">${esc(c.title || "New chat")}</div><div class="sub">${c.last_platform ? esc(aiName(c.last_platform)) + " · " : ""}${rel(at)}</div></div>${dot}
         <details class="menu"><summary class="btn icon ghost" aria-label="More" style="width:24px;height:24px">${icon("more", "sm")}</summary><div class="menu-list">
           <button class="btn small" data-rename="${c.id}">${icon("edit", "sm")} Rename</button>
@@ -337,27 +421,34 @@
       const d = await api(`/conversations/${id}`);
       current = d.conversation;
       messages = d.messages;
+      setView("chat");
       renderChatList(); renderHeader(); renderThread();
-      if (isNarrow()) setView("chat");
     } catch (err) { fail(err); }
   }
   function newChat() {
     current = null;
     messages = [];
+    setView("chat");
     renderChatList(); renderHeader(); renderThread();
-    if (isNarrow()) setView("chat");
     $("#chat-text").focus();
   }
   $("#btn-new-chat").addEventListener("click", newChat);
 
   /* ---------- middle: header, mode, targets ---------- */
   function renderHeader() {
+    if (view !== "chat") {
+      $("#chat-title").textContent = Views.titles[view] || view;
+      $("#chat-title").title = "";
+      $("#chat-sub").textContent = viewFilter ? `filtered: ${viewFilter}` : "";
+      return;
+    }
     $("#chat-title").textContent = current ? current.title || "New chat" : "New chat";
+    $("#chat-title").title = "Click to rename";
     const n = current?.message_count ?? messages.length;
     $("#chat-sub").textContent = current ? `${n} message${n === 1 ? "" : "s"}` : "";
   }
   $("#chat-title").addEventListener("click", async () => {
-    if (!current) return;
+    if (view !== "chat" || !current) return;
     const title = prompt("Rename this chat", current.title || "");
     if (title === null) return;
     try { current = await api(`/conversations/${current.id}`, { method: "PATCH", body: { title: title.trim() } }); renderHeader(); renderChatList(); } catch (err) { fail(err); }
@@ -372,16 +463,15 @@
       const r = await api("/settings/approval", { method: "PUT", body: { approvalMode: b.dataset.mode } });
       approvalMode = r.approvalMode;
       renderMode(); renderEngine();
-      toast(approvalMode === "manual" ? "The agent will now pause and ask before sending anything." : "The agent now acts on its own.");
+      toast(approvalMode === "manual" ? "The agent will now pause and ask before sending or acting." : "The agent now acts on its own for everyday actions. Deploys and deletions still ask.");
     } catch (err) { fail(err); }
   });
   function renderTargets() {
     const chattable = connections.filter((c) => c.canChat);
     $("#targets").innerHTML =
-      `<button type="button" class="chip ${target === "" ? "active" : ""}" data-target="" role="radio" aria-checked="${target === ""}" title="Pick the AI from what you write">Auto</button>` +
+      `<button type="button" class="chip ${target === "" ? "active" : ""}" data-target="" role="radio" aria-checked="${target === ""}" title="Questions and commands are answered here; anything else goes to the AI picked from what you write">Auto</button>` +
       chattable.map((c) => `<button type="button" class="chip ${target === c.id ? "active" : ""}" data-target="${c.id}" role="radio" aria-checked="${target === c.id}" title="${c.status === "logged_in" ? `Send to ${esc(c.name)}` : `${esc(c.name)} is not connected`}"><span class="dot ${statusOf(c).dot}"></span>${esc(c.name)}</button>`).join("");
-    $("#chat-send").disabled = chattable.length === 0;
-    $("#chat-text").placeholder = chattable.some((c) => c.status === "logged_in") ? "Message your AIs…" : "Sign in to an AI first, then message it here…";
+    $("#chat-send").disabled = false;
   }
   function setTarget(id) {
     target = id;
@@ -399,9 +489,7 @@
     const inner = $("#thread-inner");
     if (!messages.length) {
       const connected = connections.filter((c) => c.status === "logged_in" && c.canChat);
-      inner.innerHTML = `<div class="thread-empty"><strong>${connected.length ? "What should your AIs do?" : "Connect an AI to begin."}</strong>${connected.length
-        ? `Chat normally or give an instruction. It goes to the AI you name or pick, the answer comes back here, and you can watch it happen in the browser panel.<div class="examples">${["Grok, what's trending in AI today?", "Claude, draft this week's status report", "Set up a daily 9am summary of my tasks"].map((x) => `<button class="chip" data-example="${esc(x)}">${esc(x)}</button>`).join("")}</div>`
-        : `Open the menu next to an AI on the left and press Sign in. You sign in inside the browser panel, once.`}</div>`;
+      inner.innerHTML = `<div class="thread-empty"><strong>${connected.length ? "Mission control. What do you want to know or do?" : "Ask the control plane, or connect a provider to talk to an AI."}</strong>Questions about your agents, tasks and runs are answered here. Commands start, pause or stop tasks. Anything else goes to the AI you name or pick, and you can watch it happen in the browser panel.<div class="examples">${["What is running right now?", "What failed today?", "What requires my approval?", "Run the security scan again", ...(connected.length ? ["Grok, what's trending in AI today?", "Claude, draft this week's status report"] : [])].map((x) => `<button class="chip" data-example="${esc(x)}">${esc(x)}</button>`).join("")}</div></div>`;
       return;
     }
     inner.innerHTML = messages.map(renderTurn).join("");
@@ -424,18 +512,21 @@
   function scrollThread() { const t = $("#thread"); t.scrollTop = t.scrollHeight; }
 
   function renderTurn(m) {
-    const name = aiName(m.platform || m.agent_platform);
-    const pid = m.platform || m.agent_platform || "";
+    const control = m.routing?.method === "control";
+    const name = control ? "Control plane" : aiName(m.platform || m.task_platform);
+    const pid = control ? "system" : m.platform || m.task_platform || "";
     const others = (except) => connections.filter((c) => c.canChat && c.id !== except).map((c) => `<button class="btn small ghost" data-send="${m.id}" data-platform="${c.id}">Send to ${esc(c.name)}</button>`).join("");
     let reply = "";
     if (m.status === "done" || (m.status === "acknowledged" && m.response)) {
-      reply = `<div class="msg ai"><span class="avatar ${esc(pid)}">${esc(name.slice(0, 1))}</span><div class="col"><div class="meta"><span class="who">${esc(name)}</span>${rel(m.acked_at || m.updated_at)}</div><div class="bubble ai">${esc(m.response || "Done.")}</div></div></div>`;
+      reply = `<div class="msg ai"><span class="avatar ${esc(pid)}">${control ? icon("agents", "sm") : esc(name.slice(0, 1))}</span><div class="col"><div class="meta"><span class="who">${esc(name)}</span>${rel(m.acked_at || m.updated_at)}</div><div class="bubble ai">${esc(m.response || "Done.")}</div></div></div>`;
     } else if (m.status === "failed") {
-      reply = `<div class="msg ai"><span class="avatar ${esc(pid)}">!</span><div class="col"><div class="bubble error">${esc(m.error || "Something went wrong.")}</div><div class="choices">${m.status === "failed" && conn(pid)?.status === "needs_login" ? `<button class="btn small primary" data-connect="${esc(pid)}">Sign in to ${esc(name)}</button>` : ""}${pid ? `<button class="btn small" data-send="${m.id}" data-platform="${esc(pid)}">Try again</button>` : ""}${others(pid)}</div></div></div>`;
+      reply = `<div class="msg ai"><span class="avatar ${esc(pid)}">!</span><div class="col"><div class="bubble error">${esc(m.error || "Something went wrong.")}</div><div class="choices">${!control && conn(pid)?.status === "needs_login" ? `<button class="btn small primary" data-connect="${esc(pid)}">Sign in to ${esc(name)}</button>` : ""}${pid && !control ? `<button class="btn small" data-send="${m.id}" data-platform="${esc(pid)}">Try again</button>` : ""}${control ? "" : others(pid)}</div></div></div>`;
     } else if (m.status === "cancelled") {
-      reply = `<div class="msg ai"><div class="col"><div class="bubble note">${esc(m.error || "Stopped.")}</div><div class="choices">${pid ? `<button class="btn small" data-send="${m.id}" data-platform="${esc(pid)}">Send again</button>` : ""}${others(pid)}</div></div></div>`;
-    } else if (m.agent_id && (m.status === "assigned" || m.status === "delivered" || m.status === "acknowledged")) {
-      reply = `<div class="msg ai"><div class="col"><div class="bubble note">${esc(m.delivery_hint ? `Handed to ${m.agent_name}: ${m.delivery_hint}.` : `Handed to ${m.agent_name}.`)}</div></div></div>`;
+      reply = `<div class="msg ai"><div class="col"><div class="bubble note">${esc(m.error || "Stopped.")}</div><div class="choices">${pid && !control ? `<button class="btn small" data-send="${m.id}" data-platform="${esc(pid)}">Send again</button>` : ""}${control ? "" : others(pid)}</div></div></div>`;
+    } else if (control && m.status === "delivered" && m.response) {
+      reply = `<div class="msg ai"><span class="avatar system">${icon("agents", "sm")}</span><div class="col"><div class="meta"><span class="who">Control plane</span></div><div class="bubble ai">${esc(m.response)}</div></div></div>`;
+    } else if (m.task_id && (m.status === "assigned" || m.status === "delivered" || m.status === "acknowledged")) {
+      reply = `<div class="msg ai"><div class="col"><div class="bubble note">${esc(m.delivery_hint ? `Handed to ${m.task_name}: ${m.delivery_hint}.` : `Handed to ${m.task_name}.`)}</div></div></div>`;
     }
     return `<div class="turn" id="message-${m.id}">
       <div class="msg me"><div class="col"><div class="bubble me">${esc(m.text)}</div><div class="meta">${clock(m.created_at)}<button class="btn icon ghost" data-del="${m.id}" title="Remove from this chat" aria-label="Remove">${icon("trash", "sm")}</button></div></div></div>
@@ -444,10 +535,11 @@
 
   function renderActivity(m) {
     const steps = m.steps || [];
-    const running = isRunning(m) && !m.agent_id;
+    const running = isRunning(m) && !m.task_id;
     const waiting = steps.find((s) => s.status === "waiting");
     if (!steps.length && !running && m.status !== "needs_assignment") return "";
-    const name = aiName(m.platform);
+    const control = m.routing?.method === "control";
+    const name = control ? "the control plane" : aiName(m.platform);
     const state = m.status === "needs_assignment" || waiting ? "waiting" : running ? "running" : m.status === "failed" ? "failed" : m.status === "cancelled" ? "cancelled" : "done";
     const open = openActivity.has(m.id) ? openActivity.get(m.id) : state !== "done";
     const runningStep = [...steps].reverse().find((s) => s.status === "running");
@@ -467,7 +559,7 @@
       <button type="button" class="activity-head" data-toggle="${m.id}"><span class="glyph ${glyphState}"></span><span class="label">${esc(head)}</span>${elapsed}${icon("chev-down", "sm chev")}</button>
       <div class="activity-body"><ol class="steps">${list}</ol>${ask}${foot}</div></div>`;
   }
-  function tickTimers() { for (const el of $$(".elapsed[data-since]")) el.textContent = dur(el.dataset.since, null); }
+  function tickTimers() { for (const el of $$(".elapsed[data-since]")) el.textContent = dur(el.dataset.since, null); const lc = $("#lc-elapsed"); if (lc?.dataset.since) lc.textContent = dur(lc.dataset.since, null); }
   setInterval(tickTimers, 1000);
 
   /* ---------- composer ---------- */
@@ -496,7 +588,7 @@
           if (i >= 0) messages[i] = r.message; else messages.push(r.message);
           patchTurn(r.message);
         }
-        if (!r.routed) toast("Not sure which AI should do this. Pick one in the thread.");
+        if (r.routed === null) toast("Not sure which AI should do this. Pick one in the thread.");
       });
       scrollThread(true);
       ta.focus();
@@ -507,8 +599,8 @@
   const live = new LiveView({
     canvas: $("#screen"),
     viewport: $("#viewport"),
-    onState: (s) => { browserState = s; renderTabs(); renderRibbons(); renderAiList(); renderEngine(); },
-    onMeta: () => { renderUrl(); renderTabs(); renderViewportMessage(); },
+    onState: (s) => { browserState = s; renderTabs(); renderRibbons(); renderAiList(); renderEngine(); renderLiveContext(); },
+    onMeta: () => { renderUrl(); renderTabs(); renderViewportMessage(); renderLiveContext(); },
     onStatus: (st) => {
       $("#live-status").textContent = st.text;
       $("#live-dot").className = `dot ${st.kind === "live" ? "ok" : st.kind === "busy" ? "run" : st.kind === "down" ? "warn" : ""}`;
@@ -525,7 +617,7 @@
     $("#tabs").innerHTML =
       `<button class="tab follow ${live.follow ? "active" : ""}" data-tab="follow" title="Show whatever tab the agent is working in">${icon("eye", "sm")} Follow agent</button>` +
       pages.map((p) => `<button class="tab ${!live.follow && shown === p.platform ? "active" : ""}" data-tab="${esc(p.platform)}" title="${esc(p.title || p.url)}"><span class="dot ${busyP === p.platform ? "run" : shown === p.platform ? "ok" : ""}"></span>${esc(aiName(p.platform))}</button>`).join("");
-    for (const b of $$("[data-nav]")) b.disabled = !shown;
+    for (const b of $$("[data-nav-browser]")) b.disabled = !shown;
   }
   $("#tabs").addEventListener("click", (e) => {
     const b = e.target.closest("[data-tab]");
@@ -545,15 +637,15 @@
     e.preventDefault();
     const v = $("#url").value.trim();
     if (!v) return;
-    if (!live.meta?.platform) return toast("Open an AI first, then you can navigate its tab.");
+    if (!live.meta?.platform) return toast("Open a provider first, then you can navigate its tab.");
     live.nav(v);
     $("#viewport").focus({ preventScroll: true });
   });
   $("#url").addEventListener("blur", renderUrl);
   document.addEventListener("click", (e) => {
-    const b = e.target.closest("[data-nav]");
+    const b = e.target.closest("[data-nav-browser]");
     if (!b) return;
-    if (b.dataset.nav === "back") live.back(); else if (b.dataset.nav === "forward") live.forward(); else live.reload();
+    if (b.dataset.navBrowser === "back") live.back(); else if (b.dataset.navBrowser === "forward") live.forward(); else live.reload();
   });
   function renderRibbons() {
     const b = browserState;
@@ -570,12 +662,30 @@
     $("#viewport").classList.toggle("interactive", live.interactive);
   }
   $("#btn-control").addEventListener("click", () => { live.setOverride(!live.override); renderRibbons(); $("#viewport").focus({ preventScroll: true }); });
+  /** The execution the browser panel is showing: agent, provider, task, current action, elapsed. */
+  function renderLiveContext() {
+    const el = $("#live-context");
+    const shown = live.meta?.platform || browserState?.busy?.platform || browserState?.active || null;
+    const runs = [...runningRuns.values()];
+    const run = runs.find((r) => r.provider === shown) || runs.find((r) => r.message_id && browserState?.busy?.messageId === r.message_id) || (browserState?.busy ? runs.find((r) => r.provider === browserState.busy.platform) : null) || null;
+    if (!run) { el.hidden = true; return; }
+    el.hidden = false;
+    $("#lc-agent").textContent = run.agent_name || aiName(run.provider) || "Agent";
+    $("#lc-provider").textContent = run.provider ? aiName(run.provider) : "control plane";
+    $("#lc-task").textContent = run.label || run.task_name || run.kind;
+    $("#lc-step").textContent = run.current_step || browserState?.busy?.label || "working";
+    const lc = $("#lc-elapsed");
+    lc.dataset.since = run.started_at || run.created_at;
+    lc.textContent = dur(lc.dataset.since, null);
+    $("#lc-stop").hidden = false;
+    $("#lc-stop").dataset.stopRun = run.id;
+  }
   function renderViewportMessage() {
     const el = $("#viewport-msg");
     const st = live.status();
     if (st.kind === "off") { el.hidden = false; el.innerHTML = `<strong>The browser is off on this deployment</strong><span>Run the Docker image (or set BROWSER_ENABLED=true) to watch and drive your AIs here.</span>`; }
     else if (st.kind === "down") { el.hidden = false; el.innerHTML = `<strong>${esc(st.text)}</strong><span>The live view reconnects on its own.</span>`; }
-    else if (st.kind === "idle") { el.hidden = false; el.innerHTML = `<strong>Nothing open yet</strong><span>Send a message, or sign in to an AI from the left, and its tab shows up here.</span>`; }
+    else if (st.kind === "idle") { el.hidden = false; el.innerHTML = `<strong>Nothing open yet</strong><span>Send a message, or sign in to a provider from the left, and its tab shows up here.</span>`; }
     else el.hidden = true;
   }
   const LEVELS = ["low", "medium", "high"];
@@ -629,38 +739,7 @@
   });
   $("#btn-signin-dismiss").addEventListener("click", () => { signingIn = null; renderRibbons(); });
 
-  /* ---------- activity modal ---------- */
-  const runCls = (s) => ({ success: "ok", failed: "bad", needs_attention: "warn", running: "run" })[s] || "";
-  const runLabel = (s) => ({ success: "ok", failed: "failed", needs_attention: "needs you", running: "running" })[s] || s || "";
-  async function openActivityModal() {
-    try {
-      const h = await api("/home");
-      attention = h.attention; activity = h.activity; connections = h.connections; home = h;
-      renderBadge();
-      $("#attention").innerHTML = [
-        h.storage?.persistedBy === "none" ? `<div class="notice warn"><div class="body"><strong>Your sign-ins and chats will be lost on the next deploy.</strong><div class="sub">Nothing keeps this server's data folder. Add a Postgres database to the Railway project and reference its DATABASE_URL in this service, or attach a volume at ${esc(h.storage.dataDir)}.</div></div><button class="btn small" data-open-settings="general">Open Settings</button></div>` : "",
-        h.storage?.database?.lastError ? `<div class="notice bad"><div class="body"><strong>The database backup is failing.</strong><div class="sub">${esc(h.storage.database.lastError)}</div></div></div>` : "",
-        ...attention.map((x) => {
-          const cls = x.kind === "session" ? "warn" : x.kind === "run" ? "bad" : x.action === "retry" ? "bad" : "warn";
-          const btn = x.action === "connect" ? `<button class="btn small primary" data-connect="${esc(x.platform)}">Sign in</button>` : x.action === "choose" || x.action === "retry" ? `<button class="btn small" data-close>Open chat</button>` : `<button class="btn small ghost" data-read="${x.id}">Dismiss</button>`;
-          return `<div class="notice ${cls}"><div class="body"><strong>${esc(x.title)}</strong>${x.body ? `<div class="sub">${esc(String(x.body).slice(0, 200))}</div>` : ""}</div>${x.link ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(x.link)}">Open</a>` : ""}${btn}</div>`;
-        }),
-      ].join("") || `<div class="notice"><div class="body"><strong>All quiet.</strong><div class="sub">Nothing needs you right now.</div></div></div>`;
-      $("#ai-cards").innerHTML = connections.filter((c) => c.appUrl).map((c) => {
-        const st = statusOf(c);
-        const tasks = c.tasks.slice(0, 5).map((t) => `<div class="task"><span class="name" title="${esc(t.name)}">${esc(t.name)}</span>${t.last_run ? `<span class="badge ${runCls(t.last_run.status)}">${esc(runLabel(t.last_run.status))}</span>` : `<span class="sched">${esc(t.schedule || "")}</span>`}</div>`).join("");
-        return `<article class="ai-card"><div class="head"><span class="dot ${st.dot}"></span><h3>${esc(c.name)}</h3><span class="muted small">${st.label}</span></div>
-          ${c.hasScreenshot ? `<img class="shot" data-shot="${c.id}" src="/api/platforms/${c.id}/screenshot.png?t=${encodeURIComponent(c.lastSync || "")}" alt="${esc(c.name)} screen" loading="lazy" />` : ""}
-          <div class="tasks">${tasks || `<span class="muted small">${c.status === "logged_in" ? (c.canSync ? "No scheduled tasks found yet." : "Ready for messages.") : "Sign in to see what it is doing."}</span>`}${c.tasks.length > 5 ? `<span class="muted small">+${c.tasks.length - 5} more</span>` : ""}</div>
-          <div class="foot"><span>${c.lastSync ? `checked ${rel(c.lastSync)}` : ""}</span><span class="row">${c.status === "logged_in" ? `<button class="btn small ghost" data-refresh="${c.id}">Refresh</button><button class="btn small ghost" data-view-ai="${c.id}" data-close>Show</button>` : `<button class="btn small primary" data-connect="${c.id}">Sign in</button>`}</span></div></article>`;
-      }).join("");
-      $("#activity").innerHTML = activity.map((x) => `<div class="rowitem s-${runCls(x.status) || "run"}"><div class="body"><div class="title">${esc(x.title)} ${x.status && x.status !== "info" ? `<span class="badge ${runCls(x.status)}">${esc(runLabel(x.status))}</span>` : ""}</div><div class="sub">${esc(aiName(x.platform))}${x.summary ? " · " + esc(String(x.summary).slice(0, 160)) : ""} · ${rel(x.at)}</div></div>${x.link ? `<a class="btn small ghost" target="_blank" rel="noopener" href="${esc(x.link)}">Open</a>` : ""}</div>`).join("") || `<p class="empty">Nothing yet. Once your AIs run tasks or answer messages, it shows up here.</p>`;
-      $("#activity-modal").hidden = false;
-    } catch (err) { fail(err); }
-  }
-  $("#btn-activity").addEventListener("click", openActivityModal);
-
-  /* ---------- add an AI ---------- */
+  /* ---------- add a provider ---------- */
   $("#btn-add-ai").addEventListener("click", () => { $("#add-modal").hidden = false; $("#add-name").focus(); });
   $("#add-ai-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -682,9 +761,9 @@
       settings = await api("/settings");
       $("#password-note").textContent = settings.passwordFromEnv ? "The password is set on the server (ACP_ADMIN_TOKEN). Change it there." : "";
       $("#password-form").hidden = settings.passwordFromEnv;
-      $("#router-note").textContent = settings.router.provider === "claude-code" ? "Claude decides which AI gets each message, using your Claude subscription (CLAUDE_CODE_OAUTH_TOKEN)."
-        : settings.router.provider === "api" ? `Claude (${settings.router.model}) decides which AI gets each message, using your Anthropic API key.`
-        : "Messages go to the AI you name, or to the only connected AI. To let Claude decide between several, set CLAUDE_CODE_OAUTH_TOKEN (from “claude setup-token”) or ANTHROPIC_API_KEY on the server.";
+      $("#router-note").textContent = settings.router.provider === "claude-code" ? "Claude decides which AI gets each message, using your Claude subscription (CLAUDE_CODE_OAUTH_TOKEN). Claude also double-checks whether a message is a question for the control plane."
+        : settings.router.provider === "api" ? `Claude (${settings.router.model}) decides which AI gets each message, using your Anthropic API key, and double-checks whether a message is a question for the control plane.`
+        : "Messages go to the AI you name, or to the only connected AI. Questions about your agents and tasks are answered by the control plane itself. To let Claude decide between several AIs, set CLAUDE_CODE_OAUTH_TOKEN (from “claude setup-token”) or ANTHROPIC_API_KEY on the server.";
       $("#alerts-note").textContent = settings.alerts.telegram || settings.alerts.webhook ? `Failures and sign-outs are sent to ${[settings.alerts.telegram ? "Telegram" : "", settings.alerts.webhook ? "your webhook" : ""].filter(Boolean).join(" and ")}.` : "Not set up. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or ALERT_WEBHOOK_URL, on the server to get notified when something fails or an AI signs you out.";
       const st = settings.storage;
       $("#storage-note").textContent = st.persistedBy === "database" ? `Sign-ins, chats and settings are mirrored to your Postgres database${st.database.lastSaveAt ? ` (last saved ${rel(st.database.lastSaveAt)})` : ""}. No volume needed.`
@@ -694,11 +773,18 @@
       $("#ingest-token").textContent = settings.ingestToken;
       $("#btn-rotate-token").hidden = settings.ingestTokenFromEnv;
       const base = home?.publicUrl || location.origin;
-      $("#ingest-example").textContent = `curl -X POST ${base}/api/ingest \\
-  -H "Authorization: Bearer ${settings.ingestToken}" \\
-  -H "Content-Type: application/json" \\
-  -d '{ "agent": { "key": "nightly-audit", "platform": "custom", "name": "Nightly audit" },
+      $("#ingest-example").textContent = `# register your agent once
+curl -X POST ${base}/api/agents/register \\
+  -H "Authorization: Bearer ${settings.ingestToken}" -H "Content-Type: application/json" \\
+  -d '{ "key": "scanner-bot", "name": "Scanner bot", "description": "watches repositories" }'
+
+# report a finished run of one of its tasks
+curl -X POST ${base}/api/ingest \\
+  -H "Authorization: Bearer ${settings.ingestToken}" -H "Content-Type: application/json" \\
+  -d '{ "agent": { "key": "nightly-audit", "platform": "custom", "name": "Nightly audit", "schedule": "daily 02:00" },
+        "profile": { "key": "scanner-bot" },
         "run": { "status": "success", "summary": "0 issues found" } }'`;
+      await renderPolicies();
       const sel = $("#ai-select");
       sel.innerHTML = connections.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
       sel.value = aiId || connections[0]?.id || "";
@@ -707,6 +793,20 @@
       $("#settings-modal").hidden = false;
     } catch (err) { fail(err); }
   }
+  async function renderPolicies() {
+    const p = await api("/policies");
+    $("#policy-list").innerHTML = p.policies.map((x) => `<div class="policy-row"><div class="body"><div>${esc(x.definition.label)}${x.override ? ` <span class="badge">custom</span>` : ""}</div><div class="sub">${esc(x.definition.description)}${x.definition.floor !== "auto" ? ` Never below “${x.definition.floor}”.` : ""}</div></div>
+      <div class="seg">${["auto", "ask", "always"].map((m) => `<button class="seg-btn ${x.mode === m ? "active" : ""}" data-policy="${esc(x.action)}" data-mode-set="${m}" ${["auto", "ask", "always"].indexOf(m) < ["auto", "ask", "always"].indexOf(x.definition.floor) ? "disabled" : ""}>${m === "auto" ? "Go ahead" : m === "ask" ? "Ask" : "Always ask"}</button>`).join("")}</div>
+      ${x.override ? `<button class="btn xs ghost" data-policy="${esc(x.action)}" data-mode-set="" title="Follow the switch again">reset</button>` : ""}</div>`).join("");
+  }
+  $("#policy-list").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-policy]");
+    if (!b || b.disabled) return;
+    try {
+      await api(`/policies/${b.dataset.policy}`, { method: "PUT", body: { mode: b.dataset.modeSet || null } });
+      await renderPolicies();
+    } catch (err) { fail(err); }
+  });
   function showSettingsTab(tab) {
     for (const b of $$(".subtab")) b.classList.toggle("active", b.dataset.stab === tab);
     for (const s of $$(".stab")) s.hidden = s.id !== `stab-${tab}`;
@@ -734,7 +834,7 @@
   });
   $("#ai-restore").addEventListener("click", async () => {
     const id = $("#ai-form").dataset.id;
-    if (!confirm("Restore this AI's built-in settings?")) return;
+    if (!confirm("Restore this provider's built-in settings?")) return;
     try { await api(`/connections/${id}/restore`, { method: "POST", body: {} }); await fillAiForm(id); toast("Defaults restored.", "ok"); await load(current ? current.id : null); } catch (err) { fail(err); }
   });
   $("#ai-remove").addEventListener("click", async () => {
@@ -779,56 +879,98 @@
       if (!Array.isArray(parsed.cookies)) throw new Error("That file has no sign-ins in it.");
       const r = await api("/browser/import-state", { method: "POST", body: { cookies: parsed.cookies } });
       await api("/browser/backup", { method: "POST", body: {} }).catch(() => null);
-      toast(`Restored ${r.imported} cookies. Check each AI from its menu.`, "ok");
+      toast(`Restored ${r.imported} cookies. Check each provider from its menu.`, "ok");
       await load(current ? current.id : null);
     } catch (err) { fail(err); } finally { e.target.value = ""; }
   });
 
+  /* ---------- expanding details inside views ---------- */
+  async function toggleDetail(kind, id, host) {
+    const box = $(`#${kind}-detail-${id}`, host) || host.querySelector(`.${kind}-detail`);
+    if (kind === "run") {
+      let box2 = host.nextElementSibling?.classList.contains("run-detail") ? host.nextElementSibling : null;
+      if (box2) { box2.remove(); return; }
+      box2 = document.createElement("div");
+      box2.className = "run-detail";
+      box2.innerHTML = `<span class="muted small">Loading…</span>`;
+      host.insertAdjacentElement("afterend", box2);
+      await Views.detail.run(box2, id, viewCtx);
+      tickTimers();
+      return;
+    }
+    if (!box) return;
+    if (!box.hidden) { box.hidden = true; return; }
+    box.hidden = false;
+    box.innerHTML = `<span class="muted small">Loading…</span>`;
+    await Views.detail[kind](box, id, viewCtx);
+    tickTimers();
+  }
+
   /* ---------- global clicks ---------- */
   document.addEventListener("click", async (e) => {
     for (const d of $$("details.menu[open]")) if (!d.contains(e.target)) d.removeAttribute("open");
-    const t = e.target.closest("[data-send],[data-del],[data-connect],[data-view-ai],[data-check],[data-refresh],[data-remove],[data-read],[data-shot],[data-open-settings],[data-close],[data-approve],[data-cancel],[data-toggle],[data-conv],[data-rename],[data-delete-conv],[data-ai],[data-example]");
+    const t = e.target.closest("[data-send],[data-del],[data-connect],[data-view-ai],[data-check],[data-refresh],[data-remove],[data-read],[data-read-all],[data-shot],[data-open-settings],[data-close],[data-approve],[data-approve-id],[data-cancel],[data-stop-run],[data-run-task],[data-pause-task],[data-resume-task],[data-sync-all],[data-toggle],[data-conv],[data-rename],[data-delete-conv],[data-ai],[data-example],[data-nav],[data-filter],[data-filter-clear],[data-open-run],[data-open-task],[data-open-agent]");
     if (!t) {
       const ov = e.target.closest("[data-close-on-click]");
       if (ov && e.target === ov) ov.hidden = true;
       return;
     }
     if (e.target.closest("details.menu") && !e.target.closest(".menu-list")) return; // the ⋯ summary itself
+    if (t.tagName === "A" && t.hasAttribute("href") && !t.dataset.nav && !t.closest(".menu-list")) return; // plain links open normally
     const btn = t.tagName === "BUTTON" ? t : null;
     const d = t.dataset;
     try {
       if (d.close !== undefined) { t.closest(".overlay").hidden = true; }
-      if (d.send) { await busy(btn, () => api(`/chat/${d.send}/send`, { method: "POST", body: { platform: d.platform } })); }
+      if (d.nav !== undefined) { e.preventDefault(); if (t.closest(".overlay")) t.closest(".overlay").hidden = true; setView(d.nav, d.filter || ""); }
+      else if (d.filter !== undefined && !d.nav) { viewFilter = d.filter; renderView(); }
+      else if (d.filterClear !== undefined) { viewFilter = ""; renderView(); }
+      else if (d.send) { await busy(btn, () => api(`/chat/${d.send}/send`, { method: "POST", body: { platform: d.platform } })); }
       else if (d.approve) { await busy(btn, () => api(`/chat/${d.approve}/approve`, { method: "POST", body: { decision: d.decision } })); }
+      else if (d.approveId) { await busy(btn, () => api(`/approvals/${d.approveId}/decide`, { method: "POST", body: { decision: d.decision } })); refreshOverview(); refreshView(); }
       else if (d.cancel) { await busy(btn, () => api(`/chat/${d.cancel}/cancel`, { method: "POST", body: {} })); }
+      else if (d.stopRun) { e.stopPropagation(); const run = runningRuns.get(Number(d.stopRun)); const m = run?.message_id ? { id: run.message_id } : null; if (m) await api(`/chat/${m.id}/cancel`, { method: "POST", body: {} }); else toast("This run cannot be stopped from here yet.", "bad"); }
+      else if (d.runTask) { e.stopPropagation(); await busy(btn, async () => { const r = await api(`/tasks/${d.runTask}/run`, { method: "POST", body: {} }); toast(r.run.status === "running" ? "Started. Its agent will report back." : r.run.status === "success" ? `Started. ${r.run.summary || ""}` : r.run.error || "Not started", r.ok ? "ok" : "bad"); }); refreshView(); }
+      else if (d.pauseTask) { await api(`/tasks/${d.pauseTask}`, { method: "PATCH", body: { enabled: false } }); refreshView(); }
+      else if (d.resumeTask) { await api(`/tasks/${d.resumeTask}`, { method: "PATCH", body: { enabled: true } }); refreshView(); }
+      else if (d.syncAll !== undefined) { await busy(btn, () => api("/sync", { method: "POST", body: {} })); refreshView(); }
       else if (d.toggle) { const box = t.closest(".activity"); const open = !box.classList.contains("open"); box.classList.toggle("open", open); openActivity.set(Number(d.toggle), open); }
       else if (d.del) { await api(`/chat/${d.del}`, { method: "DELETE" }); }
-      else if (d.conv) { if (!(current && current.id === Number(d.conv))) await openConversation(Number(d.conv)); else if (isNarrow()) setView("chat"); }
+      else if (d.conv) { if (!(view === "chat" && current && current.id === Number(d.conv))) await openConversation(Number(d.conv)); else if (isNarrow()) setPanel("chat"); }
       else if (d.rename) { const c = conversations.find((x) => x.id === Number(d.rename)); const title = prompt("Rename this chat", c?.title || ""); if (title !== null) await api(`/conversations/${d.rename}`, { method: "PATCH", body: { title: title.trim() } }); }
       else if (d.deleteConv) { if (confirm("Delete this chat and its messages?")) await api(`/conversations/${d.deleteConv}`, { method: "DELETE" }); }
       else if (d.ai !== undefined) { const c = conn(d.ai); setTarget(target === d.ai ? "" : d.ai); if (c && browserState?.pages?.some((p) => p.platform === c.id)) { live.watch(c.id); renderTabs(); } }
       else if (d.connect) { if (t.closest(".overlay")) t.closest(".overlay").hidden = true; await startSignIn(d.connect); }
       else if (d.viewAi) { showBrowser(); if (browserState?.pages?.some((p) => p.platform === d.viewAi)) live.watch(d.viewAi); else { await api("/browser/open", { method: "POST", body: { platform: d.viewAi, url: conn(d.viewAi)?.appUrl } }); live.watch(d.viewAi); } renderTabs(); }
       else if (d.check) { await busy(btn, async () => { const r = await api(`/connections/${d.check}/check`, { method: "POST", body: {} }); toast(r.status === "logged_in" ? `${r.name} is connected.` : `${r.name} is signed out.`, r.status === "logged_in" ? "ok" : "bad"); }); }
-      else if (d.refresh) { await busy(btn, async () => { const c = conn(d.refresh); if (c?.canSync) await api(`/platforms/${c.id}/sync`, { method: "POST" }); else await api(`/connections/${d.refresh}/check`, { method: "POST", body: {} }); }); await openActivityModal(); }
+      else if (d.refresh) { await busy(btn, async () => { const c = conn(d.refresh); if (c?.canSync) await api(`/platforms/${c.id}/sync`, { method: "POST" }); else await api(`/connections/${d.refresh}/check`, { method: "POST", body: {} }); }); refreshView(); }
       else if (d.remove) { if (confirm(`Remove ${aiName(d.remove)} from the app?`)) { await api(`/connections/${d.remove}`, { method: "DELETE" }); await load(current ? current.id : null); } }
-      else if (d.read) { await api(`/events/${d.read}/read`, { method: "POST", body: {} }); await openActivityModal(); }
+      else if (d.read) { await api(`/events/${d.read}/read`, { method: "POST", body: {} }); refreshOverview(); refreshView(); }
+      else if (d.readAll !== undefined) { await api("/events/read-all", { method: "POST", body: {} }); refreshOverview(); refreshView(); }
       else if (d.shot) { $("#shot-img").src = `/api/platforms/${d.shot}/screenshot.png?t=${Date.now()}`; $("#shot-modal").hidden = false; }
       else if (d.openSettings) { if (t.closest(".overlay") && t.closest(".overlay").id !== "settings-modal") t.closest(".overlay").hidden = true; await openSettings(d.openSettings, d.aiId || null); }
-      else if (d.example) { ta.value = d.example; autogrow(); ta.focus(); }
+      else if (d.example) { setView("chat"); ta.value = d.example; autogrow(); ta.focus(); }
+      else if (d.openRun) { if (e.target.closest("button, a")) return; await toggleDetail("run", Number(d.openRun), t); }
+      else if (d.openTask) { if (e.target.closest("button, a, details")) return; await toggleDetail("task", Number(d.openTask), t); }
+      else if (d.openAgent) { if (e.target.closest("button, a")) return; await toggleDetail("agent", Number(d.openAgent), t); }
     } catch (err) { fail(err); }
+  });
+  $("#lc-stop").addEventListener("click", async (e) => {
+    const id = Number(e.currentTarget.dataset.stopRun);
+    const run = runningRuns.get(id);
+    try { if (run?.message_id) await api(`/chat/${run.message_id}/cancel`, { method: "POST", body: {} }); else toast("This run cannot be stopped from here yet.", "bad"); } catch (err) { fail(err); }
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { for (const o of $$(".overlay")) o.hidden = true; }
   });
-  window.addEventListener("resize", () => { if (!isNarrow() && !app.dataset.view) setView("chat"); });
 
   /* ---------- boot ---------- */
   async function start() {
     await load();
     connectStream();
     live.connect();
-    if (isNarrow()) setView(connections.some((c) => c.status === "logged_in") ? "chat" : "side");
+    const h = viewFromHash();
+    setView(h.name, h.filter);
+    if (isNarrow()) setPanel(connections.some((c) => c.status === "logged_in") ? "chat" : "side");
   }
   (async () => {
     try {

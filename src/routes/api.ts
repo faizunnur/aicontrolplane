@@ -2,28 +2,40 @@ import fs from "node:fs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { availableActions, runAction } from "../actions.js";
+import { ensureTaskAgent } from "../agents.js";
 import { alertsConfigured, sendAlert } from "../alerts.js";
-import { approvalMode, decide, pendingApprovals, setApprovalMode } from "../approvals.js";
+import { approvalMode, decide, decideForMessage, listPolicies, pendingApprovals, requestExternalApproval, setApprovalMode, setPolicy } from "../policy.js";
 import { liveViewers } from "../browser/live.js";
 import { browser, storageInfo, vncState } from "../browser/manager.js";
 import { config } from "../config.js";
 import {
+  addAudit,
   addEvent,
   allPlatformStates,
+  db,
   conversationMessages,
   createConversation,
   createMessage,
-  deleteAgent,
+  deleteAgentProfile,
+  deleteTask,
   deleteConversation,
   deleteMessage,
-  findAgent,
-  getAgent,
+  findTask,
+  getAgentProfile,
+  getTask,
   getCapture,
+  foldSteps,
+  getApproval,
   getConversation,
   getMessage,
   getPlatformState,
+  getRun,
+  runEvents,
   inboxFor,
-  listAgents,
+  listAgentProfiles,
+  listApprovals,
+  listAudit,
+  listTasks,
   listCaptures,
   listConversations,
   listEvents,
@@ -33,19 +45,26 @@ import {
   markEventRead,
   openMessageCount,
   overviewCounts,
-  recentStatusesByAgent,
+  recentStatusesByTask,
   recentSyncLogs,
   recordRun,
   runStats,
-  updateAgent,
+  schemaVersion,
+  updateAgentProfile,
+  updateTask,
   updateConversation,
   updateMessage,
-  upsertAgent,
+  upsertAgentProfile,
+  upsertTask,
 } from "../db.js";
 import { deliverMessage } from "../deliver.js";
 import { streamClients, streamHandler } from "../live.js";
 import { routeMessage } from "../router.js";
-import { requestCancel, StepTracker } from "../steps.js";
+import { handleControl } from "../answers.js";
+import { classifyIntent } from "../intents.js";
+import { activity, overview } from "../overview.js";
+import { beginRun, endRun, requestCancel, runForMessage, RunTracker } from "../runs.js";
+import { listTaskViews, startTask, taskView } from "../tasks.js";
 import { connectionCard, expandMessage } from "../view.js";
 import { emailStatus, pollOnce } from "../ingest/email.js";
 import { deletePlatformOverride, getPlatform, getPlatforms, savePlatformOverride, visiblePlatforms } from "../platforms.js";
@@ -53,19 +72,22 @@ import {
   adminFromEnv,
   changeAdminPassword,
   clearSessionCookieHeader,
+  clientIp,
   createAdminPassword,
+  createSession,
   ingestToken,
   requireAdmin,
   requireIngest,
+  revokeSession,
   rotateIngestToken,
   sessionCookieHeader,
   setupRequired,
   verifyAdmin,
 } from "../auth.js";
-import { isSyncRunning, schedulerStatus, syncAll } from "../sync.js";
-import { syncPlatform } from "../collect/collector.js";
-import { checkConnection } from "../collect/chat.js";
+import { rateLimit } from "../ratelimit.js";
+import { isSyncRunning, schedulerStatus, syncAll, syncProvider } from "../sync.js";
 import { deliverToConnection } from "../deliver.js";
+import { getProvider, listProviders, providerView, requireProvider } from "../providers/registry.js";
 import { connectedPlatforms, routeToConnection } from "../router.js";
 
 export const api = Router();
@@ -81,12 +103,20 @@ const DELIVERY = z
   .nullable();
 
 async function assignAndDeliver(messageId: number, agentId: number) {
-  updateMessage(messageId, { agent_id: agentId, status: "assigned", error: null, delivered_at: null, acked_at: null });
+  updateMessage(messageId, { task_id: agentId, status: "assigned", error: null, delivered_at: null, acked_at: null });
   return expandMessage(await deliverMessage(messageId));
 }
 
 function bad(res: Response, msg: string, code = 400) {
   res.status(code).json({ error: msg });
+}
+/** Attach the provider's own id to a run an agent opened, so a later report with the same id updates it. */
+function finishRunExternalId(runId: number, externalId: string) {
+  const run = getRun(runId);
+  if (run) finishRunExternal(run.id, externalId);
+}
+function finishRunExternal(runId: number, externalId: string) {
+  db.prepare("UPDATE runs SET external_id = ? WHERE id = ?").run(externalId, runId);
 }
 function num(v: unknown, def: number) {
   const n = Number(v);
@@ -98,21 +128,26 @@ function secure(req: Request) {
 
 /* ---------- auth & first run ---------- */
 
+const loginLimit = rateLimit({ name: "login", max: 10, windowMs: 10 * 60_000 });
 api.get("/setup", (_req, res) => res.json({ setupRequired: setupRequired(), passwordFromEnv: adminFromEnv() }));
-api.post("/setup", (req, res) => {
+api.post("/setup", loginLimit, (req, res) => {
   const password = typeof req.body?.password === "string" ? req.body.password : "";
   if (password.length < 8) return bad(res, "Use at least 8 characters.");
   if (!createAdminPassword(password)) return bad(res, "A password already exists. Sign in instead.", 409);
-  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req)));
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), createSession(req)));
   res.json({ ok: true });
 });
-api.post("/session", (req, res) => {
+api.post("/session", loginLimit, (req, res) => {
   const token = typeof req.body?.token === "string" ? req.body.token : typeof req.body?.password === "string" ? req.body.password : "";
-  if (!verifyAdmin(token)) return res.status(401).json({ error: "That password was not accepted.", setup: setupRequired() });
-  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req)));
+  if (!verifyAdmin(token)) {
+    addAudit({ actor: clientIp(req), action: "auth.login_failed" });
+    return res.status(401).json({ error: "That password was not accepted.", setup: setupRequired() });
+  }
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), createSession(req)));
   res.json({ ok: true });
 });
-api.delete("/session", (_req, res) => {
+api.delete("/session", (req, res) => {
+  revokeSession(req);
   res.setHeader("Set-Cookie", clearSessionCookieHeader());
   res.json({ ok: true });
 });
@@ -134,6 +169,15 @@ const ingestSchema = z.object({
     keywords: z.string().max(500).optional(),
     delivery: DELIVERY.optional(),
   }),
+  /** Which agent carries the task out. Absent: the provider's assistant, or a profile of the task's own for custom agents. */
+  profile: z
+    .object({
+      key: z.string().min(1).max(200),
+      name: z.string().max(200).optional(),
+      description: z.string().max(2000).optional(),
+      capabilities: z.array(z.string().max(60)).max(50).optional(),
+    })
+    .optional(),
   run: z
     .object({
       external_id: z.string().max(200).optional(),
@@ -159,9 +203,9 @@ const ingestSchema = z.object({
 api.post("/ingest", requireIngest, async (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid payload", issues: parsed.error.issues });
-  const { agent: a, run, event } = parsed.data;
+  const { agent: a, profile, run, event } = parsed.data;
   const platform = a.platform.toLowerCase();
-  const agent = upsertAgent({
+  const agent = upsertTask({
     platform,
     key: a.key,
     name: a.name,
@@ -173,10 +217,16 @@ api.post("/ingest", requireIngest, async (req, res) => {
     keywords: a.keywords,
     delivery: a.delivery === undefined ? undefined : a.delivery,
   });
+  const agentProfile = ensureTaskAgent(agent, profile ?? null);
   let runRow = null;
   if (run) {
     const r = recordRun({
-      agent_id: agent.id,
+      task_id: agent.id,
+      kind: "external",
+      provider: platform,
+      trigger: "push",
+      label: agent.name,
+      agent_id: agentProfile?.id ?? null,
       external_id: run.external_id ?? null,
       status: run.status,
       started_at: run.started_at ?? null,
@@ -204,7 +254,112 @@ api.post("/ingest", requireIngest, async (req, res) => {
   if (event) {
     eventRow = addEvent({ platform, kind: event.kind, title: event.title, body: event.body ?? null, link: event.link ?? null });
   }
-  res.json({ ok: true, agent, run: runRow, event: eventRow });
+  res.json({ ok: true, agent, task: agent, profile: agentProfile, run: runRow, event: eventRow });
+});
+
+/* ---------- runs reported live by your own agents (ingest token) ---------- */
+
+const openRunSchema = z.object({
+  agent: z.object({ key: z.string().min(1).max(200), platform: z.string().min(1).max(50).default("custom"), name: z.string().max(200).optional() }),
+  profile: z.object({ key: z.string().min(1).max(200), name: z.string().max(200).optional() }).optional(),
+  label: z.string().max(200).optional(),
+  external_id: z.string().max(200).optional(),
+});
+/** An agent says "I am starting this now". The run appears running in the control plane until it is finished. */
+api.post("/runs", requireIngest, (req, res) => {
+  const parsed = openRunSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid run", issues: parsed.error.issues });
+  const d = parsed.data;
+  const platform = d.agent.platform.toLowerCase();
+  const task = upsertTask({ platform, key: d.agent.key, name: d.agent.name, source: "push" });
+  const agent = ensureTaskAgent(task, d.profile ?? null);
+  const { run } = beginRun({ kind: "external", label: d.label ?? task.name, provider: platform, task_id: task.id, agent_id: agent?.id ?? null, trigger: "push", source: "push" });
+  if (d.external_id) finishRunExternalId(run.id, d.external_id);
+  res.json({ ok: true, run: getRun(run.id), events_url: `/api/runs/${run.id}/events`, finish_url: `/api/runs/${run.id}/finish` });
+});
+const runEventSchema = z.object({
+  type: z.enum(["step", "log"]).default("step"),
+  key: z.string().max(60).optional(),
+  label: z.string().min(1).max(300),
+  status: z.enum(["pending", "running", "done", "failed", "skipped", "waiting"]).optional(),
+  detail: z.string().max(2000).optional(),
+});
+/** A line in a running run's timeline: "researching", "approval requested", "drafting the report". */
+api.post("/runs/:id/events", requireIngest, (req, res) => {
+  const run = getRun(num(req.params.id, 0));
+  if (!run) return bad(res, "not found", 404);
+  if (run.status !== "running") return bad(res, "that run is finished", 409);
+  const parsed = runEventSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid event", issues: parsed.error.issues });
+  const d = parsed.data;
+  const track = new RunTracker(run.id, run.message_id);
+  if (d.type === "log") track.log(d.label, d.detail ?? null);
+  else track.set(d.key ?? d.label.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 60), d.label, d.status ?? "running", d.detail ?? null);
+  res.json({ ok: true, steps: track.read() });
+});
+const finishSchema = z.object({
+  status: z.enum(["success", "failed", "needs_attention", "cancelled"]).default("success"),
+  summary: z.string().max(4000).optional(),
+  error: z.string().max(4000).optional(),
+  output_url: z.string().max(2000).optional(),
+});
+api.post("/runs/:id/finish", requireIngest, (req, res) => {
+  const run = getRun(num(req.params.id, 0));
+  if (!run) return bad(res, "not found", 404);
+  if (run.status !== "running") return bad(res, "that run is already finished", 409);
+  const parsed = finishSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid outcome", issues: parsed.error.issues });
+  const d = parsed.data;
+  const track = new RunTracker(run.id, run.message_id);
+  for (const s of track.read()) if (s.status === "waiting" || s.status === "running") track.set(s.key, s.label, d.status === "success" ? "done" : "failed", d.summary ?? d.error ?? null);
+  const done = endRun(run.id, { status: d.status, summary: d.summary ?? null, error: d.error ?? null, output_url: d.output_url ?? null })!;
+  if (d.status === "failed" || d.status === "needs_attention") {
+    addEvent({ platform: run.provider, kind: "run", title: `${run.label ?? "A run"}: ${d.status.replace("_", " ")}`, body: d.summary ?? d.error ?? null, link: d.output_url ?? null, dedupe_key: `run_finish:${run.id}` });
+    void sendAlert({ key: `run:${run.task_id ?? run.id}`, title: `${run.label ?? "Run"} ${d.status}`, body: d.summary ?? d.error, link: d.output_url });
+  }
+  res.json({ ok: true, run: done });
+});
+
+/* ---------- agent self-registration (ingest token) ---------- */
+
+const registerSchema = z.object({
+  key: z.string().min(1).max(200),
+  name: z.string().min(1).max(200),
+  description: z.string().max(2000).optional(),
+  capabilities: z.array(z.string().max(60)).max(50).optional(),
+  /** Provider id the agent runs on; defaults to "custom". */
+  provider: z.string().max(50).optional(),
+  configuration: z.record(z.string(), z.unknown()).optional(),
+});
+/* ---------- approvals requested by your own agents (ingest token) ---------- */
+
+const approvalRequestSchema = z.object({
+  action: z.string().min(1).max(60),
+  summary: z.string().min(1).max(500),
+  detail: z.string().max(4000).optional(),
+  provider: z.string().max(50).optional(),
+  run_id: z.number().int().optional(),
+});
+/** "May I deploy?" The answer follows the policy for that action; the agent polls the approval until it is decided. */
+api.post("/approvals/request", requireIngest, (req, res) => {
+  const parsed = approvalRequestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid approval request", issues: parsed.error.issues });
+  const r = requestExternalApproval({ ...parsed.data, provider: parsed.data.provider ?? "custom" });
+  res.json({ ok: true, decision: r.decision, approval: r.approval, poll_url: `/api/approvals/${r.approval.id}` });
+});
+api.get("/approvals/:id", requireIngest, (req, res) => {
+  const a = getApproval(num(req.params.id, 0));
+  if (!a) return bad(res, "not found", 404);
+  res.json(a);
+});
+
+/** A program of your own announces itself. It appears in the control plane next to ChatGPT, Claude and Grok. */
+api.post("/agents/register", requireIngest, (req, res) => {
+  const parsed = registerSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid agent", issues: parsed.error.issues });
+  const d = parsed.data;
+  const profile = upsertAgentProfile({ key: d.key, name: d.name, description: d.description ?? null, capabilities: d.capabilities ?? null, provider_id: (d.provider ?? "custom").toLowerCase(), kind: "custom", configuration: d.configuration });
+  res.json({ ok: true, agent: profile });
 });
 
 /* ---------- inbox (agents pull their instructions; ingest token) ---------- */
@@ -213,7 +368,7 @@ api.get("/inbox", requireIngest, (req, res) => {
   const platform = String(req.query.platform ?? "").toLowerCase();
   const key = String(req.query.key ?? "");
   if (!platform || !key) return bad(res, "platform and key are required");
-  const agent = findAgent(platform, key);
+  const agent = findTask(platform, key);
   if (!agent) return bad(res, "unknown agent", 404);
   const now = new Date().toISOString();
   const messages = inboxFor(agent.id).map((m) => {
@@ -238,11 +393,15 @@ api.post("/inbox/:id/ack", requireIngest, (req, res) => {
     response: parsed.data.response ?? null,
     error: parsed.data.status === "failed" ? (parsed.data.response ?? "agent reported failure") : null,
   })!;
+  // The agent reporting back closes the dispatch run that carried the instruction.
+  if (updated.run_id && parsed.data.status !== "acknowledged") {
+    endRun(updated.run_id, { status: parsed.data.status === "failed" ? "failed" : "success", summary: parsed.data.response ?? null, error: parsed.data.status === "failed" ? (parsed.data.response ?? "agent reported failure") : null });
+  }
   if (parsed.data.status === "failed") {
     addEvent({
-      platform: updated.agent_platform,
+      platform: updated.task_platform,
       kind: "message",
-      title: `${updated.agent_name ?? "Agent"} could not complete an instruction`,
+      title: `${updated.task_name ?? "Agent"} could not complete an instruction`,
       body: `${parsed.data.response ?? ""}\n\n"${updated.text.slice(0, 200)}"`,
       dedupe_key: `message_agent_failed:${updated.id}`,
     });
@@ -258,6 +417,14 @@ api.use(requireAdmin);
 
 /** Live updates for the workspace (server-sent events). */
 api.get("/stream", streamHandler);
+
+/* providers: execution backends with declared capabilities */
+api.get("/providers", (_req, res) => res.json(listProviders().map(providerView)));
+api.get("/providers/:id", (req, res) => {
+  const a = getProvider(req.params.id);
+  if (!a) return bad(res, "unknown provider", 404);
+  res.json(providerView(a));
+});
 
 api.get("/connections", (_req, res) => res.json(visiblePlatforms().map(connectionCard)));
 
@@ -311,19 +478,25 @@ api.post("/connections/:id/restore", (req, res) => {
   res.json(p ? connectionCard(p) : { ok: true });
 });
 /** Bring the AI's sign-in page up in its tab; the live view then shows that tab for the user to sign in. */
-api.post("/connections/:id/connect", async (req, res) => {
-  const p = getPlatform(req.params.id);
-  if (!p || !p.appUrl) return bad(res, "this AI has no web address to open", 404);
-  if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
-  await browser.withLock(() => browser.consolePage(p.id, p.appUrl), { label: `Opening ${p.name}`, platform: p.id });
-  res.json({ ok: true, platform: p.id, screen: "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1" });
+api.post("/connections/:id/connect", async (req, res, next) => {
+  try {
+    const a = requireProvider(req.params.id);
+    if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
+    await a.connect();
+    res.json({ ok: true, platform: a.id, screen: "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1" });
+  } catch (err) {
+    next(err);
+  }
 });
 /** After signing in: confirm the session and capture a screenshot. */
-api.post("/connections/:id/check", async (req, res) => {
-  const p = getPlatform(req.params.id);
-  if (!p || !p.appUrl) return bad(res, "unknown AI", 404);
-  const status = await checkConnection(p);
-  res.json({ ...connectionCard(getPlatform(p.id)!), status });
+api.post("/connections/:id/check", async (req, res, next) => {
+  try {
+    const a = requireProvider(req.params.id);
+    const status = await a.checkAuth();
+    res.json({ ...connectionCard(a.config()), status });
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* conversations (threads in the chat panel) */
@@ -362,29 +535,31 @@ api.post("/chat", async (req, res) => {
   if (!conversation) conversation = createConversation(titleFrom(text));
   else if (!conversation.title) conversation = updateConversation(conversation.id, { title: titleFrom(text) })!;
   const msg = createMessage(text, conversation.id);
-  const track = new StepTracker(msg.id);
+  // Questions about the control plane and commands about tasks are answered here; they never reach a provider.
+  if (!chosen) {
+    const intent = await classifyIntent(text);
+    if (intent.kind !== "chat") {
+      await handleControl(intent, msg.id);
+      return res.json({ message: expandMessage(getMessage(msg.id)!), routed: "control", intent, conversation: getConversation(conversation.id) });
+    }
+  }
   if (chosen) {
     updateMessage(msg.id, { routing: { method: "manual", confidence: 1, reason: "You chose it." } });
-    track.set("route", `Sending to ${getPlatform(chosen)!.name}`, "done", "you chose it");
     // Respond right away; the reply lands in the thread when the AI answers.
     res.json({ message: expandMessage(getMessage(msg.id)!), routed: chosen, conversation: getConversation(conversation.id) });
     void deliverToConnection(msg.id, chosen);
     return;
   }
-  track.set("route", "Choosing the AI", "running");
   const routing = await routeToConnection(text);
   updateMessage(msg.id, {
     suggestions: routing.options,
     routing: { method: routing.method, confidence: routing.top?.confidence ?? 0, reason: routing.reason, llm_error: routing.llm_error },
   });
   if (routing.top && routing.top.confidence >= config.router.autoThreshold) {
-    const how = routing.method === "mention" ? "you named it" : routing.method === "only" ? "the only AI connected" : routing.method === "llm" ? "picked by Claude" : "picked by keywords";
-    track.set("route", `Sending to ${routing.top.name}`, "done", how);
     res.json({ message: expandMessage(getMessage(msg.id)!), routed: routing.top.platform, conversation: getConversation(conversation.id) });
     void deliverToConnection(msg.id, routing.top.platform);
     return;
   }
-  track.set("route", "Which AI should do this?", "waiting", routing.reason);
   res.json({ message: expandMessage(getMessage(msg.id)!), routed: null, conversation: getConversation(conversation.id) });
 });
 api.post("/chat/:id/send", async (req, res) => {
@@ -393,7 +568,7 @@ api.post("/chat/:id/send", async (req, res) => {
   const platform = String(req.body?.platform ?? "");
   const p = getPlatform(platform);
   if (!p) return bad(res, "unknown AI", 404);
-  new StepTracker(m.id).set("route", `Sending to ${p.name}`, "done", "you chose it");
+  updateMessage(m.id, { routing: { method: "manual", confidence: 1, reason: "You chose it." } });
   res.json({ ok: true });
   void deliverToConnection(m.id, platform);
 });
@@ -402,27 +577,54 @@ api.post("/chat/:id/approve", (req, res) => {
   const m = getMessage(num(req.params.id, 0));
   if (!m) return bad(res, "not found", 404);
   const decision = req.body?.decision === "reject" || req.body?.decision === "rejected" ? "rejected" : "approved";
-  if (!decide(m.id, decision)) return bad(res, "nothing is waiting for approval on this message", 409);
-  res.json({ ok: true, decision });
+  const row = decideForMessage(m.id, decision);
+  if (!row) return bad(res, "nothing is waiting for approval on this message", 409);
+  res.json({ ok: true, decision, approval: row });
 });
 /** Stop a task that is running. If the message was already sent, only the wait is stopped. */
 api.post("/chat/:id/cancel", (req, res) => {
   const m = getMessage(num(req.params.id, 0));
   if (!m) return bad(res, "not found", 404);
   if (!["assigned", "delivered"].includes(m.status)) return bad(res, "nothing is running for this message", 409);
-  requestCancel(m.id);
-  decide(m.id, "rejected");
-  res.json({ ok: true });
+  const run = runForMessage(m.id);
+  if (run) requestCancel(run.id);
+  decideForMessage(m.id, "rejected");
+  res.json({ ok: true, run_id: run?.id ?? null });
 });
 api.delete("/chat/:id", (req, res) => res.json({ ok: deleteMessage(num(req.params.id, 0)) }));
 
-/* execution mode: auto (the agent acts on its own) or manual (it asks before acting) */
-api.get("/settings/approval", (_req, res) => res.json({ approvalMode: approvalMode(), pending: pendingApprovals() }));
+/* execution mode: auto (the agent acts on its own) or manual (it asks before acting) — a preset over the policies */
+const approvalView = (a: ReturnType<typeof pendingApprovals>[number]) => ({ ...a, messageId: a.message_id, runId: a.run_id });
+api.get("/settings/approval", (_req, res) => res.json({ approvalMode: approvalMode(), pending: pendingApprovals().map(approvalView) }));
 api.put("/settings/approval", (req, res) => {
   const mode = req.body?.approvalMode === "manual" ? "manual" : req.body?.approvalMode === "auto" ? "auto" : null;
   if (!mode) return bad(res, "approvalMode must be auto or manual");
   setApprovalMode(mode);
   res.json({ approvalMode: mode });
+});
+
+/* approvals: everything waiting for you, and what was decided */
+api.get("/approvals", (req, res) => {
+  res.json({ pending: pendingApprovals().map(approvalView), recent: listApprovals({ status: ["approved", "rejected", "expired", "interrupted"], limit: num(req.query.limit, 30) }).map(approvalView) });
+});
+api.post("/approvals/:id/decide", (req, res) => {
+  const decision = req.body?.decision === "reject" || req.body?.decision === "rejected" ? "rejected" : req.body?.decision === "approve" || req.body?.decision === "approved" ? "approved" : null;
+  if (!decision) return bad(res, "decision must be approve or reject");
+  const row = decide(num(req.params.id, 0), decision, "you", typeof req.body?.reason === "string" ? req.body.reason.slice(0, 500) : null);
+  if (!row) return bad(res, "that approval is not pending", 409);
+  res.json({ ok: true, approval: approvalView(row) });
+});
+
+/* policies: which actions go ahead and which ask */
+api.get("/policies", (_req, res) => res.json(listPolicies()));
+api.put("/policies/:action", (req, res, next) => {
+  try {
+    const mode = req.body?.mode;
+    if (mode !== null && mode !== "auto" && mode !== "ask" && mode !== "always") return bad(res, "mode must be auto, ask, always or null");
+    res.json(setPolicy(req.params.action.slice(0, 60), mode));
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* one call for the whole app */
@@ -431,7 +633,7 @@ api.get("/home", async (req, res) => {
   const conversations = listConversations();
   const wanted = num(req.query.conversation_id, 0);
   const current = (wanted ? getConversation(wanted) : undefined) ?? conversations[0] ?? null;
-  const runs = listRuns({ limit: 15 }).map((r) => ({ kind: "run", at: r.finished_at || r.started_at || r.created_at, platform: r.platform, title: r.agent_name, status: r.status, summary: r.summary, link: r.output_url || r.agent_native_url }));
+  const runs = listRuns({ limit: 15 }).map((r) => ({ kind: "run", at: r.finished_at || r.started_at || r.created_at, platform: r.provider, title: r.label ?? r.task_name ?? r.kind, status: r.status, summary: r.summary, link: r.output_url || r.task_native_url, run_id: r.id, run_kind: r.kind }));
   const events = listEvents({ limit: 15 }).map((e) => ({ kind: e.kind, at: e.occurred_at, platform: e.platform, title: e.title, status: e.kind === "run" ? "failed" : e.kind === "session" ? "needs_attention" : "info", summary: e.body, link: e.link, id: e.id, read: !!e.read }));
   const activity = [...runs, ...events].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 20);
   const attention = [
@@ -446,6 +648,9 @@ api.get("/home", async (req, res) => {
     conversation: current,
     messages: current ? conversationMessages(current.id).map(expandMessage) : [],
     approvalMode: approvalMode(),
+    approvals: pendingApprovals().map(approvalView),
+    agents: listAgentProfiles(),
+    overview: overview(),
     attention,
     activity,
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
@@ -479,9 +684,12 @@ api.post("/settings/password", (req, res) => {
   if (next.length < 8) return bad(res, "Use at least 8 characters.");
   if (adminFromEnv()) return bad(res, "The password is set by ACP_ADMIN_TOKEN on the server; change it there.", 409);
   if (!changeAdminPassword(current, next)) return bad(res, "Current password is wrong.", 401);
-  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req)));
+  // Every other browser is signed out; this one continues on a fresh session.
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), createSession(req)));
   res.json({ ok: true });
 });
+/** Who did what: logins, approvals, policy changes, exports, live-view control. */
+api.get("/audit", (req, res) => res.json(listAudit({ limit: num(req.query.limit, 100), action: typeof req.query.action === "string" ? req.query.action : undefined })));
 api.post("/settings/ingest-token/rotate", (_req, res) => res.json({ ingestToken: rotateIngestToken(), fromEnv: !!process.env.ACP_INGEST_TOKEN }));
 
 /* ---------- messages (instructions from you, routed to agents) ---------- */
@@ -490,7 +698,7 @@ api.get("/messages", (req, res) => {
   res.json(
     listMessages({
       status: typeof req.query.status === "string" ? req.query.status : undefined,
-      agent_id: req.query.agent_id ? num(req.query.agent_id, 0) : undefined,
+      task_id: req.query.task_id ? num(req.query.task_id, 0) : undefined,
       limit: num(req.query.limit, 50),
     }).map(expandMessage),
   );
@@ -507,8 +715,8 @@ api.post("/messages", async (req, res) => {
   const auto = req.body?.auto !== false;
   const msg = createMessage(text);
 
-  if (req.body?.agent_id) {
-    const agent = getAgent(num(req.body.agent_id, 0));
+  if (req.body?.task_id || req.body?.agent_id) {
+    const agent = getTask(num(req.body.task_id ?? req.body.agent_id, 0));
     if (!agent) return bad(res, "unknown agent", 404);
     updateMessage(msg.id, { routing: { method: "manual", confidence: 1, reason: "You chose the agent." } });
     return res.json({ message: await assignAndDeliver(msg.id, agent.id), auto_assigned: false, chosen: true });
@@ -520,7 +728,7 @@ api.post("/messages", async (req, res) => {
     routing: { method: routing.method, confidence: routing.confidence, reason: routing.reason, new_agent: routing.new_agent, llm_error: routing.llm_error },
   });
   if (auto && routing.top && routing.confidence >= config.router.autoThreshold) {
-    return res.json({ message: await assignAndDeliver(msg.id, routing.top.agent_id), auto_assigned: true });
+    return res.json({ message: await assignAndDeliver(msg.id, routing.top.task_id), auto_assigned: true });
   }
   addEvent({
     kind: "message",
@@ -533,15 +741,15 @@ api.post("/messages", async (req, res) => {
 api.post("/messages/:id/assign", async (req, res) => {
   const m = getMessage(num(req.params.id, 0));
   if (!m) return bad(res, "not found", 404);
-  const agent = getAgent(num(req.body?.agent_id, 0));
-  if (!agent) return bad(res, "unknown agent", 404);
+  const agent = getTask(num(req.body?.task_id ?? req.body?.agent_id, 0));
+  if (!agent) return bad(res, "unknown task", 404);
   res.json(await assignAndDeliver(m.id, agent.id));
 });
 api.post("/messages/:id/retry", async (req, res) => {
   const m = getMessage(num(req.params.id, 0));
   if (!m) return bad(res, "not found", 404);
-  if (!m.agent_id) return bad(res, "message has no agent; assign it first", 409);
-  res.json(await assignAndDeliver(m.id, m.agent_id));
+  if (!m.task_id) return bad(res, "message has no agent; assign it first", 409);
+  res.json(await assignAndDeliver(m.id, m.task_id));
 });
 api.post("/messages/:id/reroute", async (req, res) => {
   const m = getMessage(num(req.params.id, 0));
@@ -549,7 +757,7 @@ api.post("/messages/:id/reroute", async (req, res) => {
   const routing = await routeMessage(m.text);
   const updated = updateMessage(m.id, {
     status: "needs_assignment",
-    agent_id: null,
+    task_id: null,
     delivery_mode: null,
     error: null,
     suggestions: routing.suggestions,
@@ -563,11 +771,20 @@ api.post("/messages/:id/status", (req, res) => {
   const status = String(req.body?.status ?? "");
   if (!["done", "failed", "acknowledged", "delivered"].includes(status)) return bad(res, "invalid status");
   const response = typeof req.body?.response === "string" ? req.body.response : undefined;
-  res.json(expandMessage(updateMessage(m.id, { status: status as "done", acked_at: new Date().toISOString(), response })!));
+  const updated = updateMessage(m.id, { status: status as "done", acked_at: new Date().toISOString(), response })!;
+  if (updated.run_id && (status === "done" || status === "failed")) endRun(updated.run_id, { status: status === "done" ? "success" : "failed", summary: response ?? null });
+  res.json(expandMessage(updated));
 });
 api.delete("/messages/:id", (req, res) => res.json({ ok: deleteMessage(num(req.params.id, 0)) }));
 
-api.get("/overview", async (_req, res) => {
+/* what is running, scheduled, finished, failed, and what needs you: real rows only */
+api.get("/overview", (_req, res) => res.json(overview()));
+/** The unified activity feed: every timeline line across every run, newest first. */
+api.get("/activity", (req, res) => {
+  res.json(activity({ limit: num(req.query.limit, 100), provider: typeof req.query.provider === "string" ? req.query.provider : undefined, agent_id: req.query.agent_id ? num(req.query.agent_id, 0) : undefined, run_id: req.query.run_id ? num(req.query.run_id, 0) : undefined }));
+});
+/** Provider diagnostics for developers: state, captured payloads, actions. */
+api.get("/diagnostics", async (_req, res) => {
   const platforms = getPlatforms();
   const states = Object.fromEntries(allPlatformStates().map((s) => [s.platform, s]));
   const cards = Object.values(platforms).map((p) => {
@@ -578,32 +795,9 @@ api.get("/overview", async (_req, res) => {
     } catch {
       meta = {};
     }
-    return {
-      ...p,
-      syncable: !!p.tasksUrl,
-      state: { ...s, meta: { finalUrl: meta.finalUrl, title: meta.title, snapshotAt: meta.snapshotAt } },
-      hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)),
-      agents: listAgents({ platform: p.id }).length,
-      actions: availableActions(p),
-    };
+    return { id: p.id, name: p.name, syncable: !!p.tasksUrl, state: { ...s, meta: { finalUrl: meta.finalUrl, title: meta.title, snapshotAt: meta.snapshotAt } }, hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)), tasks: listTasks({ platform: p.id }).length, actions: availableActions(p) };
   });
-  res.json({
-    counts: { ...overviewCounts(), openMessages: openMessageCount() },
-    platforms: cards,
-    attention: {
-      runs: listRuns({ limit: 20 }).filter((r) => r.status === "failed" || r.status === "needs_attention"),
-      events: listEvents({ unread: true, limit: 20 }),
-      sessions: cards.filter((c) => c.state.session_status === "needs_login").map((c) => ({ platform: c.id, name: c.name })),
-      messages: [...listMessages({ status: "needs_assignment", limit: 10 }), ...listMessages({ status: "failed", limit: 10 })].map(expandMessage),
-    },
-    router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
-    storage: storageInfo(),
-    scheduler: schedulerStatus(),
-    browser: await browser.status(),
-    email: emailStatus(),
-    alerts: { configured: alertsConfigured() },
-    publicUrl: config.publicUrl,
-  });
+  res.json({ counts: { ...overviewCounts(), openMessages: openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: storageInfo(), scheduler: schedulerStatus(), browser: await browser.status(), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, schema: schemaVersion() });
 });
 
 /* ---------- agents (registry) ---------- */
@@ -621,35 +815,91 @@ const agentSchema = z.object({
   delivery: DELIVERY.optional(),
 });
 
-api.get("/agents", (req, res) => {
-  const recent = recentStatusesByAgent(6);
-  res.json(
-    listAgents({ platform: typeof req.query.platform === "string" ? req.query.platform : undefined, includeDisabled: req.query.all === "1" }).map((a) => ({
-      ...a,
-      recent_statuses: recent[a.id] ?? [],
-    })),
-  );
+/* ---------- the task registry: every standing piece of work, every provider, one shape ---------- */
+
+api.get("/tasks", (req, res) => {
+  res.json(listTaskViews({ platform: typeof req.query.platform === "string" ? req.query.platform : undefined, agent_id: req.query.agent_id ? num(req.query.agent_id, 0) : undefined, includeDisabled: req.query.all === "1" }));
+});
+api.get("/tasks/:id", (req, res) => {
+  const t = listTasks({ includeDisabled: true }).find((x) => x.id === num(req.params.id, 0));
+  if (!t) return bad(res, "not found", 404);
+  res.json({ ...taskView(t, recentStatusesByTask(10)), runs: listRuns({ task_id: t.id, limit: 20 }) });
+});
+api.post("/tasks", (req, res) => {
+  const parsed = agentSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid task", issues: parsed.error.issues });
+  const d = parsed.data;
+  const key = d.key || d.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `task-${Date.now()}`;
+  const task = upsertTask({ ...d, key, platform: d.platform.toLowerCase(), source: "registry" });
+  ensureTaskAgent(task);
+  res.json(taskView({ ...getTask(task.id)!, last_run: null }));
+});
+const taskPatch = agentSchema.partial().extend({ prompt: z.string().max(20_000).nullable().optional(), configuration: z.record(z.string(), z.unknown()).nullable().optional() });
+const patchTask = (req: Request, res: Response) => {
+  const parsed = taskPatch.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid task", issues: parsed.error.issues });
+  const t = updateTask(num(req.params.id, 0), parsed.data);
+  if (!t) return bad(res, "not found", 404);
+  addAudit({ actor: "you", action: parsed.data.enabled === false ? "task.paused" : parsed.data.enabled === true ? "task.resumed" : "task.updated", target: `task:${t.id}`, detail: t.name });
+  res.json(taskView({ ...t, last_run: listRuns({ task_id: t.id, limit: 1 })[0] ?? null }));
+};
+api.put("/tasks/:id", patchTask);
+api.patch("/tasks/:id", patchTask);
+api.delete("/tasks/:id", (req, res) => {
+  res.json({ ok: deleteTask(num(req.params.id, 0)) });
+});
+/** Start a task now, where the provider allows it. Goes through the run_task policy. */
+api.post("/tasks/:id/run", async (req, res, next) => {
+  try {
+    addAudit({ actor: "you", action: "task.run_requested", target: `task:${req.params.id}` });
+    const run = await startTask(num(req.params.id, 0), { text: typeof req.body?.text === "string" ? req.body.text.slice(0, 20_000) : undefined, trigger: "user" });
+    res.json({ ok: run.status !== "failed", run: { ...run, events: runEvents(run.id), steps: foldSteps(runEvents(run.id)) } });
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* ---------- stats ---------- */
 
 api.get("/stats/runs", (req, res) => res.json(runStats(num(req.query.days, 14))));
+
+/* ---------- agent profiles (who does the work) ---------- */
+
+api.get("/agents", (req, res) => {
+  res.json(listAgentProfiles({ provider: typeof req.query.provider === "string" ? req.query.provider : undefined, kind: typeof req.query.kind === "string" ? req.query.kind : undefined, includeDisabled: req.query.all === "1" }));
+});
+api.get("/agents/:id", (req, res) => {
+  const a = getAgentProfile(num(req.params.id, 0));
+  if (!a) return bad(res, "not found", 404);
+  res.json({ ...a, tasks: listTasks({ agent_id: a.id }), runs: listRuns({ agent_id: a.id, limit: 20 }) });
+});
+const profilePatch = z
+  .object({
+    name: z.string().min(1).max(200),
+    description: z.string().max(2000).nullable(),
+    status: z.enum(["active", "paused", "disabled"]),
+    capabilities: z.array(z.string().max(60)).max(50).nullable(),
+    configuration: z.record(z.string(), z.unknown()).nullable(),
+  })
+  .partial();
 api.post("/agents", (req, res) => {
-  const parsed = agentSchema.safeParse(req.body);
+  const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid agent", issues: parsed.error.issues });
   const d = parsed.data;
-  const key = d.key || d.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `agent-${Date.now()}`;
-  res.json(upsertAgent({ ...d, key, platform: d.platform.toLowerCase(), source: "registry" }));
+  res.json(upsertAgentProfile({ key: d.key, name: d.name, description: d.description ?? null, capabilities: d.capabilities ?? null, provider_id: (d.provider ?? "custom").toLowerCase(), kind: "custom", configuration: d.configuration }));
 });
-api.put("/agents/:id", (req, res) => {
-  const parsed = agentSchema.partial().safeParse(req.body);
+api.patch("/agents/:id", (req, res) => {
+  const parsed = profilePatch.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid agent", issues: parsed.error.issues });
-  const a = updateAgent(num(req.params.id, 0), parsed.data);
+  const a = updateAgentProfile(num(req.params.id, 0), parsed.data);
   if (!a) return bad(res, "not found", 404);
   res.json(a);
 });
 api.delete("/agents/:id", (req, res) => {
-  res.json({ ok: deleteAgent(num(req.params.id, 0)) });
+  const a = getAgentProfile(num(req.params.id, 0));
+  if (!a) return bad(res, "not found", 404);
+  if (a.kind !== "custom") return bad(res, "only your own agents can be removed; assistants belong to their provider", 409);
+  res.json({ ok: deleteAgentProfile(a.id) });
 });
 
 /* ---------- runs & events ---------- */
@@ -658,11 +908,20 @@ api.get("/runs", (req, res) => {
   res.json(
     listRuns({
       limit: num(req.query.limit, 50),
-      agent_id: req.query.agent_id ? num(req.query.agent_id, 0) : undefined,
-      status: typeof req.query.status === "string" ? req.query.status : undefined,
+      task_id: req.query.task_id ?? req.query.agent_id ? num(req.query.task_id ?? req.query.agent_id, 0) : undefined,
+      status: typeof req.query.status === "string" ? req.query.status.split(",") : undefined,
       platform: typeof req.query.platform === "string" ? req.query.platform : undefined,
+      kind: typeof req.query.kind === "string" ? req.query.kind : undefined,
+      since: typeof req.query.since === "string" ? req.query.since : undefined,
     }),
   );
+});
+/** One run with its timeline: the raw events and the step view folded from them. */
+api.get("/runs/:id", (req, res) => {
+  const run = getRun(num(req.params.id, 0));
+  if (!run) return bad(res, "not found", 404);
+  const events = runEvents(run.id);
+  res.json({ ...run, events, steps: foldSteps(events) });
 });
 api.get("/events", (req, res) => {
   res.json(listEvents({ limit: num(req.query.limit, 50), unread: req.query.unread === "1", platform: typeof req.query.platform === "string" ? req.query.platform : undefined }));
@@ -759,18 +1018,21 @@ api.post("/sync", async (req, res) => {
   const ids = Array.isArray(req.body?.platforms) ? (req.body.platforms as string[]) : undefined;
   res.json({ ok: true, results: await syncAll(ids) });
 });
-api.post("/platforms/:id/sync", async (req, res) => {
-  const p = getPlatform(req.params.id);
-  if (!p) return bad(res, "unknown platform", 404);
-  if (!p.tasksUrl) return bad(res, "platform has no tasksUrl", 409);
-  if (!browser.enabled) return bad(res, "browser is disabled", 409);
-  res.json(await syncPlatform(p));
+api.post("/platforms/:id/sync", async (req, res, next) => {
+  try {
+    const a = requireProvider(req.params.id);
+    if (!a.supports("listTasks")) throw a.unsupported("listTasks");
+    if (!browser.enabled) return bad(res, "browser is disabled", 409);
+    res.json(await syncProvider(a));
+  } catch (err) {
+    next(err);
+  }
 });
 api.post("/platforms/:id/actions/:action", async (req, res) => {
   const p = getPlatform(req.params.id);
   if (!p) return bad(res, "unknown platform", 404);
-  const agent = req.body?.agent_id ? getAgent(num(req.body.agent_id, 0)) : undefined;
-  res.json(await runAction(p, req.params.action, agent));
+  const task = req.body?.task_id || req.body?.agent_id ? getTask(num(req.body.task_id ?? req.body.agent_id, 0)) : undefined;
+  res.json(await runAction(p, req.params.action, task, {}, { trigger: "user" }));
 });
 api.get("/sync/log", (_req, res) => res.json(recentSyncLogs(50)));
 
@@ -790,10 +1052,13 @@ api.post("/browser/import-state", async (req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);
   const cookies = Array.isArray(req.body?.cookies) ? req.body.cookies : [];
   if (!cookies.length) return bad(res, "body must be a Playwright storageState with a cookies array");
+  addAudit({ actor: "you", action: "browser.import_state", detail: `${cookies.length} cookies from ${clientIp(req)}` });
   res.json({ ok: true, imported: await browser.importState({ cookies }) });
 });
-api.get("/browser/export-state", async (_req, res) => {
+api.get("/browser/export-state", async (req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);
+  // Cookies for every signed-in provider leave the server here; that is always worth a record.
+  addAudit({ actor: "you", action: "browser.export_state", detail: clientIp(req) });
   res.json(await browser.exportState());
 });
 api.post("/browser/open", async (req, res) => {

@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 import { bus } from "./bus.js";
-import type { MessageWithAgent } from "./db.js";
+import type { MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatform } from "./platforms.js";
 import { connectionCard, expandMessage } from "./view.js";
@@ -27,7 +27,7 @@ function broadcast(event: string, data: unknown) {
 }
 
 // "msg" rather than "message": an EventSource treats unnamed events as "message" too, so keep the names distinct.
-bus.on("message:row", (row: MessageWithAgent) => broadcast("msg", expandMessage(row)));
+bus.on("message:row", (row: MessageWithTask) => broadcast("msg", expandMessage(row)));
 bus.on("message:deleted", (info: { id: number; conversation_id: number | null }) => broadcast("msg-deleted", info));
 bus.on("platform:row", (id: string) => {
   const p = getPlatform(id);
@@ -36,6 +36,15 @@ bus.on("platform:row", (id: string) => {
 bus.on("browser", (state: unknown) => broadcast("browser", state));
 bus.on("conversation", (c: unknown) => broadcast("conversation", c));
 bus.on("settings", (s: unknown) => broadcast("settings", s));
+bus.on("run", (r: unknown) => broadcast("run", r));
+bus.on("run-event", (e: unknown) => broadcast("run-event", e));
+bus.on("task", (t: unknown) => broadcast("task", t));
+bus.on("task:deleted", (t: unknown) => broadcast("task-deleted", t));
+bus.on("notification", (n: unknown) => broadcast("notification", n));
+bus.on("approval", (a: unknown) => broadcast("approval", a));
+bus.on("policy", (p: unknown) => broadcast("policy", p));
+bus.on("agent", (a: unknown) => broadcast("agent", a));
+bus.on("agent:deleted", (a: unknown) => broadcast("agent-deleted", a));
 
 export function streamClients() {
   return clients.size;

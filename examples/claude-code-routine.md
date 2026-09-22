@@ -1,10 +1,21 @@
 # Wiring a Claude Code routine to the control plane
 
 Claude Code routines run in the cloud and can call any HTTP endpoint, so they can
-both **pick up instructions** you typed on the dashboard and **report their outcome**.
+both **pick up instructions** you typed in the command chat and **report their outcome**.
 Give the routine two environment variables, `ACP_URL` (your deployment) and
 `ACP_INGEST_TOKEN`, and paste the two blocks below into its prompt. Keep the `key`
-stable; it is what ties instructions and runs to the same agent.
+stable; it is what ties instructions and runs to the same task in the registry.
+
+Two things the control plane can do with a routine beyond reports:
+
+- **Start it from the control plane.** Add an API trigger to the routine at
+  claude.ai/code/routines › Edit › API, then put its fire URL and token on the task
+  (`PATCH /api/tasks/:id` with `{"configuration": {"fire_url": "…", "fire_token": "…"}}`,
+  or Tasks › the task's menu once the UI exposes it). "Run" and "run the nightly review" then
+  fire it through Anthropic's documented endpoint.
+- **Show it live.** Instead of one report at the end, open a run with `POST /api/runs`, stream
+  what you are doing with `POST /api/runs/:id/events`, and close it with `POST /api/runs/:id/finish`.
+  The run then shows as running in the Overview with its current step.
 
 ## At the start: fetch instructions
 
@@ -55,8 +66,10 @@ curl -sS -X POST "$ACP_URL/api/ingest" \
   }'
 ```
 
-The `keywords` field is optional but makes the dashboard's router more accurate when
-you type instructions like "skip the audit tonight" or "also check the Python deps".
+The `keywords` field is optional but makes the router more accurate when you type
+instructions like "skip the audit tonight" or "also check the Python deps". Add
+`"profile": { "key": "my-routines", "name": "My routines" }` next to `"agent"` to group several
+routines under one agent in the Agents view; without it the task belongs to Claude's assistant profile.
 
 ## Agents that can receive a webhook instead
 

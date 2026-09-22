@@ -3,6 +3,7 @@ import type { Duplex } from "node:stream";
 import type { CDPSession, Page } from "playwright";
 import { WebSocketServer, type WebSocket } from "ws";
 import { bus } from "../bus.js";
+import { addAudit } from "../db.js";
 import { logger } from "../logger.js";
 import { browser, type BrowserSnapshot } from "./manager.js";
 
@@ -197,9 +198,15 @@ async function ensureStream(platform: string): Promise<Stream | null> {
 async function startScreencast(s: Stream) {
   const q = QUALITY[s.level];
   try {
+    // Chromium refuses a second start while one is active; a (re)start always begins from stopped.
+    if (s.started) await s.session.send("Page.stopScreencast").catch(() => undefined);
     await s.session.send("Page.startScreencast", { format: "jpeg", quality: q.quality, maxWidth: q.maxWidth, maxHeight: q.maxHeight, everyNthFrame: 1 });
     s.started = true;
   } catch (err) {
+    if (/already active/i.test(err instanceof Error ? err.message : String(err))) {
+      s.started = true;
+      return;
+    }
     log.warn(`screencast for ${s.platform} did not start`, err);
   }
 }
@@ -291,6 +298,7 @@ async function handle(c: Client, msg: Record<string, unknown>) {
   }
   if (t === "override") {
     c.override = !!msg.on;
+    if (c.override) addAudit({ actor: "you", action: "browser.take_control", target: c.stream?.platform ?? null, detail: browser.busy?.label ?? null });
     return;
   }
 
@@ -306,6 +314,8 @@ async function handle(c: Client, msg: Record<string, unknown>) {
         let url = String(msg.url ?? "").trim();
         if (!url) return;
         if (!/^[a-z]+:\/\//i.test(url)) url = /^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(url) ? `https://${url}` : `https://www.google.com/search?q=${encodeURIComponent(url)}`;
+        if (!/^https?:\/\//i.test(url)) return sendJson(c, { t: "error", message: "Only http and https addresses can be opened here." });
+        addAudit({ actor: "you", action: "browser.navigate", target: s.platform, detail: url.slice(0, 300) });
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
       } else if (t === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
       else if (t === "forward") await page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });

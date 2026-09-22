@@ -3,7 +3,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
-import { isAdmin } from "./auth.js";
+import { backfillAgents } from "./agents.js";
+import { settleCommandMessage } from "./answers.js";
+import { crossOrigin, isAdmin } from "./auth.js";
 import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
@@ -11,16 +13,38 @@ import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
 import { startEmailPoller } from "./ingest/email.js";
 import { persistEnabled, saveToDatabase, startPersistLoop, stopPersistLoop } from "./persist.js";
+import { recoverInterruptedApprovals } from "./policy.js";
+import { UnsupportedOperationError } from "./providers/types.js";
+import { onRunEnded, recoverInterruptedRuns } from "./runs.js";
 import { startScheduler, stopScheduler } from "./sync.js";
 
 const log = logger("server");
 const here = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(here, "..", "public");
 
+onRunEnded(settleCommandMessage);
+
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", true);
 app.use(express.json({ limit: "5mb" }));
+
+// Security headers. The app pages get a content-security policy; the noVNC pages under /vnc keep their own.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  if (!req.path.startsWith("/vnc")) {
+    res.setHeader("X-Frame-Options", "DENY");
+    if (req.path === "/" || req.path.endsWith(".html")) {
+      res.setHeader(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+      );
+    }
+  }
+  next();
+});
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, browser: browser.isRunning(), at: new Date().toISOString() }));
 
@@ -62,15 +86,25 @@ app.use("/vnc", (req, res) => {
 app.use(express.static(publicDir, { index: "index.html", extensions: ["html"] }));
 app.use((_req, res) => res.status(404).json({ error: "not found" }));
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (res.headersSent) return;
+  // A provider that cannot do something answers with a structured 501, never a stack trace.
+  if (err instanceof UnsupportedOperationError) return res.status(501).json(err.toJSON());
+  const status = err && typeof err === "object" && typeof (err as { status?: unknown }).status === "number" ? (err as { status: number }).status : 500;
   const msg = err instanceof Error ? err.message : String(err);
-  log.error("request failed", err);
-  if (!res.headersSent) res.status(500).json({ error: msg });
+  if (status >= 500) log.error("request failed", err);
+  res.status(status).json({ error: msg });
 });
 
 const server = http.createServer(app);
 server.on("upgrade", (req, socket, head) => {
   const isLive = req.url === "/live" || req.url?.startsWith("/live?");
   if (!isLive && !req.url?.startsWith("/vnc/")) {
+    socket.destroy();
+    return;
+  }
+  // A socket that drives the signed-in browser must come from this app's own pages.
+  if (crossOrigin(req)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
     socket.destroy();
     return;
   }
@@ -106,6 +140,15 @@ server.listen(config.port, () => {
     log.info("state is mirrored to the Postgres database; no volume needed");
   }
   if (persistEnabled) startPersistLoop();
+  try {
+    backfillAgents();
+    // Work that was in flight when the last process stopped is surfaced, never left hanging.
+    const approvals = recoverInterruptedApprovals();
+    const runs = recoverInterruptedRuns();
+    if (approvals || runs) log.warn(`recovered after restart: ${approvals} pending approval(s), ${runs} running run(s) marked interrupted`);
+  } catch (err) {
+    log.error("startup recovery failed", err);
+  }
   startScheduler();
   startEmailPoller();
   if (browser.enabled) {

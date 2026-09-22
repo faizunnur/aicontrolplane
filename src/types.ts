@@ -1,6 +1,54 @@
 export type SessionStatus = "logged_in" | "needs_login" | "unknown" | "error";
-export type RunStatus = "success" | "failed" | "running" | "needs_attention" | "unknown";
-export type AgentSource = "registry" | "discovered" | "push";
+export type RunStatus = "success" | "failed" | "running" | "needs_attention" | "cancelled" | "unknown";
+export type TaskSource = "registry" | "discovered" | "push";
+/** @deprecated the registry stored tasks under the name "agents"; use TaskSource. */
+export type AgentSource = TaskSource;
+
+/**
+ * What a run is:
+ *   chat        a message sent to a provider's assistant and its answer
+ *   dispatch    a message handed to a registered task's agent (inbox, webhook or browser action)
+ *   sync        a look at a provider's tasks page
+ *   action      a browser action started from the control plane
+ *   task        a task the control plane started at the provider (runTask)
+ *   external    reported by a custom agent through the ingest API
+ *   discovered  captured from a provider's own run history
+ *   email       read from a provider's notification email
+ */
+export type RunKind = "chat" | "dispatch" | "sync" | "action" | "task" | "external" | "discovered" | "email";
+export type RunTrigger = "user" | "schedule" | "push" | "system";
+
+export type RunEventType = "step" | "log" | "approval" | "result" | "error";
+
+/** auto: goes ahead. ask: waits for you. always: waits for you and cannot be relaxed. */
+export type PolicyMode = "auto" | "ask" | "always";
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "interrupted";
+
+/** A request to do something that policy says you must approve. Persisted, so a restart cannot lose it quietly. */
+export interface Approval {
+  id: number;
+  run_id: number | null;
+  message_id: number | null;
+  action: string;
+  provider: string | null;
+  summary: string;
+  detail: string | null;
+  status: ApprovalStatus;
+  requested_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+  reason: string | null;
+}
+
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actor: string;
+  action: string;
+  target: string | null;
+  detail: string | null;
+  metadata: string | null;
+}
 
 export type DeliveryMode = "auto" | "inbox" | "webhook" | "browser" | "manual" | "chat";
 
@@ -15,12 +63,17 @@ export interface AgentDelivery {
   action?: string;
 }
 
-export interface Agent {
+/**
+ * A standing piece of work at a provider: a ChatGPT scheduled task, a Claude Code routine, a Grok
+ * automation, a custom agent's job. Identified by (platform, key), where key is the provider's own id.
+ */
+export interface Task {
   id: number;
+  /** Provider id ("chatgpt", "claude", "custom", …). */
   platform: string;
   key: string;
   name: string;
-  source: AgentSource;
+  source: TaskSource;
   purpose: string | null;
   schedule: string | null;
   native_url: string | null;
@@ -31,6 +84,34 @@ export interface Agent {
   keywords: string | null;
   /** JSON AgentDelivery. */
   delivery: string | null;
+  /** The agent profile that carries this task out; null until one is attached. */
+  agent_id: number | null;
+  /** The standing instruction the task runs with, when known. */
+  prompt: string | null;
+  /** When the provider says it runs next, ISO, when known. */
+  next_run: string | null;
+  /** JSON, provider-specific settings for the task: a routine's fire URL and token, a webhook, … */
+  configuration: string | null;
+  created_at: string;
+  updated_at: string;
+}
+/** @deprecated use Task. */
+export type Agent = Task;
+
+/** Who does the work: a provider's built-in assistant, or a program of your own. */
+export interface AgentProfile {
+  id: number;
+  key: string;
+  name: string;
+  description: string | null;
+  provider_id: string | null;
+  /** assistant (the provider's own AI) | custom (your program) | system (the control plane itself) */
+  kind: "assistant" | "custom" | "system";
+  /** JSON string[] of what it can do, as declared by the provider or the agent. */
+  capabilities: string | null;
+  status: "active" | "paused" | "disabled";
+  /** JSON, agent-specific settings. */
+  configuration: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -58,7 +139,7 @@ export interface Conversation {
 }
 
 export interface Suggestion {
-  agent_id: number;
+  task_id: number;
   key: string;
   name: string;
   platform: string;
@@ -71,11 +152,14 @@ export interface MessageRow {
   id: number;
   text: string;
   status: MessageStatus;
-  /** Target AI (platform id) when the instruction was sent to a connection's chat. */
+  /** Target provider id when the message was sent to a provider's chat. */
   platform: string | null;
-  agent_id: number | null;
+  /** Registered task the message was handed to (developer API), if any. */
+  task_id: number | null;
   conversation_id: number | null;
-  /** JSON Step[]: what the agent did for this message, in order. */
+  /** The run that carried this message out. A message is never a run; it points at one. */
+  run_id: number | null;
+  /** JSON Step[]: mirror of the run's step events, kept for the current UI. run_events is the source of truth. */
   steps: string | null;
   /** JSON Suggestion[] */
   suggestions: string | null;
@@ -90,9 +174,19 @@ export interface MessageRow {
   updated_at: string;
 }
 
+/** One execution: of a task, of a message, of a sync, of an action. Every kind of work leaves one. */
 export interface Run {
   id: number;
-  agent_id: number;
+  task_id: number | null;
+  agent_id: number | null;
+  /** Provider id the run executed on, if any. */
+  provider: string | null;
+  kind: RunKind;
+  trigger: RunTrigger | null;
+  /** Message that started the run, for chat and dispatch runs. */
+  message_id: number | null;
+  /** Short human title: "Message to ChatGPT", "Weekly research", "Looking at Claude's routines". */
+  label: string | null;
   external_id: string | null;
   status: RunStatus;
   started_at: string | null;
@@ -100,9 +194,23 @@ export interface Run {
   summary: string | null;
   details: string | null;
   output_url: string | null;
+  error: string | null;
   source: string;
   raw: string | null;
   created_at: string;
+}
+
+/** One line of a run's timeline. Steps are events with a key and a status; the latest event per key is the step's state. */
+export interface RunEvent {
+  id: number;
+  run_id: number;
+  at: string;
+  type: RunEventType;
+  key: string | null;
+  label: string;
+  status: StepStatus | null;
+  detail: string | null;
+  metadata: string | null;
 }
 
 export interface EventRow {

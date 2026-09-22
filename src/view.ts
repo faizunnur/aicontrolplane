@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import { getAgent, getPlatformState, listAgents, type MessageWithAgent } from "./db.js";
+import { getTask, getPlatformState, listTasks, type MessageWithTask } from "./db.js";
 import { describeMode, resolveMode } from "./deliver.js";
+import { getProvider } from "./providers/registry.js";
 import type { PlatformConfig } from "./types.js";
 
 /* Shapes the UI renders. Shared by the REST routes and the live stream so both agree. */
@@ -14,8 +15,8 @@ function parse(s: string | null) {
 }
 
 /** Expand JSON columns and add a human hint so the UI can render a message without extra calls. */
-export function expandMessage(m: MessageWithAgent) {
-  const agent = m.agent_id ? getAgent(m.agent_id) : undefined;
+export function expandMessage(m: MessageWithTask) {
+  const agent = m.task_id ? getTask(m.task_id) : undefined;
   const mode = m.delivery_mode ?? (agent ? resolveMode(agent) : null);
   return {
     ...m,
@@ -31,16 +32,19 @@ export type ExpandedMessage = ReturnType<typeof expandMessage>;
 /** One AI as the sidebar and the Activity view show it. */
 export function connectionCard(p: PlatformConfig) {
   const s = getPlatformState(p.id);
-  const tasks = listAgents({ platform: p.id });
+  const tasks = listTasks({ platform: p.id });
   const status = !p.appUrl ? "none" : s.session_status;
+  const adapter = getProvider(p.id);
   return {
     id: p.id,
     name: p.name,
     purpose: p.purpose,
     appUrl: p.appUrl,
-    canChat: !!p.composerSelector,
-    canSync: !!p.tasksUrl,
-    builtin: ["chatgpt", "claude", "grok"].includes(p.id),
+    kind: adapter?.kind ?? "browser",
+    capabilities: adapter?.capabilities() ?? null,
+    canChat: adapter ? adapter.supports("chat") : !!p.composerSelector,
+    canSync: adapter ? adapter.supports("listTasks") : !!p.tasksUrl,
+    builtin: adapter?.builtin ?? false,
     status, // logged_in | needs_login | error | unknown | none
     lastSync: s.last_sync_at,
     lastError: s.last_error,

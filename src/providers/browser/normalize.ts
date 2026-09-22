@@ -1,4 +1,4 @@
-import type { PlatformConfig, RunStatus } from "../types.js";
+import type { PlatformConfig, RunStatus } from "../../types.js";
 
 /**
  * Structural normaliser. Web apps rename their endpoints, but a scheduled task
@@ -44,11 +44,14 @@ export interface NormalizedTask {
   key: string;
   name: string;
   schedule: string | null;
+  /** ISO timestamp of the next run when the payload names one. */
+  next_run: string | null;
   status: string | null;
   native_url: string | null;
   purpose: string | null;
   raw: Obj;
 }
+const NEXT_RUN_KEYS = ["next_run_at", "next_run", "next_run_time", "next_scheduled_run", "scheduled_at", "next_fire_at"];
 export interface NormalizedRun {
   taskKey: string;
   external_id: string;
@@ -134,12 +137,15 @@ function nativeUrl(p: PlatformConfig, o: Obj, key: string): string | null {
   return p.tasksUrl || null;
 }
 
-function outputUrl(p: PlatformConfig, o: Obj): string | null {
+export interface NormalizeHooks {
+  /** Provider rule for where a run's output lives (e.g. ChatGPT's conversation link). */
+  outputUrlFor?: (raw: Obj) => string | null;
+}
+
+function outputUrl(o: Obj, hooks: NormalizeHooks): string | null {
   const direct = pick(o, URL_KEYS);
   if (typeof direct === "string" && /^https?:\/\//.test(direct)) return direct;
-  const conv = o["conversation_id"] ?? o["conversationId"];
-  if (typeof conv === "string" && p.id === "chatgpt") return `https://chatgpt.com/c/${conv}`;
-  return null;
+  return hooks.outputUrlFor?.(o) ?? null;
 }
 
 function toTask(p: PlatformConfig, o: Obj): NormalizedTask {
@@ -150,6 +156,7 @@ function toTask(p: PlatformConfig, o: Obj): NormalizedTask {
     key,
     name,
     schedule,
+    next_run: toIso(pick(o, NEXT_RUN_KEYS)),
     status: taskStatus(o),
     native_url: nativeUrl(p, o, key),
     purpose: str(pick(o, PROMPT_KEYS), 500),
@@ -157,7 +164,7 @@ function toTask(p: PlatformConfig, o: Obj): NormalizedTask {
   };
 }
 
-function toRun(p: PlatformConfig, o: Obj, taskKey: string): NormalizedRun {
+function toRun(o: Obj, taskKey: string, hooks: NormalizeHooks): NormalizedRun {
   return {
     taskKey,
     external_id: String(pick(o, RUN_ID_KEYS)),
@@ -165,12 +172,12 @@ function toRun(p: PlatformConfig, o: Obj, taskKey: string): NormalizedRun {
     started_at: toIso(pick(o, START_KEYS)),
     finished_at: toIso(pick(o, END_KEYS)),
     summary: str(pick(o, SUMMARY_KEYS), 500),
-    output_url: outputUrl(p, o),
+    output_url: outputUrl(o, hooks),
     raw: o,
   };
 }
 
-export function normalizePayloads(p: PlatformConfig, payloads: unknown[]): { tasks: NormalizedTask[]; runs: NormalizedRun[] } {
+export function normalizePayloads(p: PlatformConfig, payloads: unknown[], hooks: NormalizeHooks = {}): { tasks: NormalizedTask[]; runs: NormalizedRun[] } {
   const tasks = new Map<string, NormalizedTask>();
   const runs = new Map<string, NormalizedRun>();
   const orphanRuns: Obj[] = [];
@@ -190,7 +197,7 @@ export function normalizePayloads(p: PlatformConfig, payloads: unknown[]): { tas
         if (!Array.isArray(arr)) continue;
         for (const r of arr) {
           if (isObj(r) && looksLikeRun(r)) {
-            const run = toRun(p, r, t.key);
+            const run = toRun(r, t.key, hooks);
             runs.set(`${t.key}:${run.external_id}`, run);
           }
         }
@@ -198,7 +205,7 @@ export function normalizePayloads(p: PlatformConfig, payloads: unknown[]): { tas
     } else if (looksLikeRun(o)) {
       const parent = pick(o, PARENT_KEYS) ?? (isObj(o["task"]) ? pick(o["task"] as Obj, ID_KEYS) : undefined);
       if (parent !== undefined) {
-        const run = toRun(p, o, String(parent));
+        const run = toRun(o, String(parent), hooks);
         runs.set(`${run.taskKey}:${run.external_id}`, run);
       } else {
         orphanRuns.push(o);
@@ -214,7 +221,7 @@ export function normalizePayloads(p: PlatformConfig, payloads: unknown[]): { tas
     const id = String(pick(o, RUN_ID_KEYS));
     for (const key of tasks.keys()) {
       if (id.startsWith(key) || id.includes(key)) {
-        const run = toRun(p, o, key);
+        const run = toRun(o, key, hooks);
         runs.set(`${key}:${run.external_id}`, run);
         break;
       }

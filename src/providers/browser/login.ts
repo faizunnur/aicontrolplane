@@ -1,15 +1,7 @@
 import type { Page } from "playwright";
-import { browser } from "../browser/manager.js";
-import { compilePatterns } from "../platforms.js";
-import type { PlatformConfig, SessionStatus } from "../types.js";
-
-/** Playwright errors carry ANSI colour codes and multi-line call logs; keep the readable first line. */
-export function cleanError(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const stripped = raw.replace(/\u001b\[[0-9;]*m/g, "");
-  const first = stripped.split("\n").find((l) => l.trim()) ?? stripped;
-  return first.trim().slice(0, 500);
-}
+import { browser } from "../../browser/manager.js";
+import { compilePatterns } from "../../platforms.js";
+import type { PlatformConfig, SessionStatus } from "../../types.js";
 
 /**
  * Are we signed in on this page? Decided from evidence in this order:
