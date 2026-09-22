@@ -4,15 +4,48 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>AI Control Plane</title>
-  <meta name="description" content="Connect your AIs, tell them what to do from one chat, and watch them from one dashboard." />
-  <meta name="color-scheme" content="light dark" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23167a74'/%3E%3Ccircle cx='16' cy='16' r='5' fill='white'/%3E%3C/svg%3E" />
+  <meta name="description" content="One workspace for your AIs: chat with them, watch the agent work in a live browser, approve what it does." />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#12161c" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%233fc1b6'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%2312161c'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-chev-left" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+    <symbol id="i-chev-right" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-chev-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></symbol>
+    <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+    <symbol id="i-reload" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-popout" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2" fill="currentColor"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/><circle cx="19" cy="12" r="1.2" fill="currentColor"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0v5M14 10V4a2 2 0 0 0-4 0v6M10 10.5V6a2 2 0 0 0-4 0v8M18 8a2 2 0 0 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
+    <symbol id="i-login" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></symbol>
+  </svg>
+
   <!-- Gate: create a password on first run, or sign in -->
   <div id="gate" class="gate" hidden>
     <form class="gate-card" id="gate-form">
@@ -26,89 +59,138 @@
     </form>
   </div>
 
-  <header class="top">
-    <a class="brand" href="#chat"><span class="mark" aria-hidden="true"></span><span class="wordmark">AI Control Plane</span></a>
-    <nav class="tabs" role="tablist" aria-label="Screens">
-      <a class="tab" href="#chat" data-tab="chat" role="tab">Chat</a>
-      <a class="tab" href="#dashboard" data-tab="dashboard" role="tab">Dashboard <span class="tab-badge" id="badge-attention" hidden></span></a>
-      <a class="tab" href="#connect" data-tab="connect" role="tab">Connect <span class="tab-badge" id="badge-connect" hidden></span></a>
-    </nav>
-    <div class="top-actions">
-      <button class="btn icon" id="btn-theme" title="Theme" aria-label="Switch theme">◐</button>
-      <button class="btn icon" id="btn-settings" title="Settings" aria-label="Settings">⚙</button>
+  <nav class="mobile-nav" aria-label="Panels">
+    <div class="seg" role="tablist">
+      <button class="seg-btn" data-view="side" role="tab">Chats</button>
+      <button class="seg-btn active" data-view="chat" role="tab">Chat</button>
+      <button class="seg-btn" data-view="browser" role="tab">Browser</button>
     </div>
-  </header>
+  </nav>
 
-  <main class="main">
-    <!-- CHAT -->
-    <section class="screen screen-chat" id="screen-chat" hidden>
-      <div class="thread" id="thread" aria-live="polite"></div>
+  <div class="app" id="app" data-view="chat">
+    <!-- LEFT: connected AIs + conversations -->
+    <aside class="side" id="side" aria-label="AIs and chats">
+      <div class="panel-head">
+        <div class="brand"><span class="mark" aria-hidden="true"></span><span class="wordmark">AI Control Plane</span></div>
+        <span class="spacer"></span>
+        <button class="btn icon ghost" id="btn-side-collapse" title="Hide sidebar" aria-label="Hide sidebar"><svg class="ic"><use href="#i-chev-left"/></svg></button>
+      </div>
+      <div class="side-scroll">
+        <section class="side-block">
+          <div class="side-title"><span>Connected AIs</span><button class="btn icon ghost" id="btn-add-ai" title="Add an AI" aria-label="Add an AI" style="width:22px;height:22px"><svg class="ic sm"><use href="#i-plus"/></svg></button></div>
+          <div id="ai-list"></div>
+          <div class="engine" id="engine"></div>
+        </section>
+        <section class="side-block">
+          <div class="side-title"><span>Chats</span><button class="btn xs ghost" id="btn-new-chat" title="Start a new chat"><svg class="ic sm"><use href="#i-plus"/></svg> New</button></div>
+          <div id="chat-list"></div>
+        </section>
+      </div>
+      <div class="side-foot">
+        <button class="btn small ghost" id="btn-activity" title="What needs you, tasks and recent activity"><svg class="ic sm"><use href="#i-activity"/></svg> Activity <span class="count" id="badge-attention" hidden></span></button>
+        <span class="spacer"></span>
+        <button class="btn icon ghost" id="btn-theme" title="Theme" aria-label="Switch theme"><svg class="ic"><use href="#i-sun"/></svg></button>
+        <button class="btn icon ghost" id="btn-settings" title="Settings" aria-label="Settings"><svg class="ic"><use href="#i-gear"/></svg></button>
+      </div>
+    </aside>
+    <div class="gutter" id="gutter-left" role="separator" aria-orientation="vertical" aria-label="Resize sidebar"></div>
+
+    <!-- MIDDLE: conversation -->
+    <main class="chat" id="chat">
+      <div class="panel-head">
+        <button class="btn icon ghost" id="btn-side-open" title="Show sidebar" aria-label="Show sidebar" hidden><svg class="ic"><use href="#i-menu"/></svg></button>
+        <div class="chat-title"><h2 id="chat-title" title="Click to rename">New chat</h2><span class="sub" id="chat-sub"></span></div>
+        <div class="mode" role="radiogroup" aria-label="Execution mode" id="mode">
+          <button class="mode-btn" data-mode="auto" role="radio" title="The agent performs actions on its own"><svg class="ic sm"><use href="#i-bolt"/></svg><span>Auto approve</span></button>
+          <button class="mode-btn" data-mode="manual" role="radio" title="The agent pauses before sending and waits for you"><svg class="ic sm"><use href="#i-hand"/></svg><span>Ask me first</span></button>
+        </div>
+        <button class="btn icon ghost" id="btn-browser-open" title="Show browser" aria-label="Show browser" hidden><svg class="ic"><use href="#i-panel"/></svg></button>
+      </div>
+      <div class="thread" id="thread" aria-live="polite"><div class="thread-inner" id="thread-inner"></div></div>
       <form class="composer" id="composer">
-        <div class="targets" id="targets" role="radiogroup" aria-label="Send to"></div>
         <div class="composer-box">
-          <label class="visually-hidden" for="chat-text">Instruction</label>
-          <textarea id="chat-text" rows="1" placeholder="Tell your AIs what to do…" required></textarea>
-          <button class="btn primary" type="submit" id="chat-send" aria-label="Send">Send</button>
+          <label class="visually-hidden" for="chat-text">Message</label>
+          <textarea id="chat-text" rows="1" placeholder="Message your AIs…" required></textarea>
+          <div class="composer-row">
+            <div class="targets" id="targets" role="radiogroup" aria-label="Send to"></div>
+            <span class="spacer"></span>
+            <span class="composer-hint">Enter to send · Shift+Enter for a new line</span>
+            <button class="btn primary send" type="submit" id="chat-send" aria-label="Send"><svg class="ic"><use href="#i-arrow-up"/></svg></button>
+          </div>
         </div>
       </form>
-    </section>
+    </main>
+    <div class="gutter" id="gutter-right" role="separator" aria-orientation="vertical" aria-label="Resize browser"></div>
 
-    <!-- DASHBOARD -->
-    <section class="screen screen-dashboard" id="screen-dashboard" hidden>
-      <div id="attention" class="attention"></div>
-      <div class="ai-cards" id="ai-cards"></div>
-      <section class="activity">
-        <h2>Recent activity</h2>
-        <div id="activity" class="rows"></div>
-      </section>
-    </section>
-
-    <!-- CONNECT -->
-    <section class="screen screen-connect" id="screen-connect" hidden>
-      <p class="lead">Sign in to each AI once. The sign-in happens on a private screen inside this page and stays saved, so you never open those sites again.</p>
-      <div id="connections" class="connections"></div>
-      <details class="add-ai">
-        <summary>Add another AI</summary>
-        <form id="add-ai-form" class="add-ai-form">
-          <div class="form-grid">
-            <div><label for="add-name">Name</label><input id="add-name" required maxlength="40" placeholder="Muse" /></div>
-            <div><label for="add-url">Web address</label><input id="add-url" required placeholder="https://…" /></div>
-          </div>
-          <label for="add-purpose">What you use it for</label>
-          <input id="add-purpose" placeholder="one line, helps route your instructions" maxlength="300" />
-          <div class="row end"><button class="btn primary" type="submit">Add AI</button></div>
-        </form>
-      </details>
-    </section>
-  </main>
-
-  <!-- Sign-in / view screen for one AI -->
-  <div id="connect-modal" class="overlay" hidden>
-    <div class="panel screen-panel">
+    <!-- RIGHT: live browser -->
+    <section class="browser" id="browser" aria-label="Live browser">
       <div class="panel-head">
-        <h2 id="connect-title">Sign in</h2>
-        <div class="row">
-          <div class="seg" role="group" aria-label="View">
-            <button class="seg-btn active" type="button" data-fit="scale">Fit</button>
-            <button class="seg-btn" type="button" data-fit="off">Actual size</button>
-          </div>
-          <a class="btn small ghost" id="connect-newtab" href="/vnc/" target="_blank" rel="noopener" title="Open the screen in its own tab (easier on a phone)">Open in new tab</a>
-          <button class="btn icon ghost" type="button" data-close aria-label="Close">✕</button>
+        <div class="tabs" id="tabs" role="tablist"></div>
+        <div class="browser-actions">
+          <button class="btn icon ghost" id="btn-quality" title="Picture quality">HD</button>
+          <a class="btn icon ghost" id="btn-popout" href="/vnc/" target="_blank" rel="noopener" title="Open the whole screen in a new tab"><svg class="ic"><use href="#i-popout"/></svg></a>
+          <button class="btn icon ghost" id="btn-fullscreen" title="Full screen" aria-label="Full screen"><svg class="ic"><use href="#i-expand"/></svg></button>
+          <button class="btn icon ghost" id="btn-browser-close" title="Hide browser" aria-label="Hide browser"><svg class="ic"><use href="#i-close"/></svg></button>
         </div>
       </div>
-      <p class="muted small" id="connect-help">Sign in below exactly as you would on your laptop. Scroll with the mouse wheel over the page. When you can see your chats, press “I'm signed in”.</p>
-      <iframe id="connect-frame" title="Browser screen" allow="clipboard-read; clipboard-write"></iframe>
-      <div class="row end" id="connect-actions">
-        <button class="btn ghost" type="button" data-close>Later</button>
-        <button class="btn primary" type="button" id="connect-done">I'm signed in</button>
+      <div class="chrome">
+        <div class="nav">
+          <button class="btn icon ghost" data-nav="back" title="Back" aria-label="Back"><svg class="ic"><use href="#i-arrow-left"/></svg></button>
+          <button class="btn icon ghost" data-nav="forward" title="Forward" aria-label="Forward"><svg class="ic"><use href="#i-arrow-right"/></svg></button>
+          <button class="btn icon ghost" data-nav="reload" title="Reload" aria-label="Reload"><svg class="ic"><use href="#i-reload"/></svg></button>
+        </div>
+        <form class="urlbar" id="urlbar" autocomplete="off">
+          <span class="lock" id="url-lock"><svg class="ic sm"><use href="#i-globe"/></svg></span>
+          <label class="visually-hidden" for="url">Address</label>
+          <input id="url" spellcheck="false" placeholder="Type an address and press Enter" />
+        </form>
       </div>
+      <div class="viewport empty" id="viewport" tabindex="0" aria-label="Live browser screen. Click to interact.">
+        <canvas id="screen" width="16" height="9"></canvas>
+        <div class="viewport-msg" id="viewport-msg"><strong>Nothing open yet</strong><span>Send a message or sign in to an AI and the browser shows up here.</span></div>
+        <div class="ribbon top busy" id="busy-ribbon" hidden><span class="dot run"></span><span class="txt" id="busy-text"></span><button class="btn xs" id="btn-control">Take control</button></div>
+        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn icon ghost" id="btn-signin-dismiss" style="width:22px;height:22px" aria-label="Dismiss"><svg class="ic sm"><use href="#i-close"/></svg></button></div>
+      </div>
+      <div class="statusbar">
+        <span class="dot" id="live-dot"></span>
+        <span class="st" id="live-status">Connecting…</span>
+        <span class="spacer"></span>
+        <span class="mono" id="live-fps"></span>
+      </div>
+    </section>
+  </div>
+  <button class="btn browser-fab" id="btn-browser-fab" hidden><svg class="ic"><use href="#i-panel"/></svg> Browser</button>
+
+  <!-- Add an AI -->
+  <div id="add-modal" class="overlay" hidden>
+    <form class="panel modal" id="add-ai-form" style="max-width:480px">
+      <div class="panel-head"><h2>Add an AI</h2><button class="btn icon ghost" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button></div>
+      <p class="muted small" style="margin-bottom:12px">Any AI with a website. You sign in to it once in the browser panel and it stays signed in.</p>
+      <div class="form-grid">
+        <div><label for="add-name">Name</label><input id="add-name" required maxlength="40" placeholder="Muse" /></div>
+        <div><label for="add-url">Web address</label><input id="add-url" required placeholder="https://…" /></div>
+      </div>
+      <label for="add-purpose">What you use it for</label>
+      <input id="add-purpose" placeholder="one line, helps route your messages" maxlength="300" />
+      <div class="row end"><button class="btn ghost" type="button" data-close>Cancel</button><button class="btn primary" type="submit">Add AI</button></div>
+    </form>
+  </div>
+
+  <!-- Activity: what needs you, tasks per AI, recent runs -->
+  <div id="activity-modal" class="overlay" hidden>
+    <div class="panel modal wide">
+      <div class="panel-head"><h2>Activity</h2><button class="btn icon ghost" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button></div>
+      <div id="attention" class="attention"></div>
+      <div class="ai-cards" id="ai-cards"></div>
+      <h3>Recent</h3>
+      <div id="activity" class="rows"></div>
     </div>
   </div>
 
   <!-- Settings -->
   <div id="settings-modal" class="overlay" hidden>
     <div class="panel modal settings">
-      <div class="panel-head"><h2>Settings</h2><button class="btn icon ghost" type="button" data-close aria-label="Close">✕</button></div>
+      <div class="panel-head"><h2>Settings</h2><button class="btn icon ghost" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button></div>
       <nav class="subtabs" id="settings-tabs">
         <button class="subtab active" data-stab="general">General</button>
         <button class="subtab" data-stab="ai">AI setup</button>
@@ -116,6 +198,9 @@
       </nav>
 
       <div class="stab" id="stab-general">
+        <h3>Execution mode</h3>
+        <p class="muted small" id="mode-note">Auto approve lets the agent send messages and run actions on its own. Ask me first pauses before each send so you can approve or reject it in the thread.</p>
+
         <h3>Password</h3>
         <form id="password-form" class="stack">
           <p class="muted small" id="password-note"></p>
@@ -126,7 +211,7 @@
           <div class="row end"><button class="btn" type="submit">Change password</button></div>
         </form>
 
-        <h3>How instructions are routed</h3>
+        <h3>How messages are routed</h3>
         <p class="muted small" id="router-note"></p>
 
         <h3>Notifications</h3>
@@ -175,14 +260,14 @@
 
       <div class="stab" id="stab-developer" hidden>
         <h3>Report from your own agents</h3>
-        <p class="muted small">Anything that can make an HTTP call can report a run or pick up instructions. Use this token, never your password.</p>
+        <p class="muted small">Anything that can make an HTTP call can report a run or pick up messages. Use this token, never your password.</p>
         <div class="row">
           <code id="ingest-token" class="token">…</code>
           <button class="btn small" id="btn-copy-token">Copy</button>
           <button class="btn small ghost" id="btn-rotate-token">New token</button>
         </div>
         <pre id="ingest-example"></pre>
-        <p class="muted small">Agents can also fetch instructions you send them: <code>GET /api/inbox?platform=&amp;key=</code> and acknowledge with <code>POST /api/inbox/:id/ack</code>. The <code>examples/</code> folder has a shell script, a Claude Code routine prompt and an MCP server for Cowork.</p>
+        <p class="muted small">Agents can also fetch messages you send them: <code>GET /api/inbox?platform=&amp;key=</code> and acknowledge with <code>POST /api/inbox/:id/ack</code>. Live updates: <code>GET /api/stream</code> (server-sent events). The <code>examples/</code> folder has a shell script, a Claude Code routine prompt and an MCP server for Cowork.</p>
       </div>
     </div>
   </div>
@@ -192,6 +277,7 @@
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/live.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

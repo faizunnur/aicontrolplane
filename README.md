@@ -8,28 +8,42 @@ signed in to each AI as you, so it can send your instructions and read the answe
 any of those sites.
 
 ```
-   Connect            Chat                                  Dashboard
-   ────────           ─────────────────────────────────     ───────────────────────
-   ChatGPT  ● on      you:  Grok, what's trending in AI?    ● ChatGPT   3 tasks, ok
-   Claude   ● on      Grok: Three things today: …           ● Claude    2 tasks, ok
-   Grok     ● on      you:  Draft the weekly report         ● Grok      1 failed ← needs you
-   + add another      Claude: Here is a draft: …            activity · attention
+  AIs & chats          Conversation                          Live browser
+  ───────────────      ──────────────────────────────────    ─────────────────────────────
+  ● ChatGPT            you:  Grok, what's trending in AI?    [ChatGPT] [Grok]   ← → ⟳  🔒 grok.com
+  ● Claude                   ✓ Opening Grok                  ┌───────────────────────────┐
+  ○ Grok  signed out         ✓ Typing your message           │  the agent typing, live,  │
+                             ● Waiting for Grok to answer    │  as it happens            │
+  Today                Grok: Three things today: …           │                           │
+    Weekly report                                            └───────────────────────────┘
+    Trending in AI     [Auto ▾]  Message your AIs…      ↑    Live · Grok · 24 fps
 ```
 
-## Three screens
+## The workspace
 
-**Connect.** One row per AI with a Connect button. It opens that AI's sign-in page on a private screen inside
-the app. You sign in the way you always do, press "I'm signed in", and it stays signed in from then on.
-Add any other AI with a name and its web address.
+One screen, three panels. Drag the dividers to resize them, collapse the sides when you want room, and on a
+phone they become three tabs.
 
-**Chat.** One thread. Type an instruction and press Enter. The app picks the AI (or you tap a chip to choose),
-opens a conversation there, types your instruction, waits for the answer and posts it back in the thread.
-Name an AI to be explicit: "Grok, what's trending?" Anything the AI does in the background, like a scheduled
-task it creates, shows up on the Dashboard later.
+**Left: your AIs and your chats.** Each AI with its connection state, what the agent is doing with it right
+now, and a menu to sign in, check, show its tab or edit it. Under that, the cloud browser and routing status,
+then every chat you have had, grouped by day.
 
-**Dashboard.** One card per AI: connected or not, the tasks it is running with their last result, a live
-screenshot, and a Refresh button. Above the cards, whatever needs you: an AI that signed you out, an
-instruction that could not be sent, a task that failed.
+**Middle: the conversation.** Chat normally or give an instruction. It goes to the AI you name or pick
+("Grok, what's trending?", or tap its chip), and the answer comes back in the thread. While the agent works,
+its activity appears under your message as it happens: Opening ChatGPT → Checking the sign-in → Typing your
+message → Sending → Waiting for the answer → Reading the answer → Done. A Stop button ends a task early.
+
+**Right: the live browser.** The actual browser the agent uses, streamed as it happens, one tab per AI. You
+can watch every action, and when nothing is running you can click, type and scroll in it yourself. The address
+bar, back, forward and reload work like any browser. "Follow agent" keeps the panel on whichever tab the agent
+is working in. Signing in to an AI happens right here.
+
+**Two execution modes**, switched in the conversation header:
+
+- **Auto approve.** The agent performs every action on its own.
+- **Ask me first.** The agent types the message, then pauses and asks in the thread. You watch it sitting in the
+  AI's box in the live browser, then press Approve or Reject. Custom actions ask the same way. An approval that
+  nobody answers within 15 minutes is treated as a rejection.
 
 Everything else lives behind the gear icon.
 
@@ -46,7 +60,8 @@ Everything else lives behind the gear icon.
    Without either, every deploy signs you out and the dashboard shows a warning banner.
 3. Do not set `DATA_DIR` on Railway; the image already uses `/data`.
 4. Give the service at least 2 GB of memory (it runs Chromium; "Page crashed" means it needs more) and generate a domain.
-5. Open the domain. Create your password. Go to Connect and sign in to your AIs. That's it.
+5. Open the domain. Create your password. Open the menu next to an AI on the left, press Sign in, and sign in
+   inside the browser panel. That's it.
 
 Optional variables, all set in the Railway service:
 
@@ -108,6 +123,20 @@ curl -X POST https://your-app.up.railway.app/api/ingest \
   -d '{ "agent": { "key": "nightly-audit", "platform": "custom", "name": "Nightly audit" },
         "run": { "status": "success", "summary": "0 issues found" } }'
 ```
+
+## How the live browser works
+
+The right panel is not a video of a screen. The app asks Chromium for a screencast of the tab (a JPEG for
+every repaint, nothing while the page is still) and streams it over a WebSocket at `/live`; your clicks, keys
+and scrolling go back the same way and are replayed in the tab. The picture quality button trades sharpness
+for bandwidth. While the agent holds the browser the panel is view-only, so a stray click cannot break a task
+that is typing; "Take control" overrides that when you need to dismiss something.
+
+Everything the UI shows updates over server-sent events (`/api/stream`): message steps, replies, connection
+state, which tab the agent is in. Nothing polls.
+
+`/vnc/` still exists as a fallback view of the whole screen (the pop-out button), for phones and for the rare
+site that misbehaves under the screencast.
 
 ## Security notes
 

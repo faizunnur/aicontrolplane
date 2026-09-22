@@ -1,15 +1,35 @@
 import fs from "node:fs";
 import path from "node:path";
 import { chromium, type BrowserContext, type Cookie, type Page } from "playwright";
+import { bus } from "../bus.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
 import { persistStatus, saveToDatabase } from "../persist.js";
 
 const log = logger("browser");
 
+export interface BusyTask {
+  /** Short human label: "Sending to ChatGPT", "Checking Claude", "Looking at Grok's tasks". */
+  label: string;
+  platform: string | null;
+  /** Message the task belongs to, when it is a chat delivery. */
+  messageId: number | null;
+  since: string;
+}
+
+export interface BrowserSnapshot {
+  enabled: boolean;
+  running: boolean;
+  headless: boolean;
+  /** Platform whose tab is in front (what the live view follows). */
+  active: string | null;
+  busy: BusyTask | null;
+  pages: { platform: string; url: string; title: string }[];
+}
+
 /**
  * One persistent Chromium profile for every platform. Cookies are per-domain
- * anyway, so a single profile keeps memory low and gives the VNC screen a
+ * anyway, so a single profile keeps memory low and gives the live view a
  * single window with one tab per platform ("console tabs").
  */
 class BrowserManager {
@@ -17,10 +37,79 @@ class BrowserManager {
   private context: BrowserContext | null = null;
   private launching: Promise<BrowserContext> | null = null;
   private consolePages = new Map<string, Page>();
+  private titles = new Map<string, string>();
   private queue: Promise<unknown> = Promise.resolve();
+  private activePlatform: string | null = null;
+  private busyTask: BusyTask | null = null;
 
   isRunning() {
     return this.context !== null;
+  }
+
+  /** Platform whose tab is in front. */
+  get active() {
+    return this.activePlatform;
+  }
+  /** The job holding the browser lock right now, if any. */
+  get busy() {
+    return this.busyTask;
+  }
+
+  /** What the UI needs to draw the browser panel. Synchronous, so it can ride on every bus event. */
+  snapshot(): BrowserSnapshot {
+    const pages: BrowserSnapshot["pages"] = [];
+    for (const [platform, page] of this.consolePages) {
+      if (page.isClosed()) continue;
+      pages.push({ platform, url: page.url(), title: this.titles.get(platform) ?? "" });
+    }
+    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages };
+  }
+
+  private announce() {
+    bus.emit("browser", this.snapshot());
+  }
+
+  /** The console tab of a platform, if one is open. */
+  pageOf(platformId: string): Page | undefined {
+    const page = this.consolePages.get(platformId);
+    return page && !page.isClosed() ? page : undefined;
+  }
+
+  /** Bring a platform's tab to the front (the live view shows the front tab in headed mode). */
+  async bringToFront(platformId: string): Promise<boolean> {
+    const page = this.pageOf(platformId);
+    if (!page) return false;
+    await page.bringToFront().catch(() => undefined);
+    this.setActive(platformId);
+    return true;
+  }
+
+  private setActive(platformId: string | null) {
+    if (this.activePlatform === platformId) return;
+    this.activePlatform = platformId;
+    this.announce();
+  }
+
+  private track(platformId: string, page: Page) {
+    const isMain = (f: import("playwright").Frame) => f === page.mainFrame();
+    page.on("framenavigated", (f) => {
+      if (isMain(f)) this.announce();
+    });
+    page.on("load", () => {
+      page
+        .title()
+        .then((t) => {
+          this.titles.set(platformId, t);
+          this.announce();
+        })
+        .catch(() => undefined);
+    });
+    page.on("close", () => {
+      if (this.consolePages.get(platformId) === page) this.consolePages.delete(platformId);
+      this.titles.delete(platformId);
+      if (this.activePlatform === platformId) this.activePlatform = null;
+      this.announce();
+    });
   }
 
   async getContext(): Promise<BrowserContext> {
@@ -67,9 +156,13 @@ class BrowserManager {
       log.warn("browser context closed");
       this.context = null;
       this.consolePages.clear();
+      this.titles.clear();
+      this.activePlatform = null;
+      this.announce();
     });
     this.context = ctx;
     await this.restoreSessionsIfEmpty(ctx);
+    this.announce();
     return ctx;
   }
 
@@ -120,11 +213,26 @@ class BrowserManager {
     return out;
   }
 
-  /** Serialise browser work so a sync never navigates a tab another job is using. */
-  withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(fn, fn);
+  /**
+   * Serialise browser work so a sync never navigates a tab another job is using.
+   * The task label is shown in the live view while the job runs ("Sending to ChatGPT").
+   */
+  withLock<T>(fn: () => Promise<T>, task?: { label: string; platform?: string | null; messageId?: number | null }): Promise<T> {
+    const job = () => this.runLocked(fn, task);
+    const run = this.queue.then(job, job);
     this.queue = run.catch(() => undefined);
     return run;
+  }
+
+  private async runLocked<T>(fn: () => Promise<T>, task?: { label: string; platform?: string | null; messageId?: number | null }): Promise<T> {
+    this.busyTask = { label: task?.label ?? "Working", platform: task?.platform ?? null, messageId: task?.messageId ?? null, since: new Date().toISOString() };
+    this.announce();
+    try {
+      return await fn();
+    } finally {
+      this.busyTask = null;
+      this.announce();
+    }
   }
 
   /** The long-lived tab for a platform. Created on demand; navigated when url is given. */
@@ -137,13 +245,12 @@ class BrowserManager {
       const spare = ctx.pages().find((p) => !owned.has(p) && !p.isClosed() && p.url() === "about:blank");
       page = spare ?? (await ctx.newPage());
       this.consolePages.set(platformId, page);
-      const tracked = page;
-      tracked.on("close", () => {
-        if (this.consolePages.get(platformId) === tracked) this.consolePages.delete(platformId);
-      });
+      this.track(platformId, page);
+      this.announce();
     }
     if (url) {
       await page.bringToFront().catch(() => undefined);
+      this.setActive(platformId);
       try {
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       } catch (err) {
@@ -153,8 +260,13 @@ class BrowserManager {
         await this.resetConsolePage(platformId);
         page = await ctx.newPage();
         this.consolePages.set(platformId, page);
+        this.track(platformId, page);
+        this.setActive(platformId);
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
       }
+    } else {
+      // Callers that take the page without a url are about to work in it: it becomes the front tab.
+      this.setActive(platformId);
     }
     return page;
   }
@@ -185,13 +297,12 @@ class BrowserManager {
     return ctx.storageState();
   }
 
-  async status() {
-    const pages: { platform: string; url: string; title: string }[] = [];
+  async status(): Promise<BrowserSnapshot> {
     for (const [platform, page] of this.consolePages) {
       if (page.isClosed()) continue;
-      pages.push({ platform, url: page.url(), title: await page.title().catch(() => "") });
+      this.titles.set(platform, await page.title().catch(() => this.titles.get(platform) ?? ""));
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, pages };
+    return this.snapshot();
   }
 
   async close() {
@@ -200,7 +311,10 @@ class BrowserManager {
     await this.backupSessions();
     this.context = null;
     this.consolePages.clear();
+    this.titles.clear();
+    this.activePlatform = null;
     await ctx.close().catch(() => undefined);
+    this.announce();
   }
 }
 

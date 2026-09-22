@@ -1,11 +1,13 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
+import { bus } from "./bus.js";
 import { config } from "./config.js";
 import type {
   Agent,
   AgentDelivery,
   AgentSource,
+  Conversation,
   DeliveryMode,
   EventRow,
   MessageRow,
@@ -14,6 +16,7 @@ import type {
   Run,
   RunStatus,
   SessionStatus,
+  Step,
 } from "./types.js";
 
 fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
@@ -118,6 +121,13 @@ CREATE TABLE IF NOT EXISTS messages (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_status ON messages(status, created_at DESC);
+CREATE TABLE IF NOT EXISTS conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_message_at TEXT
+);
 `);
 
 /** Additive migrations for databases created by earlier versions. */
@@ -128,8 +138,21 @@ function ensureColumn(table: string, column: string, ddl: string) {
 ensureColumn("agents", "keywords", "keywords TEXT");
 ensureColumn("agents", "delivery", "delivery TEXT");
 ensureColumn("messages", "platform", "platform TEXT");
+ensureColumn("messages", "conversation_id", "conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE");
+ensureColumn("messages", "steps", "steps TEXT");
+db.exec("CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, created_at)");
 
 export const now = () => new Date().toISOString();
+
+// Messages written before conversations existed are gathered into one thread so nothing disappears.
+{
+  const orphans = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE conversation_id IS NULL").get() as { n: number }).n;
+  if (orphans > 0) {
+    const ts = now();
+    const res = db.prepare("INSERT INTO conversations (title, created_at, updated_at, last_message_at) VALUES (?, ?, ?, ?)").run("Earlier messages", ts, ts, ts);
+    db.prepare("UPDATE messages SET conversation_id = ? WHERE conversation_id IS NULL").run(Number(res.lastInsertRowid));
+  }
+}
 
 /* ---------- agents ---------- */
 
@@ -430,6 +453,7 @@ export function setPlatformState(platform: string, patch: Partial<Omit<PlatformS
      ON CONFLICT(platform) DO UPDATE SET session_status=excluded.session_status, last_sync_at=excluded.last_sync_at,
        last_ok_at=excluded.last_ok_at, last_error=excluded.last_error, screenshot_path=excluded.screenshot_path, meta=excluded.meta`,
   ).run(platform, next.session_status, next.last_sync_at, next.last_ok_at, next.last_error, next.screenshot_path, next.meta);
+  bus.emit("platform:row", platform);
   return next;
 }
 
@@ -525,6 +549,71 @@ export function asSessionStatus(s: string): SessionStatus {
   return (["logged_in", "needs_login", "unknown", "error"] as const).includes(s as SessionStatus) ? (s as SessionStatus) : "unknown";
 }
 
+/* ---------- conversations (threads in the chat panel) ---------- */
+
+export type ConversationSummary = Conversation & {
+  message_count: number;
+  last_status: MessageStatus | null;
+  last_text: string | null;
+  last_platform: string | null;
+  /** True while any message in the thread is still being worked on. */
+  active: number;
+};
+
+const CONVERSATION_SELECT = `SELECT c.*,
+  (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
+  (SELECT status FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) AS last_status,
+  (SELECT text FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) AS last_text,
+  (SELECT platform FROM messages m WHERE m.conversation_id = c.id AND m.platform IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS last_platform,
+  EXISTS(SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND m.status IN ('assigned','delivered')) AS active
+  FROM conversations c`;
+
+export function createConversation(title = ""): ConversationSummary {
+  const ts = now();
+  const res = db.prepare("INSERT INTO conversations (title, created_at, updated_at, last_message_at) VALUES (?, ?, ?, NULL)").run(title.slice(0, 120), ts, ts);
+  const c = getConversation(Number(res.lastInsertRowid))!;
+  bus.emit("conversation", { action: "created", conversation: c });
+  return c;
+}
+
+export function getConversation(id: number): ConversationSummary | undefined {
+  return db.prepare(`${CONVERSATION_SELECT} WHERE c.id = ?`).get(id) as ConversationSummary | undefined;
+}
+
+export function listConversations(limit = 200): ConversationSummary[] {
+  return db.prepare(`${CONVERSATION_SELECT} ORDER BY COALESCE(c.last_message_at, c.created_at) DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 1000)) as ConversationSummary[];
+}
+
+export function updateConversation(id: number, patch: { title?: string; last_message_at?: string }): ConversationSummary | undefined {
+  const c = getConversation(id);
+  if (!c) return undefined;
+  db.prepare("UPDATE conversations SET title = ?, last_message_at = ?, updated_at = ? WHERE id = ?").run(
+    patch.title === undefined ? c.title : patch.title.slice(0, 120),
+    patch.last_message_at === undefined ? c.last_message_at : patch.last_message_at,
+    now(),
+    id,
+  );
+  const next = getConversation(id)!;
+  bus.emit("conversation", { action: "updated", conversation: next });
+  return next;
+}
+
+export function deleteConversation(id: number): boolean {
+  const c = getConversation(id);
+  if (!c) return false;
+  db.prepare("DELETE FROM messages WHERE conversation_id = ?").run(id);
+  db.prepare("DELETE FROM conversations WHERE id = ?").run(id);
+  bus.emit("conversation", { action: "deleted", conversation: c });
+  return true;
+}
+
+/** Messages of one thread, oldest first. */
+export function conversationMessages(conversationId: number, limit = 300): MessageWithAgent[] {
+  return db
+    .prepare(`${MESSAGE_SELECT} WHERE m.conversation_id = ? ORDER BY m.created_at ASC, m.id ASC LIMIT ?`)
+    .all(conversationId, Math.min(Math.max(limit, 1), 2000)) as MessageWithAgent[];
+}
+
 /* ---------- messages (instructions routed to agents) ---------- */
 
 export type MessageWithAgent = MessageRow & { agent_name: string | null; agent_platform: string | null; agent_key: string | null; agent_native_url: string | null };
@@ -532,10 +621,19 @@ export type MessageWithAgent = MessageRow & { agent_name: string | null; agent_p
 const MESSAGE_SELECT = `SELECT m.*, a.name AS agent_name, a.platform AS agent_platform, a.key AS agent_key, a.native_url AS agent_native_url
   FROM messages m LEFT JOIN agents a ON a.id = m.agent_id`;
 
-export function createMessage(text: string): MessageRow {
+export function createMessage(text: string, conversationId: number | null = null): MessageRow {
   const ts = now();
-  const res = db.prepare(`INSERT INTO messages (text, status, created_at, updated_at) VALUES (?, 'needs_assignment', ?, ?)`).run(text, ts, ts);
-  return getMessage(Number(res.lastInsertRowid))!;
+  const res = db
+    .prepare(`INSERT INTO messages (text, status, conversation_id, created_at, updated_at) VALUES (?, 'needs_assignment', ?, ?, ?)`)
+    .run(text, conversationId, ts, ts);
+  if (conversationId) {
+    db.prepare("UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ?").run(ts, ts, conversationId);
+    const c = getConversation(conversationId);
+    if (c) bus.emit("conversation", { action: "updated", conversation: c });
+  }
+  const m = getMessage(Number(res.lastInsertRowid))!;
+  bus.emit("message:row", m);
+  return m;
 }
 
 export function getMessage(id: number): MessageWithAgent | undefined {
@@ -553,6 +651,7 @@ export interface MessagePatch {
   acked_at?: string | null;
   response?: string | null;
   error?: string | null;
+  steps?: Step[] | null;
 }
 
 export function updateMessage(id: number, patch: MessagePatch): MessageWithAgent | undefined {
@@ -560,7 +659,7 @@ export function updateMessage(id: number, patch: MessagePatch): MessageWithAgent
   if (!m) return undefined;
   const json = (v: unknown, cur: string | null) => (v === undefined ? cur : v === null ? null : JSON.stringify(v));
   db.prepare(
-    `UPDATE messages SET status=?, platform=?, agent_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, updated_at=? WHERE id=?`,
+    `UPDATE messages SET status=?, platform=?, agent_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, steps=?, updated_at=? WHERE id=?`,
   ).run(
     patch.status ?? m.status,
     patch.platform === undefined ? m.platform : patch.platform,
@@ -572,10 +671,20 @@ export function updateMessage(id: number, patch: MessagePatch): MessageWithAgent
     patch.acked_at === undefined ? m.acked_at : patch.acked_at,
     patch.response === undefined ? m.response : patch.response,
     patch.error === undefined ? m.error : patch.error,
+    json(patch.steps, m.steps),
     now(),
     id,
   );
-  return getMessage(id);
+  const next = getMessage(id);
+  if (next) {
+    bus.emit("message:row", next);
+    // A status change is what the thread list cares about (running dot, last status).
+    if (next.conversation_id && patch.status && patch.status !== m.status) {
+      const c = getConversation(next.conversation_id);
+      if (c) bus.emit("conversation", { action: "updated", conversation: c });
+    }
+  }
+  return next;
 }
 
 export function listMessages(opts: { status?: string; agent_id?: number; limit?: number } = {}): MessageWithAgent[] {
@@ -603,7 +712,16 @@ export function inboxFor(agentId: number): MessageWithAgent[] {
 }
 
 export function deleteMessage(id: number): boolean {
-  return db.prepare("DELETE FROM messages WHERE id = ?").run(id).changes > 0;
+  const m = getMessage(id);
+  const ok = db.prepare("DELETE FROM messages WHERE id = ?").run(id).changes > 0;
+  if (ok && m) {
+    bus.emit("message:deleted", { id, conversation_id: m.conversation_id });
+    if (m.conversation_id) {
+      const c = getConversation(m.conversation_id);
+      if (c) bus.emit("conversation", { action: "updated", conversation: c });
+    }
+  }
+  return ok;
 }
 
 export function openMessageCount(): number {

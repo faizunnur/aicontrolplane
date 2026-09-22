@@ -60,7 +60,7 @@ export async function syncPlatform(p: PlatformConfig): Promise<SyncResult> {
   const before = getPlatformState(p.id);
   let result: SyncResult;
   try {
-    result = await browser.withLock(() => collect(p));
+    result = await browser.withLock(() => collect(p), { label: `Looking at ${p.name}'s tasks`, platform: p.id });
   } catch (err) {
     const message = cleanError(err);
     log.error(`sync ${p.id} failed: ${message}`);
@@ -273,7 +273,7 @@ function tryParse(body: string): unknown {
 
 /** Screenshot the console tab without navigating (used by the dashboard's Screenshot button). */
 export async function snapshotOnly(p: PlatformConfig): Promise<string | null> {
-  return browser.withLock(() => screenshotConsoleTab(p));
+  return browser.withLock(() => screenshotConsoleTab(p), { label: `Taking a screenshot of ${p.name}`, platform: p.id });
 }
 
 /**

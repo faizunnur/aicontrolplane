@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
 import { isAdmin } from "./auth.js";
+import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
@@ -68,7 +69,8 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 
 const server = http.createServer(app);
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url?.startsWith("/vnc/")) {
+  const isLive = req.url === "/live" || req.url?.startsWith("/live?");
+  if (!isLive && !req.url?.startsWith("/vnc/")) {
     socket.destroy();
     return;
   }
@@ -77,7 +79,12 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  req.url = req.url.replace(/^\/vnc/, "") || "/";
+  if (isLive) {
+    // The live browser view: Chromium screencast frames + input, see src/browser/live.ts.
+    handleLiveUpgrade(req, socket, head);
+    return;
+  }
+  req.url = req.url!.replace(/^\/vnc/, "") || "/";
   vncState.connections++;
   vncState.lastActivityAt = Date.now();
   socket.on("close", () => {

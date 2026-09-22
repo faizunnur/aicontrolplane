@@ -35,7 +35,27 @@ export interface Agent {
   updated_at: string;
 }
 
-export type MessageStatus = "needs_assignment" | "assigned" | "delivered" | "acknowledged" | "done" | "failed";
+export type MessageStatus = "needs_assignment" | "assigned" | "delivered" | "acknowledged" | "done" | "failed" | "cancelled";
+
+export type StepStatus = "pending" | "running" | "done" | "failed" | "skipped" | "waiting";
+
+/** One line of agent activity shown under a message: "Opening ChatGPT", "Waiting for your approval", … */
+export interface Step {
+  key: string;
+  label: string;
+  status: StepStatus;
+  detail?: string | null;
+  at: string;
+  ended_at?: string | null;
+}
+
+export interface Conversation {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  last_message_at: string | null;
+}
 
 export interface Suggestion {
   agent_id: number;
@@ -54,6 +74,9 @@ export interface MessageRow {
   /** Target AI (platform id) when the instruction was sent to a connection's chat. */
   platform: string | null;
   agent_id: number | null;
+  conversation_id: number | null;
+  /** JSON Step[]: what the agent did for this message, in order. */
+  steps: string | null;
   /** JSON Suggestion[] */
   suggestions: string | null;
   /** JSON routing details: method, confidence, reason, new_agent, llm_error */

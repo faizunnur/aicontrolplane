@@ -3,22 +3,29 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { availableActions, runAction } from "../actions.js";
 import { alertsConfigured, sendAlert } from "../alerts.js";
+import { approvalMode, decide, pendingApprovals, setApprovalMode } from "../approvals.js";
+import { liveViewers } from "../browser/live.js";
 import { browser, storageInfo, vncState } from "../browser/manager.js";
 import { config } from "../config.js";
 import {
   addEvent,
   allPlatformStates,
+  conversationMessages,
+  createConversation,
   createMessage,
   deleteAgent,
+  deleteConversation,
   deleteMessage,
   findAgent,
   getAgent,
   getCapture,
+  getConversation,
   getMessage,
   getPlatformState,
   inboxFor,
   listAgents,
   listCaptures,
+  listConversations,
   listEvents,
   listMessages,
   listRuns,
@@ -31,12 +38,15 @@ import {
   recordRun,
   runStats,
   updateAgent,
+  updateConversation,
   updateMessage,
   upsertAgent,
-  type MessageWithAgent,
 } from "../db.js";
-import { deliverMessage, describeMode, resolveMode } from "../deliver.js";
+import { deliverMessage } from "../deliver.js";
+import { streamClients, streamHandler } from "../live.js";
 import { routeMessage } from "../router.js";
+import { requestCancel, StepTracker } from "../steps.js";
+import { connectionCard, expandMessage } from "../view.js";
 import { emailStatus, pollOnce } from "../ingest/email.js";
 import { deletePlatformOverride, getPlatform, getPlatforms, savePlatformOverride, visiblePlatforms } from "../platforms.js";
 import {
@@ -69,20 +79,6 @@ const DELIVERY = z
     action: z.string().max(80).optional(),
   })
   .nullable();
-
-/** Expand JSON columns and add a human hint so the dashboard can render a message without extra calls. */
-function expandMessage(m: MessageWithAgent) {
-  const parse = (s: string | null) => {
-    try {
-      return s ? JSON.parse(s) : null;
-    } catch {
-      return null;
-    }
-  };
-  const agent = m.agent_id ? getAgent(m.agent_id) : undefined;
-  const mode = m.delivery_mode ?? (agent ? resolveMode(agent) : null);
-  return { ...m, suggestions: parse(m.suggestions) ?? [], routing: parse(m.routing), delivery_mode: mode, delivery_hint: mode ? describeMode(mode) : null };
-}
 
 async function assignAndDeliver(messageId: number, agentId: number) {
   updateMessage(messageId, { agent_id: agentId, status: "assigned", error: null, delivered_at: null, acked_at: null });
@@ -260,32 +256,8 @@ api.use(requireAdmin);
 
 /* ---------- the app: connections, chat, home ---------- */
 
-function connectionCard(p: ReturnType<typeof getPlatform> & object) {
-  const s = getPlatformState(p.id);
-  const tasks = listAgents({ platform: p.id });
-  const status = !p.appUrl ? "none" : s.session_status;
-  return {
-    id: p.id,
-    name: p.name,
-    purpose: p.purpose,
-    appUrl: p.appUrl,
-    canChat: !!p.composerSelector,
-    canSync: !!p.tasksUrl,
-    builtin: ["chatgpt", "claude", "grok"].includes(p.id),
-    status, // logged_in | needs_login | error | unknown | none
-    lastSync: s.last_sync_at,
-    lastError: s.last_error,
-    hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)),
-    tasks: tasks.map((a) => ({
-      id: a.id,
-      name: a.name,
-      schedule: a.schedule,
-      status: a.status,
-      native_url: a.native_url,
-      last_run: a.last_run ? { status: a.last_run.status, at: a.last_run.finished_at || a.last_run.started_at || a.last_run.created_at, summary: a.last_run.summary } : null,
-    })),
-  };
-}
+/** Live updates for the workspace (server-sent events). */
+api.get("/stream", streamHandler);
 
 api.get("/connections", (_req, res) => res.json(visiblePlatforms().map(connectionCard)));
 
@@ -338,13 +310,13 @@ api.post("/connections/:id/restore", (req, res) => {
   const p = getPlatform(req.params.id);
   res.json(p ? connectionCard(p) : { ok: true });
 });
-/** Bring the AI's sign-in page up on the browser screen; the UI then embeds that screen. */
+/** Bring the AI's sign-in page up in its tab; the live view then shows that tab for the user to sign in. */
 api.post("/connections/:id/connect", async (req, res) => {
   const p = getPlatform(req.params.id);
   if (!p || !p.appUrl) return bad(res, "this AI has no web address to open", 404);
   if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
-  await browser.withLock(() => browser.consolePage(p.id, p.appUrl));
-  res.json({ ok: true, screen: "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1" });
+  await browser.withLock(() => browser.consolePage(p.id, p.appUrl), { label: `Opening ${p.name}`, platform: p.id });
+  res.json({ ok: true, platform: p.id, screen: "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1" });
 });
 /** After signing in: confirm the session and capture a screenshot. */
 api.post("/connections/:id/check", async (req, res) => {
@@ -354,47 +326,111 @@ api.post("/connections/:id/check", async (req, res) => {
   res.json({ ...connectionCard(getPlatform(p.id)!), status });
 });
 
+/* conversations (threads in the chat panel) */
+api.get("/conversations", (_req, res) => res.json(listConversations()));
+api.post("/conversations", (req, res) => res.json(createConversation(typeof req.body?.title === "string" ? req.body.title : "")));
+api.get("/conversations/:id", (req, res) => {
+  const c = getConversation(num(req.params.id, 0));
+  if (!c) return bad(res, "not found", 404);
+  res.json({ conversation: c, messages: conversationMessages(c.id).map(expandMessage) });
+});
+api.patch("/conversations/:id", (req, res) => {
+  const title = typeof req.body?.title === "string" ? req.body.title.trim() : undefined;
+  const c = updateConversation(num(req.params.id, 0), { title });
+  if (!c) return bad(res, "not found", 404);
+  res.json(c);
+});
+api.delete("/conversations/:id", (req, res) => res.json({ ok: deleteConversation(num(req.params.id, 0)) }));
+
 /* chat */
-api.get("/chat", (req, res) => res.json(listMessages({ limit: num(req.query.limit, 40) }).map(expandMessage).reverse()));
+const titleFrom = (text: string) => {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > 56 ? line.slice(0, 55).replace(/\s+\S*$/, "") + "…" : line;
+};
+api.get("/chat", (req, res) => {
+  const cid = num(req.query.conversation_id, 0);
+  if (cid) return res.json(conversationMessages(cid, num(req.query.limit, 300)).map(expandMessage));
+  res.json(listMessages({ limit: num(req.query.limit, 40) }).map(expandMessage).reverse());
+});
 api.post("/chat", async (req, res) => {
   const text = String(req.body?.text ?? "").trim();
-  if (!text) return bad(res, "Type an instruction first.");
-  if (text.length > 20_000) return bad(res, "That instruction is too long.");
+  if (!text) return bad(res, "Type something first.");
+  if (text.length > 20_000) return bad(res, "That message is too long.");
   const chosen = typeof req.body?.platform === "string" && req.body.platform ? req.body.platform : null;
-  const msg = createMessage(text);
+  if (chosen && !getPlatform(chosen)) return bad(res, "unknown AI", 404);
+  let conversation = req.body?.conversation_id ? getConversation(num(req.body.conversation_id, 0)) : undefined;
+  if (!conversation) conversation = createConversation(titleFrom(text));
+  else if (!conversation.title) conversation = updateConversation(conversation.id, { title: titleFrom(text) })!;
+  const msg = createMessage(text, conversation.id);
+  const track = new StepTracker(msg.id);
   if (chosen) {
-    if (!getPlatform(chosen)) return bad(res, "unknown AI", 404);
     updateMessage(msg.id, { routing: { method: "manual", confidence: 1, reason: "You chose it." } });
+    track.set("route", `Sending to ${getPlatform(chosen)!.name}`, "done", "you chose it");
     // Respond right away; the reply lands in the thread when the AI answers.
-    res.json({ message: expandMessage(getMessage(msg.id)!), routed: chosen });
+    res.json({ message: expandMessage(getMessage(msg.id)!), routed: chosen, conversation: getConversation(conversation.id) });
     void deliverToConnection(msg.id, chosen);
     return;
   }
+  track.set("route", "Choosing the AI", "running");
   const routing = await routeToConnection(text);
   updateMessage(msg.id, {
     suggestions: routing.options,
     routing: { method: routing.method, confidence: routing.top?.confidence ?? 0, reason: routing.reason, llm_error: routing.llm_error },
   });
   if (routing.top && routing.top.confidence >= config.router.autoThreshold) {
-    res.json({ message: expandMessage(getMessage(msg.id)!), routed: routing.top.platform });
+    const how = routing.method === "mention" ? "you named it" : routing.method === "only" ? "the only AI connected" : routing.method === "llm" ? "picked by Claude" : "picked by keywords";
+    track.set("route", `Sending to ${routing.top.name}`, "done", how);
+    res.json({ message: expandMessage(getMessage(msg.id)!), routed: routing.top.platform, conversation: getConversation(conversation.id) });
     void deliverToConnection(msg.id, routing.top.platform);
     return;
   }
-  res.json({ message: expandMessage(getMessage(msg.id)!), routed: null });
+  track.set("route", "Which AI should do this?", "waiting", routing.reason);
+  res.json({ message: expandMessage(getMessage(msg.id)!), routed: null, conversation: getConversation(conversation.id) });
 });
 api.post("/chat/:id/send", async (req, res) => {
   const m = getMessage(num(req.params.id, 0));
   if (!m) return bad(res, "not found", 404);
   const platform = String(req.body?.platform ?? "");
-  if (!getPlatform(platform)) return bad(res, "unknown AI", 404);
+  const p = getPlatform(platform);
+  if (!p) return bad(res, "unknown AI", 404);
+  new StepTracker(m.id).set("route", `Sending to ${p.name}`, "done", "you chose it");
   res.json({ ok: true });
   void deliverToConnection(m.id, platform);
 });
+/** Manual mode: the agent paused before an action and waits for this. */
+api.post("/chat/:id/approve", (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  const decision = req.body?.decision === "reject" || req.body?.decision === "rejected" ? "rejected" : "approved";
+  if (!decide(m.id, decision)) return bad(res, "nothing is waiting for approval on this message", 409);
+  res.json({ ok: true, decision });
+});
+/** Stop a task that is running. If the message was already sent, only the wait is stopped. */
+api.post("/chat/:id/cancel", (req, res) => {
+  const m = getMessage(num(req.params.id, 0));
+  if (!m) return bad(res, "not found", 404);
+  if (!["assigned", "delivered"].includes(m.status)) return bad(res, "nothing is running for this message", 409);
+  requestCancel(m.id);
+  decide(m.id, "rejected");
+  res.json({ ok: true });
+});
 api.delete("/chat/:id", (req, res) => res.json({ ok: deleteMessage(num(req.params.id, 0)) }));
 
+/* execution mode: auto (the agent acts on its own) or manual (it asks before acting) */
+api.get("/settings/approval", (_req, res) => res.json({ approvalMode: approvalMode(), pending: pendingApprovals() }));
+api.put("/settings/approval", (req, res) => {
+  const mode = req.body?.approvalMode === "manual" ? "manual" : req.body?.approvalMode === "auto" ? "auto" : null;
+  if (!mode) return bad(res, "approvalMode must be auto or manual");
+  setApprovalMode(mode);
+  res.json({ approvalMode: mode });
+});
+
 /* one call for the whole app */
-api.get("/home", async (_req, res) => {
+api.get("/home", async (req, res) => {
   const connections = visiblePlatforms().map(connectionCard);
+  const conversations = listConversations();
+  const wanted = num(req.query.conversation_id, 0);
+  const current = (wanted ? getConversation(wanted) : undefined) ?? conversations[0] ?? null;
   const runs = listRuns({ limit: 15 }).map((r) => ({ kind: "run", at: r.finished_at || r.started_at || r.created_at, platform: r.platform, title: r.agent_name, status: r.status, summary: r.summary, link: r.output_url || r.agent_native_url }));
   const events = listEvents({ limit: 15 }).map((e) => ({ kind: e.kind, at: e.occurred_at, platform: e.platform, title: e.title, status: e.kind === "run" ? "failed" : e.kind === "session" ? "needs_attention" : "info", summary: e.body, link: e.link, id: e.id, read: !!e.read }));
   const activity = [...runs, ...events].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 20);
@@ -406,7 +442,10 @@ api.get("/home", async (_req, res) => {
   ];
   res.json({
     connections,
-    chat: listMessages({ limit: 40 }).map(expandMessage).reverse(),
+    conversations,
+    conversation: current,
+    messages: current ? conversationMessages(current.id).map(expandMessage) : [],
+    approvalMode: approvalMode(),
     attention,
     activity,
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
@@ -417,6 +456,7 @@ api.get("/home", async (_req, res) => {
     email: emailStatus(),
     publicUrl: config.publicUrl,
     connectedCount: connectedPlatforms().length,
+    viewers: { stream: streamClients(), live: liveViewers() },
   });
 });
 
@@ -762,7 +802,7 @@ api.post("/browser/open", async (req, res) => {
   if (!p) return bad(res, "unknown platform", 404);
   const url = typeof req.body?.url === "string" && /^https?:\/\//.test(req.body.url) ? req.body.url : p.tasksUrl || p.appUrl;
   if (!url) return bad(res, "no url");
-  await browser.withLock(() => browser.consolePage(p.id, url));
+  await browser.withLock(() => browser.consolePage(p.id, url), { label: `Opening ${p.name}`, platform: p.id });
   res.json({ ok: true, url });
 });
 

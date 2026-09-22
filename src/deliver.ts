@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { addEvent, getAgent, getMessage, getPlatformState, updateMessage, type MessageWithAgent } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatform } from "./platforms.js";
+import { clearCancel, StepTracker } from "./steps.js";
 import type { Agent, AgentDelivery, DeliveryMode } from "./types.js";
 
 const log = logger("deliver");
@@ -44,39 +45,74 @@ export function describeMode(mode: DeliveryMode): string {
 
 /**
  * Send an instruction to a connected AI's chat and wait for its answer.
- * The message row is updated as it goes: assigned → delivered → done (with the reply) or failed.
+ * The message row is updated as it goes: assigned → delivered → done (with the reply), failed, or cancelled.
+ * Every stage is a step on the message, shown live in the thread.
  */
 export async function deliverToConnection(messageId: number, platformId: string): Promise<MessageWithAgent> {
   const msg = getMessage(messageId);
   if (!msg) throw new Error("message not found");
   const p = getPlatform(platformId);
   if (!p) throw new Error(`unknown AI ${platformId}`);
-  updateMessage(msg.id, { platform: p.id, agent_id: null, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null });
-  // Never sit on a two-minute chat attempt against an AI that is not signed in: look first.
-  let status = getPlatformState(p.id).session_status;
-  if (status !== "logged_in") status = await checkConnection(p);
-  if (status !== "logged_in") {
-    const error = status === "needs_login" ? `${p.name} needs you to sign in again. Open Connect.` : `${p.name} is not connected yet. Open Connect and sign in.`;
-    addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
-    return updateMessage(msg.id, { status: "failed", error })!;
-  }
-  const r = await chatWithConnection(p, msg.text);
-  const now = new Date().toISOString();
-  if (!r.ok) {
-    log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
-    addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: `${r.error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
-    return updateMessage(msg.id, { status: "failed", error: r.error ?? "unknown error" })!;
-  }
-  return updateMessage(msg.id, {
-    status: "done",
-    delivered_at: now,
-    acked_at: now,
-    response: r.reply ? (r.partial ? r.reply + "\n\n(reply was still being written when I stopped waiting)" : r.reply) : "Sent. No reply text could be read back; open the AI to see it.",
+  const track = new StepTracker(msg.id);
+  clearCancel(msg.id);
+  // Keep the routing step from the request; everything after it starts fresh (retries included).
+  const route = track.read().find((s) => s.key === "route");
+  updateMessage(msg.id, {
+    platform: p.id,
+    agent_id: null,
+    status: "assigned",
+    delivery_mode: "chat",
     error: null,
-  })!;
+    response: null,
+    delivered_at: null,
+    acked_at: null,
+    steps: route ? [{ ...route, status: "done", ended_at: route.ended_at ?? new Date().toISOString() }] : [],
+  });
+  try {
+    // Never sit on a two-minute chat attempt against an AI that is not signed in: look first.
+    let status = getPlatformState(p.id).session_status;
+    if (status !== "logged_in") {
+      track.start("connect", `Checking ${p.name} is connected`);
+      status = await checkConnection(p);
+      if (status === "logged_in") track.done("connect", "connected");
+      else track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
+    }
+    if (status !== "logged_in") {
+      const error = status === "needs_login" ? `${p.name} needs you to sign in again.` : `${p.name} is not connected yet. Sign in first.`;
+      addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
+      return updateMessage(msg.id, { status: "failed", error })!;
+    }
+    updateMessage(msg.id, { status: "delivered", delivered_at: new Date().toISOString() });
+    const r = await chatWithConnection(p, msg.text, track);
+    const now = new Date().toISOString();
+    if (r.cancelled) {
+      track.failRunning(r.error ?? "stopped");
+      return updateMessage(msg.id, { status: "cancelled", error: r.error ?? "Stopped." })!;
+    }
+    if (!r.ok) {
+      log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
+      track.failRunning(r.error ?? "failed");
+      addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: `${r.error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
+      return updateMessage(msg.id, { status: "failed", error: r.error ?? "unknown error" })!;
+    }
+    track.set("done", "Completed", "done");
+    return updateMessage(msg.id, {
+      status: "done",
+      acked_at: now,
+      response: r.reply ? (r.partial ? r.reply + "\n\n(reply was still being written when I stopped waiting)" : r.reply) : "Sent. No reply text could be read back; open the AI to see it.",
+      error: null,
+    })!;
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    log.error(`delivery of message ${msg.id} crashed`, err);
+    track.failRunning(error);
+    return updateMessage(msg.id, { status: "failed", error })!;
+  } finally {
+    clearCancel(msg.id);
+  }
 }
 
-/** Deliver an assigned message. Updates the row and returns it. Never throws. */
+/** Deliver an assigned message to a registered agent. Updates the row and returns it. Never throws. */
 export async function deliverMessage(messageId: number): Promise<MessageWithAgent> {
   const msg = getMessage(messageId);
   if (!msg) throw new Error("message not found");
@@ -85,16 +121,19 @@ export async function deliverMessage(messageId: number): Promise<MessageWithAgen
   if (!agent) throw new Error("agent not found");
   const mode = resolveMode(agent);
   const now = new Date().toISOString();
+  const track = new StepTracker(msg.id);
 
   try {
     switch (mode) {
       case "inbox":
       case "manual":
+        track.set("deliver", mode === "inbox" ? `Waiting for ${agent.name} to pick it up` : `Copy it into ${agent.name} yourself`, "waiting");
         return updateMessage(msg.id, { status: "assigned", delivery_mode: mode, error: null })!;
 
       case "webhook": {
         const d = parseDelivery(agent);
         if (!d.webhook_url) throw new Error("agent has no webhook_url");
+        track.start("deliver", `Posting to ${agent.name}'s webhook`);
         const res = await fetch(d.webhook_url, {
           method: "POST",
           headers: { "content-type": "application/json", ...(d.webhook_token ? { authorization: `Bearer ${d.webhook_token}` } : {}) },
@@ -108,6 +147,7 @@ export async function deliverMessage(messageId: number): Promise<MessageWithAgen
           signal: AbortSignal.timeout(20_000),
         });
         if (!res.ok) throw new Error(`webhook responded ${res.status}`);
+        track.done("deliver", `HTTP ${res.status}`);
         return updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: now, error: null })!;
       }
 
@@ -117,14 +157,17 @@ export async function deliverMessage(messageId: number): Promise<MessageWithAgen
         const actionName = parseDelivery(agent).action || "send_message";
         if (!p.actions?.[actionName]) throw new Error(`platform ${p.name} has no "${actionName}" action; define one in its settings`);
         if (getPlatformState(p.id).session_status === "needs_login") throw new Error(`${p.name} needs login before messages can be sent`);
-        const r = await runAction(p, actionName, agent, { message: msg.text });
+        track.start("deliver", `Running "${actionName}" on ${p.name}`);
+        const r = await runAction(p, actionName, agent, { message: msg.text }, { messageId: msg.id, track });
         if (!r.ok) throw new Error(r.message);
+        track.done("deliver", r.message);
         return updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: now, error: null })!;
       }
     }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log.warn(`delivery of message ${msg.id} to ${agent.name} via ${mode} failed: ${error}`);
+    track.failRunning(error);
     addEvent({
       platform: agent.platform,
       kind: "message",

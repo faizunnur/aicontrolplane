@@ -1,6 +1,8 @@
+import { approvalMode, requestApproval } from "./approvals.js";
 import { browser } from "./browser/manager.js";
 import { cleanError, screenshotConsoleTab, snapshotOnly, syncPlatform } from "./collect/collector.js";
 import { logger } from "./logger.js";
+import type { StepTracker } from "./steps.js";
 import type { ActionStep, Agent, PlatformConfig } from "./types.js";
 
 const log = logger("actions");
@@ -34,13 +36,19 @@ export function availableActions(p: PlatformConfig) {
   return out;
 }
 
-export async function runAction(p: PlatformConfig, action: string, agent?: Agent, extraVars: Record<string, string> = {}): Promise<ActionResult> {
+export async function runAction(
+  p: PlatformConfig,
+  action: string,
+  agent?: Agent,
+  extraVars: Record<string, string> = {},
+  opts: { messageId?: number; track?: StepTracker } = {},
+): Promise<ActionResult> {
   if (!browser.enabled) return { ok: false, action, message: "browser is disabled" };
 
   if (action === "open") {
     const url = agent?.native_url || p.tasksUrl || p.appUrl;
     if (!url) return { ok: false, action, message: "no URL to open" };
-    await browser.withLock(() => browser.consolePage(p.id, url));
+    await browser.withLock(() => browser.consolePage(p.id, url), { label: `Opening ${p.name}`, platform: p.id });
     return { ok: true, action, message: `console tab is on ${url}. Open the browser screen to interact.`, url };
   }
   if (action === "screenshot") {
@@ -65,24 +73,61 @@ export async function runAction(p: PlatformConfig, action: string, agent?: Agent
   };
   const sub = (s?: string) => (s ?? "").replace(/\{\{(\w+)\}\}/g, (_, k: string) => vars[k] ?? "");
 
-  return browser.withLock(async () => {
-    const page = await browser.consolePage(p.id);
-    let stepNo = 0;
-    try {
-      for (const step of def.steps ?? []) {
-        stepNo++;
-        await runStep(page, step, sub);
-      }
-      // We already hold the browser lock here, so use the unlocked screenshot helper.
-      await screenshotConsoleTab(p).catch(() => null);
-      return { ok: true, action, message: `ran ${stepNo} step(s)`, url: page.url(), screenshot: true };
-    } catch (err) {
-      const msg = cleanError(err);
-      log.warn(`action ${p.id}/${action} failed at step ${stepNo}: ${msg}`);
-      await screenshotConsoleTab(p).catch(() => null);
-      return { ok: false, action, message: `step ${stepNo} failed: ${msg}`, url: page.url(), screenshot: true };
+  // Manual mode: a custom action changes something on the site, so it waits for the user's go-ahead.
+  if (opts.messageId && approvalMode() === "manual") {
+    const label = def.label ?? action;
+    opts.track?.waiting("approve", `Run "${label}" on ${p.name}?`, extraVars.message?.slice(0, 240) ?? null);
+    const decision = await requestApproval(opts.messageId, action, `Run "${label}" on ${p.name}?`, p.id);
+    if (decision !== "approved") {
+      opts.track?.fail("approve", decision === "timeout" ? "no answer in 15 minutes" : "rejected");
+      return { ok: false, action, message: decision === "timeout" ? "not approved within 15 minutes" : "you rejected it" };
     }
-  });
+    opts.track?.done("approve", "approved by you");
+  }
+
+  return browser.withLock(
+    async () => {
+      const page = await browser.consolePage(p.id);
+      let stepNo = 0;
+      try {
+        for (const step of def.steps ?? []) {
+          stepNo++;
+          opts.track?.start(`step-${stepNo}`, describeStep(step, sub));
+          await runStep(page, step, sub);
+          opts.track?.done(`step-${stepNo}`);
+        }
+        // We already hold the browser lock here, so use the unlocked screenshot helper.
+        await screenshotConsoleTab(p).catch(() => null);
+        return { ok: true, action, message: `ran ${stepNo} step(s)`, url: page.url(), screenshot: true };
+      } catch (err) {
+        const msg = cleanError(err);
+        log.warn(`action ${p.id}/${action} failed at step ${stepNo}: ${msg}`);
+        opts.track?.fail(`step-${stepNo}`, msg);
+        await screenshotConsoleTab(p).catch(() => null);
+        return { ok: false, action, message: `step ${stepNo} failed: ${msg}`, url: page.url(), screenshot: true };
+      }
+    },
+    { label: `Running "${def.label ?? action}" on ${p.name}`, platform: p.id, messageId: opts.messageId ?? null },
+  );
+}
+
+function describeStep(step: ActionStep, sub: (s?: string) => string): string {
+  switch (step.type) {
+    case "goto":
+      return `Opening ${sub(step.url)}`;
+    case "click":
+      return `Clicking ${step.selector}`;
+    case "fill":
+      return `Filling in ${step.selector}`;
+    case "press":
+      return `Pressing ${step.key ?? "Enter"}`;
+    case "wait":
+      return `Waiting ${Math.round((step.ms ?? 1000) / 1000)}s`;
+    case "waitFor":
+      return `Waiting for ${step.selector}`;
+    default:
+      return step.type;
+  }
 }
 
 async function runStep(page: import("playwright").Page, step: ActionStep, sub: (s?: string) => string) {
