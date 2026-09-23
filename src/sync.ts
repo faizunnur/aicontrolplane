@@ -2,7 +2,7 @@ import { ensureSystemAgent, ensureTaskAgent } from "./agents.js";
 import { sendAlert } from "./alerts.js";
 import { browser, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
-import { addEvent, findTask, finishSyncLog, getPlatformState, recordRun, setPlatformState, startSyncLog, upsertTask } from "./db.js";
+import { addEvent, findTask, finishSyncLog, getPlatformState, getSetting, recordRun, setPlatformState, startSyncLog, upsertTask } from "./db.js";
 import { logger } from "./logger.js";
 import { syncablePlatforms } from "./platforms.js";
 import { getProvider } from "./providers/registry.js";
@@ -151,7 +151,8 @@ export async function syncProvider(adapter: ProviderAdapter, ctx: ExecutionConte
   finishSyncLog(logId, { ok: result.ok, message: result.message, agents: result.agents, runs: result.runs, captures: result.captures });
 
   if (result.sessionStatus === "needs_login" && before.session_status !== "needs_login") {
-    addEvent({ platform: p.id, kind: "session", title: `${p.name}: login required`, body: `The browser session for ${p.name} is no longer authenticated. Sign in again from the sidebar.`, dedupe_key: `session:${p.id}:${ts.slice(0, 10)}` });
+    const how = getSetting(`signin_mode:${p.id}`) === "local" ? `Open its menu in the sidebar and choose "Connect from this computer".` : "Sign in again from the sidebar.";
+    addEvent({ platform: p.id, kind: "session", title: `${p.name}: login required`, body: `The browser session for ${p.name} is no longer authenticated. ${how}`, dedupe_key: `session:${p.id}:${ts.slice(0, 10)}` });
     void sendAlert({ key: `session:${p.id}`, title: `${p.name} needs login`, body: "Open the control plane and sign in again." });
   }
   if (!result.ok && result.sessionStatus === "error" && before.session_status !== "error") {

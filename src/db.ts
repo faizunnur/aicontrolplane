@@ -312,6 +312,26 @@ const MIGRATIONS: { id: number; name: string; up: () => void }[] = [
       )`);
     },
   },
+  {
+    id: 6,
+    name: "pairing codes for sign-in from your computer",
+    up: () => {
+      db.exec(`CREATE TABLE IF NOT EXISTS pairings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        code_hash TEXT NOT NULL UNIQUE,
+        token_hash TEXT UNIQUE,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        detail TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        paired_at TEXT,
+        finished_at TEXT,
+        ip TEXT
+      )`);
+      db.exec("CREATE INDEX IF NOT EXISTS pairings_platform ON pairings(platform, id DESC)");
+    },
+  },
 ];
 
 function migrate() {
@@ -1068,6 +1088,60 @@ export function purgeExpiredSessions(): number {
 }
 export function countSessions(): number {
   return (db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?").get(now()) as { n: number }).n;
+}
+
+/* ---------- pairings (a sign-in done on the user's own computer, handed to the cloud browser) ---------- */
+
+export type PairingStatus = "waiting" | "paired" | "importing" | "done" | "failed" | "expired" | "cancelled" | "replaced";
+export interface PairingRow {
+  id: number;
+  platform: string;
+  code_hash: string;
+  token_hash: string | null;
+  status: PairingStatus;
+  detail: string | null;
+  created_at: string;
+  /** While waiting: when the code dies. Once paired: when the token dies. */
+  expires_at: string;
+  paired_at: string | null;
+  finished_at: string | null;
+  ip: string | null;
+}
+
+export function insertPairing(input: { platform: string; code_hash: string; expires_at: string }): PairingRow {
+  const res = db.prepare("INSERT INTO pairings (platform, code_hash, status, created_at, expires_at) VALUES (?, ?, 'waiting', ?, ?)").run(input.platform, input.code_hash, now(), input.expires_at);
+  return getPairing(Number(res.lastInsertRowid))!;
+}
+export function getPairing(id: number): PairingRow | undefined {
+  return db.prepare("SELECT * FROM pairings WHERE id = ?").get(id) as PairingRow | undefined;
+}
+export function findPairingByCodeHash(hash: string): PairingRow | undefined {
+  return db.prepare("SELECT * FROM pairings WHERE code_hash = ? AND status = 'waiting' AND expires_at > ?").get(hash, now()) as PairingRow | undefined;
+}
+export function findPairingByTokenHash(hash: string): PairingRow | undefined {
+  return db.prepare("SELECT * FROM pairings WHERE token_hash = ? AND status IN ('paired', 'importing') AND expires_at > ?").get(hash, now()) as PairingRow | undefined;
+}
+export function updatePairing(id: number, patch: Partial<Pick<PairingRow, "status" | "detail" | "token_hash" | "expires_at" | "paired_at" | "finished_at" | "ip">>): PairingRow | undefined {
+  const cols: string[] = [];
+  const vals: unknown[] = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    cols.push(`${k} = ?`);
+    vals.push(v);
+  }
+  if (cols.length) db.prepare(`UPDATE pairings SET ${cols.join(", ")} WHERE id = ?`).run(...vals, id);
+  return getPairing(id);
+}
+export function latestPairing(platform: string): PairingRow | undefined {
+  return db.prepare("SELECT * FROM pairings WHERE platform = ? ORDER BY id DESC LIMIT 1").get(platform) as PairingRow | undefined;
+}
+/** Codes and tokens die on their own; nothing lingers as "waiting" past its time. */
+export function expirePairings(): number {
+  return db.prepare("UPDATE pairings SET status = 'expired', token_hash = NULL, finished_at = ? WHERE status IN ('waiting', 'paired', 'importing') AND expires_at <= ?").run(now(), now()).changes;
+}
+/** A new code for a provider retires any earlier one still waiting. */
+export function replaceWaitingPairings(platform: string, exceptId: number): number {
+  return db.prepare("UPDATE pairings SET status = 'replaced', finished_at = ? WHERE platform = ? AND status = 'waiting' AND id <> ?").run(now(), platform, exceptId).changes;
 }
 
 /* ---------- overview ---------- */

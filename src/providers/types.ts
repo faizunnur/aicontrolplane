@@ -52,8 +52,11 @@ export interface ConnectResult {
  * live     sign in inside the live view, in the automated browser (works for most sites)
  * desktop  sign in in a plain browser window on the cloud desktop, automation stepped aside
  *          (for sites whose sign-in page is guarded by a bot check)
+ * local    sign in on your own computer; a helper hands the session to the cloud browser
+ *          (for sites whose check refuses any browser in a datacenter)
  */
-export type SignInMode = "live" | "desktop";
+export type SignInMode = "live" | "desktop" | "local";
+export const SIGN_IN_MODES: readonly SignInMode[] = ["live", "desktop", "local"];
 
 /** What an execution carries with it so the adapter can report progress and honour approvals. */
 export interface ExecutionContext {

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { getTask, getPlatformState, listTasks, type MessageWithTask } from "./db.js";
 import { describeMode, resolveMode } from "./deliver.js";
+import { activePairing } from "./pairing.js";
 import { getProvider } from "./providers/registry.js";
 import type { PlatformConfig } from "./types.js";
 
@@ -45,6 +46,8 @@ export function connectionCard(p: PlatformConfig) {
     canChat: adapter ? adapter.supports("chat") : !!p.composerSelector,
     canSync: adapter ? adapter.supports("listTasks") : !!p.tasksUrl,
     signInMode: adapter?.preferredSignIn() ?? "live",
+    /** A sign-in from the user's computer in progress (or just finished), if any. */
+    pairing: p.appUrl ? activePairing(p.id) : null,
     builtin: adapter?.builtin ?? false,
     status, // logged_in | needs_login | error | unknown | none
     lastSync: s.last_sync_at,

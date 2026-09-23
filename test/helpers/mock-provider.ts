@@ -33,6 +33,7 @@ ${signedIn ? "" : '<a id="login" href="/login">Log in</a>'}
 <textarea id="box" placeholder="Ask me anything"></textarea>
 <button id="send">Send</button> <span id="stop" class="busy">thinking…</span>
 <script>
+try{localStorage.setItem('mock_seen','1')}catch(e){}
 const log=document.getElementById('log'),box=document.getElementById('box'),stop=document.getElementById('stop');
 function add(cls,t){const d=document.createElement('div');d.className='msg '+cls;d.textContent=t;log.appendChild(d);return d}
 document.getElementById('send').onclick=()=>{const t=box.value.trim();if(!t)return;box.value='';add('user',t);stop.style.display='inline';
@@ -47,23 +48,37 @@ export interface MockProvider {
   setSignedIn(v: boolean): void;
   /** Put a failed bot check on the sign-in page. */
   setChallenge(v: boolean): void;
+  /** Decide sign-in by cookie instead: signed in only when the request carries mock_session=ok. */
+  setCookieGate(v: boolean): void;
+  /** The sign-in page signs itself in after a moment (a stand-in for a person in a real browser window). */
+  setAutoLogin(v: boolean): void;
   close(): Promise<void>;
 }
 
 export function startMockProvider(): Promise<MockProvider> {
   let signedIn = true;
   let challenge = false;
+  let cookieGate = false;
+  let autoLogin = false;
   const server = http.createServer((req, res) => {
+    const hasSession = /(^|;\s*)mock_session=ok(;|$)/.test(String(req.headers.cookie ?? ""));
+    const authed = cookieGate ? hasSession : signedIn;
     if (req.url?.startsWith("/login")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      return res.end(challenge ? challengePage : "<h1>Please log in</h1>");
+      // In auto mode the page "signs in" by itself after a moment, standing in for a person at the keyboard.
+      return res.end(challenge ? challengePage : `<h1>Please log in</h1><a id="do-login" href="/do-login">Log in as tester</a>${autoLogin ? '<script>setTimeout(function(){location.href="/do-login"},1500)</script>' : ""}`);
     }
-    if (!signedIn) {
+    // The sign-in itself, for the cookie-gated mode: sets the session cookie and goes home.
+    if (req.url?.startsWith("/do-login")) {
+      res.writeHead(302, { "set-cookie": "mock_session=ok; Path=/", location: "/" });
+      return res.end();
+    }
+    if (!authed) {
       res.writeHead(302, { location: "/login" });
       return res.end();
     }
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(page(signedIn));
+    res.end(page(true));
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
@@ -72,6 +87,8 @@ export function startMockProvider(): Promise<MockProvider> {
         url: `http://127.0.0.1:${port}/`,
         setSignedIn: (v) => (signedIn = v),
         setChallenge: (v) => (challenge = v),
+        setCookieGate: (v) => (cookieGate = v),
+        setAutoLogin: (v) => (autoLogin = v),
         // Drop keep-alive connections too, or a lingering browser tab keeps the test process alive.
         close: () =>
           new Promise((r) => {

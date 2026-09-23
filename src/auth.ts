@@ -90,7 +90,8 @@ export function parseCookies(header: string | undefined): Record<string, string>
   return out;
 }
 
-function bearer(req: IncomingMessage): string | undefined {
+/** The Authorization: Bearer value, if any. Never read from the query string. */
+export function bearer(req: IncomingMessage): string | undefined {
   const h = req.headers["authorization"];
   if (typeof h !== "string") return undefined;
   const m = /^Bearer\s+(.+)$/i.exec(h.trim());

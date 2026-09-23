@@ -175,7 +175,7 @@
         <iframe id="desktop-frame" class="desktop-frame" title="Cloud desktop" allow="clipboard-read; clipboard-write" hidden></iframe>
         <div class="viewport-msg" id="viewport-msg"><strong>Nothing open yet</strong><span>Send a message or sign in to an AI and the browser shows up here.</span></div>
         <div class="ribbon top busy" id="busy-ribbon" hidden><span class="dot run"></span><span class="txt" id="busy-text"></span><button class="btn xs" id="btn-control">Take control</button></div>
-        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt" id="signin-text">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs ghost" id="btn-signin-desktop" hidden title="Sites with a bot check refuse the automated browser; this opens a plain browser window on the cloud desktop instead">Use the cloud desktop</button><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn xs ghost" id="btn-signin-dismiss" title="Close the sign-in window and give the browser back to the agents">Cancel</button></div>
+        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt" id="signin-text">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs ghost" id="btn-signin-desktop" hidden title="Sites with a bot check refuse the automated browser; this opens a plain browser window on the cloud desktop instead">Use the cloud desktop</button><button class="btn xs ghost" id="btn-signin-local" hidden title="Sites that refuse any browser in a datacenter: sign in on your own computer and hand the session over">Connect from this computer</button><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn xs ghost" id="btn-signin-dismiss" title="Close the sign-in window and give the browser back to the agents">Cancel</button></div>
       </div>
       <div class="statusbar">
         <span class="dot" id="live-dot"></span>
@@ -200,6 +200,20 @@
       <input id="add-purpose" placeholder="one line, helps route your messages" maxlength="300" />
       <div class="row end"><button class="btn ghost" type="button" data-close>Cancel</button><button class="btn primary" type="submit">Add provider</button></div>
     </form>
+  </div>
+
+  <!-- Sign in from this computer -->
+  <div id="pairing-modal" class="overlay" hidden>
+    <div class="panel modal" style="max-width:580px">
+      <div class="panel-head"><h2 id="pairing-title">Connect from this computer</h2><button class="btn icon ghost" type="button" data-pairing-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button></div>
+      <p class="muted small" style="margin-bottom:12px">Some sign-in pages refuse any browser that runs in a datacenter, automated or not. Sign in on this computer instead: run the command below in a terminal in the project folder (Node 20 or newer). Your own Chrome opens a plain window, you sign in exactly as you always do, and only that sign-in is handed to the cloud browser. Nothing else leaves this computer.</p>
+      <label>Run this on your computer</label>
+      <pre id="pairing-command" class="pairing-command"></pre>
+      <div class="row" style="margin-top:8px"><button class="btn small" id="btn-pairing-copy">Copy command</button><span class="muted small">Code <code id="pairing-code" class="token"></code> <span id="pairing-expires"></span></span></div>
+      <p class="form-error" id="pairing-warning" hidden style="margin-top:10px">This deployment is not served over HTTPS. The helper refuses to send a sign-in over plain HTTP anywhere except localhost.</p>
+      <div class="notice" id="pairing-status" style="margin-top:14px"><span class="dot run" id="pairing-dot"></span><div class="body" id="pairing-status-text">Waiting for your computer…</div></div>
+      <div class="row end"><button class="btn ghost" type="button" id="btn-pairing-cancel">Cancel</button><button class="btn" type="button" id="btn-pairing-new" hidden>New code</button><button class="btn primary" type="button" id="btn-pairing-done" hidden>Done</button></div>
+    </div>
   </div>
 
   <!-- Settings -->

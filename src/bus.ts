@@ -14,6 +14,8 @@ import { EventEmitter } from "node:events";
  *   conversation     { action: "created" | "updated" | "deleted", conversation }
  *   browser          the browser snapshot (active tab, busy task, open pages)
  *   settings         { approvalMode }
+ *   pairing          a sign-in from the user's computer changed state (PairingView)
+ *   log              a log line (LogLine), for the Logs view
  */
 export const bus = new EventEmitter();
 bus.setMaxListeners(64);

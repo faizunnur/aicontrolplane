@@ -58,25 +58,41 @@ execution header: which agent, on which provider, which task, the current action
 Stop button. When nothing is running you can click, type and scroll in the tab yourself; signing in to a
 provider happens right here.
 
-## Signing in, including sites with a bot check
+## Signing in: live view, cloud desktop, or from your computer
 
-Most providers let you sign in inside the live view. Some guard their sign-in page with a bot check
-(Grok's accounts.x.ai uses Cloudflare Turnstile) that refuses a browser with a debugging session attached,
-which is exactly what a live view needs. For those the app has a second mode, and it switches to it on its own
-when it sees the check fail:
+Most providers let you sign in inside the live view. Some guard their sign-in page with a bot check that scores
+the browser and the machine it runs on. The app has three ways in, and picks the right one on its own when it
+sees a check fail:
 
 - **Live view** (default): the provider's site opens in its automated tab and you sign in through the stream.
 - **Cloud desktop**: the automation closes its browser, opens the same profile in a plain Google Chrome window on
   the cloud display, with no debugging session and no automation flags, and shows you that window. You sign in
   as you would at home, press "I'm signed in", the window closes, and the automation takes the profile back with
-  your session in it. Grok starts in this mode; any provider that needed it once uses it next time.
+  your session in it. This is enough for checks that object to automation.
+- **From your computer**: for checks that refuse any browser in a datacenter (Grok's accounts.x.ai does, even to
+  a plain window). Open the provider's menu, choose "Connect from this computer", and run the one-line command
+  it shows in a terminal in this project's folder on your own computer (Node 20 or newer):
 
-Nothing here pretends to be a different browser or solves a check for you; it removes the automation from the
-moment you type your password. A datacenter address can still be judged harshly by a strict check. If a
-provider refuses even the plain window, the last resort remains importing a session from your own computer
-(Settings › Saved sign-ins, or `npm run login` and `npm run push-state`).
+  ```
+  npm run connect -- https://your-app.up.railway.app ABCD-EFGH
+  ```
 
-The Docker image installs Google Chrome and uses it for both modes, so sites see an ordinary browser and the
+  Your own Google Chrome opens a plain window on the sign-in page, with nothing attached to it. You sign in as
+  you always do. When the site shows you signed in, the helper reads that one provider's cookies and localStorage,
+  sends them to your deployment over HTTPS, and the cloud browser is signed in. The panel in the app follows every
+  step and ends with "connected". Grok starts in this mode; any provider that needed it once uses it next time,
+  and a sign-out notification for such a provider says so.
+
+  The code is good for ten minutes and works once. It buys a token that can do exactly one thing, hand that one
+  provider's session over, for twenty minutes, once. Both are stored hashed; every step is in the audit log.
+  The helper never writes your session to disk; Chrome's own profile for these sign-ins lives under
+  `~/.aicontrolplane/connect-profile` and can be deleted at any time.
+
+Nothing here pretends to be a different browser or solves a check for you. The desktop mode removes the automation
+from the moment you type your password; the connect mode removes the datacenter too. The old manual path
+(`npm run login`, then `npm run push-state`, or Settings › Saved sign-ins › Restore) still works as a fallback.
+
+The Docker image installs Google Chrome and uses it for the cloud modes, so sites see an ordinary browser and the
 profile never changes hands between two browser versions.
 
 A desktop sign-in belongs to the server, not to the page that started it. If you close or reload the tab while
@@ -126,7 +142,8 @@ hides or disables the control. Provider-specific selectors and rules live in `sr
 3. Do not set `DATA_DIR` on Railway; the image already uses `/data`.
 4. Give the service at least 2 GB of memory (it runs Chromium) and generate a domain.
 5. Open the domain. Create your password. Open the menu next to a provider on the left, press Sign in, and
-   sign in inside the browser panel. That's it.
+   sign in inside the browser panel. For Grok, the menu offers "Connect from this computer" instead: its sign-in
+   page refuses browsers in a datacenter, so you sign in on your own machine and the session is handed over.
 
 Optional variables, all set in the Railway service:
 
@@ -220,5 +237,8 @@ shell script, a Claude Code routine prompt block and an MCP server for Cowork.
 - The ingest token lets your agents register, report, ask and read their inbox. Treat it like a password; rotate it
   under Settings › Developer if it leaks. It cannot read chats, cookies or settings.
 - Exporting your saved sign-ins (Settings › Saved sign-ins) is written to the audit log. Treat that file like a password.
+- "Connect from this computer" uses a single-use pairing code (ten minutes) and a token scoped to one provider's
+  session import (twenty minutes, once). Guessing codes is rate limited; the helper refuses plain HTTP except to
+  localhost; the token cannot read or change anything else.
 - These are consumer accounts driven from one extra browser. The app talks to each AI the way you would, at a
   human pace, and never claims an API a provider does not document.

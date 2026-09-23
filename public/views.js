@@ -39,9 +39,10 @@
       ${r.output_url ? `<a class="btn xs ghost" href="${esc(r.output_url)}" target="_blank" rel="noopener" title="Open the result">${icon("popout", "sm")}</a>` : ""}
     </div>`;
 
-  const attentionRow = (x) => {
+  const attentionRow = (x, ctx) => {
+    const local = x.action === "connect" && ctx?.conn?.(x.platform)?.signInMode === "local";
     const act = x.action === "decide" ? `<button class="btn small" data-approve-id="${x.id}" data-decision="reject">Reject</button><button class="btn small primary" data-approve-id="${x.id}" data-decision="approve">${icon("check", "sm")} Approve</button>`
-      : x.action === "connect" ? `<button class="btn small primary" data-connect="${esc(x.platform)}">Sign in</button>`
+      : x.action === "connect" ? `<button class="btn small primary" data-connect="${esc(x.platform)}">${local ? "Connect from this computer" : "Sign in"}</button>`
       : x.action === "open_chat" ? `<button class="btn small" data-nav="chat">Open command</button>`
       : x.action === "dismiss" ? `<button class="btn small ghost" data-read="${x.id}">Dismiss</button>` : "";
     return `<div class="notice ${x.kind === "approval" ? "warn" : x.kind === "session" ? "warn" : "bad"}"><div class="body"><strong>${esc(x.title)}</strong>${x.body ? `<div class="sub">${esc(String(x.body).slice(0, 200))}</div>` : ""}</div>${x.link ? `<a class="btn small" target="_blank" rel="noopener" href="${esc(x.link)}">Open</a>` : ""}${act}</div>`;
@@ -63,7 +64,7 @@
           ${tile(c.scheduled, "scheduled", "", "tasks")}
         </div>
         <section class="vsec"><h3>Currently running</h3>${o.running.length ? `<div class="list">${o.running.map((r) => runRow(r)).join("")}</div>` : empty("Nothing is running", "Runs appear here the moment an agent starts working.")}</section>
-        <section class="vsec"><h3>Requires attention</h3>${o.attention.length ? `<div class="attention">${o.attention.map(attentionRow).join("")}</div>` : empty("All quiet", "Nothing needs you right now.")}</section>
+        <section class="vsec"><h3>Requires attention</h3>${o.attention.length ? `<div class="attention">${o.attention.map((x) => attentionRow(x, ctx)).join("")}</div>` : empty("All quiet", "Nothing needs you right now.")}</section>
         ${o.upcoming.length ? `<section class="vsec"><h3>Coming up</h3><div class="list">${o.upcoming.map((t) => `<div class="lrow" data-open-task="${t.id}"><span class="dot"></span><div class="body"><div class="title">${esc(t.name)} <span class="muted">· ${esc(t.provider_name)}</span></div><div class="sub">next ${esc(when(t.next_run))}${t.schedule ? ` · ${esc(t.schedule)}` : ""}</div></div></div>`).join("")}</div></section>` : ""}
         <section class="vsec"><h3>Recent</h3>${o.recent.length ? `<div class="list">${o.recent.map((r) => runRow(r)).join("")}</div>` : empty("No runs yet", "Once your agents do something, it shows up here.")}</section>
         <p class="muted small vfoot">Providers: ${o.providers.map((p) => `${esc(p.name)} ${p.status === "logged_in" ? "connected" : p.status === "needs_login" ? "signed out" : p.kind === "custom" ? "via API" : "not connected"}`).join(" · ")}</p>`;

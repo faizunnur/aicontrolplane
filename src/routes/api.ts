@@ -45,6 +45,7 @@ import {
   markEventRead,
   openMessageCount,
   overviewCounts,
+  type PairingRow,
   recentStatusesByTask,
   recentSyncLogs,
   recordRun,
@@ -65,6 +66,8 @@ import { handleControl } from "../answers.js";
 import { classifyIntent } from "../intents.js";
 import { logLevel, logScopes, recentLogs, setLogLevel, type Level } from "../logger.js";
 import { activity, overview } from "../overview.js";
+import { activePairing, cancelPairing, createPairing, exchangePairing, finishPairing, markImporting, requirePairingFor } from "../pairing.js";
+import { selectProviderState, sessionDomains } from "../providers/browser/domains.js";
 import { beginRun, endRun, requestCancel, runForMessage, RunTracker } from "../runs.js";
 import { listTaskViews, startTask, taskView } from "../tasks.js";
 import { connectionCard, expandMessage } from "../view.js";
@@ -155,6 +158,61 @@ api.delete("/session", (req, res) => {
 });
 api.get("/session", requireAdmin, (_req, res) => {
   res.json({ ok: true, admin: true, publicUrl: config.publicUrl });
+});
+
+/* ---------- signing in from your own computer ----------
+   Some sign-in pages refuse any browser in a datacenter. The app hands out a short code; the helper on
+   the user's computer trades it for a token good for one thing only: handing that one provider's
+   session to the cloud browser. Neither route is admin: the helper has no password and no cookie. */
+
+const pairingLimit = rateLimit({ name: "pairing", max: 10, windowMs: 10 * 60_000 });
+api.post("/pairing/exchange", pairingLimit, (req, res) => {
+  if (!browser.enabled) return bad(res, "the browser is disabled on this deployment, so there is nowhere to put a sign-in", 409);
+  const code = typeof req.body?.code === "string" ? req.body.code : "";
+  const found = code ? exchangePairing(code, clientIp(req)) : null;
+  // One answer for unknown, expired and used codes alike: nothing to enumerate.
+  if (!found) return bad(res, "That code is not valid or has expired. Make a new one in the app.", 404);
+  const p = getPlatform(found.row.platform);
+  if (!p) return bad(res, "That provider no longer exists.", 404);
+  res.json({
+    ok: true,
+    token: found.token,
+    expiresAt: found.row.expires_at,
+    platform: { id: p.id, name: p.name, appUrl: p.appUrl, sessionCookie: p.sessionCookie, domains: sessionDomains(p), loginUrlPatterns: p.loginUrlPatterns },
+    importPath: `/api/connections/${p.id}/import-session`,
+  });
+});
+/** The helper hands over the session it captured; the server filters it again, imports it, and checks. */
+api.post("/connections/:id/import-session", requirePairingFor, async (req, res, next) => {
+  const pairing = res.locals.pairing as PairingRow | undefined;
+  try {
+    const a = requireProvider(String(req.params.id));
+    if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
+    const p = a.config();
+    const domains = sessionDomains(p);
+    const picked = selectProviderState({ cookies: req.body?.cookies, origins: req.body?.origins }, domains);
+    if (!picked.cookies.length) return bad(res, `no usable cookies for ${domains.join(", ")} were sent`);
+    if (pairing) markImporting(pairing.id);
+    const imported = await browser.importProviderState(p, domains, picked);
+    const status = await a.checkAuth();
+    const h = req.body?.helper && typeof req.body.helper === "object" ? (req.body.helper as { version?: unknown; os?: unknown }) : null;
+    const via = h ? ` via helper ${String(h.version ?? "?")} on ${String(h.os ?? "?")}` : "";
+    if (status === "logged_in") {
+      setSetting(`signin_mode:${a.id}`, "local");
+      addAudit({ actor: clientIp(req), action: "signin.imported_from_computer", target: a.id, detail: `${imported.cookies} cookies, ${imported.origins} origin(s), ${imported.cleared} replaced${via}` });
+      if (pairing) finishPairing(pairing.id, "done", `${p.name} connected`);
+    } else {
+      addAudit({ actor: clientIp(req), action: "signin.import_failed", target: a.id, detail: `${p.name} still looks signed out after importing ${imported.cookies} cookies${via}` });
+      if (pairing) finishPairing(pairing.id, "failed", `${p.name} still looks signed out after importing ${imported.cookies} cookies. Make sure you can see your chats in the Chrome window, then make a new code and try again.`);
+    }
+    res.json({ ok: status === "logged_in", status, name: p.name, imported, dropped: picked.dropped, mode: "local" });
+  } catch (err) {
+    // A refusal because the browser is held (a desktop sign-in) keeps the token: the helper retries.
+    // Anything else ends the pairing with the reason, so the panel says what happened.
+    const status = err && typeof err === "object" ? (err as { status?: number }).status : undefined;
+    if (pairing && status !== 409) finishPairing(pairing.id, "failed", err instanceof Error ? err.message : String(err));
+    next(err);
+  }
 });
 
 /* ---------- ingest (push from agents) ---------- */
@@ -445,6 +503,7 @@ const connectionPatch = z
     loginUrlPatterns: z.array(z.string().max(300)).max(30),
     sessionCookie: z.string().max(120),
     cookieDomain: z.string().max(120),
+    sessionDomains: z.array(z.string().max(120)).max(20),
     capturePatterns: z.array(z.string().max(300)).max(30),
     hidden: z.boolean(),
   })
@@ -499,7 +558,28 @@ async function vncAvailable(): Promise<boolean> {
   vncProbe = { at: Date.now(), ok };
   return ok;
 }
-const signInOptions = async (a: ReturnType<typeof requireProvider>) => ({ preferred: a.preferredSignIn(), desktop: browser.canDesktopSignIn(), vnc: { available: await vncAvailable(), url: VNC_PATH } });
+const signInOptions = async (a: ReturnType<typeof requireProvider>) => ({ preferred: a.preferredSignIn(), desktop: browser.canDesktopSignIn(), local: { ok: browser.enabled }, vnc: { available: await vncAvailable(), url: VNC_PATH } });
+
+/* local: the user signs in on their own computer and a helper hands the session to the cloud browser. */
+api.post("/connections/:id/pairing", (req, res, next) => {
+  try {
+    const a = requireProvider(req.params.id);
+    if (!a.supports("signIn")) throw a.unsupported("signIn");
+    if (!browser.enabled) return bad(res, "the browser is disabled on this deployment, so there is nowhere to put a sign-in", 409);
+    if (browser.signIn) return bad(res, `a sign-in to ${browser.signIn.platform} is open on the cloud desktop; finish or cancel it first`, 409);
+    const { row, code } = createPairing(a.id);
+    const base = (config.publicUrl || `${req.protocol}://${req.headers.host}`).replace(/\/$/, "");
+    const secure = /^https:/i.test(base) || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/i.test(base);
+    res.json({ ok: true, id: row.id, platform: a.id, name: a.name, code, expiresAt: row.expires_at, publicUrl: base, secure, command: `npm run connect -- ${base} ${code}`, pairing: activePairing(a.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+api.get("/connections/:id/pairing", (req, res) => res.json(activePairing(req.params.id)));
+api.delete("/connections/:id/pairing", (req, res) => {
+  const ok = cancelPairing(req.params.id);
+  res.json({ ok, pairing: activePairing(req.params.id) });
+});
 
 /** Bring the AI's sign-in page up in its tab; the live view then shows that tab for the user to sign in. */
 api.post("/connections/:id/connect", async (req, res, next) => {
@@ -1033,6 +1113,7 @@ const platformPatch = z
     loginUrlPatterns: z.array(z.string().max(300)).max(30),
     sessionCookie: z.string().max(120),
     cookieDomain: z.string().max(120),
+    sessionDomains: z.array(z.string().max(120)).max(20),
     loggedInSelector: z.string().max(300),
     loggedOutSelector: z.string().max(300),
     nativeUrlTemplate: z.string().max(2000),

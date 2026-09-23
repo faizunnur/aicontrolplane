@@ -266,6 +266,8 @@ export interface PlatformConfig {
   sessionCookie: string;
   /** Domain the session cookie lives on. */
   cookieDomain: string;
+  /** Other domains the sign-in touches (an accounts host on another domain); their cookies belong to the session too. */
+  sessionDomains: string[];
   /** Optional CSS/text selector that only exists when logged in. */
   loggedInSelector: string;
   /** Optional selector of a visible "Log in" / "Sign up" control that only exists when logged out. */

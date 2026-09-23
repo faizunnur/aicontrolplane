@@ -6,6 +6,7 @@ import { checkSignIn, sendThroughBrowser } from "./browser/chat.js";
 import { detectChallenge } from "./browser/login.js";
 import { collectTasks } from "./browser/tasks.js";
 import {
+  SIGN_IN_MODES,
   UnsupportedOperationError,
   type ActionResult,
   type CapabilityNotes,
@@ -134,7 +135,7 @@ export class BrowserProviderAdapter implements ProviderAdapter {
   /** What worked last time wins; otherwise what the provider is known to need; otherwise the live view. */
   preferredSignIn(): SignInMode {
     const remembered = getSetting(`signin_mode:${this.id}`);
-    if (remembered === "desktop" || remembered === "live") return remembered;
+    if (remembered && (SIGN_IN_MODES as readonly string[]).includes(remembered)) return remembered as SignInMode;
     return this.defaultSignIn();
   }
   protected defaultSignIn(): SignInMode {

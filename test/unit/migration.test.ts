@@ -38,7 +38,7 @@ describe("migration from the first-release schema", () => {
     old.close();
 
     const db = await import("../../src/db.js");
-    assert.deepEqual(db.schemaVersion().map((m) => m.id), [1, 2, 3, 4, 5]);
+    assert.deepEqual(db.schemaVersion().map((m) => m.id), [1, 2, 3, 4, 5, 6]);
     const tasks = db.listTasks({ includeDisabled: true });
     assert.deepEqual(tasks.map((t) => [t.platform, t.key, t.name]), [["chatgpt", "t1", "Daily briefing"], ["custom", "audit", "Nightly audit"]]);
     const runs = db.listRuns({ limit: 10 });
@@ -62,6 +62,6 @@ describe("migration from the first-release schema", () => {
     const again = db.recordRun({ task_id: 1, external_id: "r1", status: "success", source: "collector" });
     assert.equal(again.created, false);
     // Running the migrations again is a no-op.
-    assert.deepEqual(db.schemaVersion().map((x) => x.id), [1, 2, 3, 4, 5]);
+    assert.deepEqual(db.schemaVersion().map((x) => x.id), [1, 2, 3, 4, 5, 6]);
   });
 });

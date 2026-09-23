@@ -68,10 +68,14 @@ describe("provider registry", () => {
 
   it("providers declare the sign-in mode they need, and a remembered mode wins", async () => {
     const { setSetting } = await import("../../src/db.js");
-    assert.equal(getProvider("grok")!.preferredSignIn(), "desktop", "Grok's sign-in page sits behind a bot check");
+    assert.equal(getProvider("grok")!.preferredSignIn(), "local", "Grok's sign-in page refuses any browser in a datacenter: sign in from your own computer");
     assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live");
     setSetting("signin_mode:chatgpt", "desktop");
     assert.equal(getProvider("chatgpt")!.preferredSignIn(), "desktop");
+    setSetting("signin_mode:chatgpt", "local");
+    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "local", "a sign-in that worked from the user's computer is remembered");
+    setSetting("signin_mode:chatgpt", "nonsense");
+    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live", "an unknown remembered mode falls back to the provider's default");
     setSetting("signin_mode:chatgpt", "live");
     assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live");
   });

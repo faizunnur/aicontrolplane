@@ -6,6 +6,8 @@ import { bus } from "../bus.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
 import { persistStatus, saveToDatabase } from "../persist.js";
+import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
+import { chromeInstallCandidates } from "./executable.js";
 
 const log = logger("browser");
 
@@ -38,15 +40,7 @@ export function resolveExecutable(): { path: string; source: "env" | "channel" |
   const env = process.env.BROWSER_EXECUTABLE;
   if (env && fs.existsSync(env)) return { path: env, source: "env" };
   if (config.browser.channel === "chrome") {
-    const pf = process.env["PROGRAMFILES"] ?? "C:\\Program Files";
-    const pf86 = process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)";
-    const candidates =
-      process.platform === "win32"
-        ? [path.join(pf, "Google", "Chrome", "Application", "chrome.exe"), path.join(pf86, "Google", "Chrome", "Application", "chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google", "Chrome", "Application", "chrome.exe")]
-        : process.platform === "darwin"
-          ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
-          : ["/opt/google/chrome/chrome", "/usr/bin/google-chrome-stable", "/usr/bin/google-chrome"];
-    const found = candidates.find((c) => c && fs.existsSync(c));
+    const found = chromeInstallCandidates().find((c) => c && fs.existsSync(c));
     if (found) return { path: found, source: "channel" };
     log.warn("BROWSER_CHANNEL=chrome but Google Chrome was not found; using the bundled Chromium");
   }
@@ -457,6 +451,45 @@ class BrowserManager {
   async exportState() {
     const ctx = await this.getContext();
     return ctx.storageState();
+  }
+
+  /**
+   * Replace one provider's session with what the user's own computer captured: its cookies for the
+   * provider's domains (the old ones for those domains go first, so a stale session cannot shadow the
+   * new one) and, best effort, its localStorage for those origins. Runs under the lock, so a desktop
+   * sign-in holding the browser answers with the usual refusal instead of racing it.
+   */
+  async importProviderState(p: { id: string; name: string }, domains: string[], state: { cookies: StoredCookie[]; origins: StoredOrigin[] }): Promise<{ cookies: number; origins: number; cleared: number }> {
+    return this.withLock(
+      async () => {
+        const ctx = await this.getContext();
+        const before = await ctx.cookies();
+        const cleared = before.filter((c) => cookieMatchesDomain(c.domain, domains)).length;
+        for (const d of domains) {
+          const escaped = d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          await ctx.clearCookies({ domain: new RegExp(`(^|\\.)${escaped}$`, "i") }).catch((err) => log.warn(`could not clear cookies for ${d}`, err));
+        }
+        if (state.cookies.length) await ctx.addCookies(state.cookies);
+        let origins = 0;
+        for (const o of state.origins) {
+          const page = await ctx.newPage();
+          try {
+            await page.goto(o.origin, { waitUntil: "commit", timeout: 15_000 });
+            await page.evaluate((entries) => {
+              for (const e of entries) localStorage.setItem(e.name, e.value);
+            }, o.localStorage);
+            origins++;
+          } catch (err) {
+            log.warn(`could not apply localStorage for ${o.origin}`, err);
+          } finally {
+            await page.close().catch(() => undefined);
+          }
+        }
+        log.info(`${p.name}: imported ${state.cookies.length} cookies and ${origins} origin(s) from the user's computer (replaced ${cleared})`);
+        return { cookies: state.cookies.length, origins, cleared };
+      },
+      { label: `Importing your ${p.name} sign-in`, platform: p.id },
+    );
   }
 
   async status(): Promise<BrowserSnapshot> {

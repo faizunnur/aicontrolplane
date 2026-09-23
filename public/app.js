@@ -22,7 +22,9 @@
   let agents = [];
   let view = "chat"; // chat | overview | agents | tasks | runs | approvals | activity | notifications
   let viewFilter = "";
-  let signingIn = null; // { platform, mode: "live" | "desktop", vnc, desktopOk } while the sign-in ribbon shows
+  let signingIn = null; // { platform, mode: "live" | "desktop", vnc, desktopOk, localOk } while the sign-in ribbon shows
+  let pairing = null; // { platform, name, id, code, command, expiresAt, secure, status, detail } while the connect panel is relevant
+  let pairingTimer = null;
   const openActivity = new Map(); // message id -> user toggled open/closed
   const runningRuns = new Map(); // run id -> { ...run, current_step }
   const app = $("#app");
@@ -159,9 +161,69 @@
     if (!s) return false;
     if (signingIn && signingIn.platform === s.platform && signingIn.mode === "desktop") return false;
     const opts = home?.signInOptions || {};
-    signingIn = { platform: s.platform, mode: "desktop", vnc: opts.vnc, desktopOk: true, resumed: true };
+    signingIn = { platform: s.platform, mode: "desktop", vnc: opts.vnc, desktopOk: true, localOk: true, resumed: true };
     return true;
   }
+
+  /* sign-in from the user's own computer: a pairing code, one command there, the session lands here */
+  async function startLocalSignIn(id) {
+    const c = conn(id);
+    if (browserState && browserState.enabled === false) return toast("The browser is off on this deployment, so there is nowhere to put a sign-in.", "bad");
+    if (pairing && pairing.platform === id && ["waiting", "paired", "importing"].includes(pairing.status)) return openPairing();
+    try {
+      const r = await api(`/connections/${id}/pairing`, { method: "POST", body: {} });
+      if (signingIn && signingIn.platform === id) { signingIn = null; renderRibbons(); }
+      pairing = { platform: id, name: r.name || c?.name || id, id: r.id, code: r.code, command: r.command, expiresAt: r.expiresAt, secure: r.secure, status: "waiting", detail: null };
+      openPairing();
+    } catch (err) { fail(err); }
+  }
+  function openPairing() {
+    $("#pairing-modal").hidden = false;
+    renderPairing();
+    clearInterval(pairingTimer);
+    pairingTimer = setInterval(renderPairing, 1000);
+  }
+  function closePairing() {
+    clearInterval(pairingTimer);
+    pairingTimer = null;
+    $("#pairing-modal").hidden = true;
+  }
+  function renderPairing() {
+    if (!pairing) return;
+    const left = Math.max(0, Math.round((new Date(pairing.expiresAt).getTime() - Date.now()) / 1000));
+    const mmss = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+    if (pairing.status === "waiting" && left <= 0) pairing.status = "expired";
+    const st = pairing.status;
+    const name = pairing.name;
+    const texts = {
+      waiting: [`Waiting for your computer… the code is good for ${mmss}.`, "run"],
+      paired: [`Your computer is paired. Sign in to ${name} in the Chrome window that opened there, exactly as you always do. When the site shows you signed in, the helper hands the session over on its own.`, "run"],
+      importing: [`Signed in. Handing your ${name} session to the cloud browser…`, "run"],
+      done: [`${name} is connected.`, "ok"],
+      failed: [pairing.detail || `The sign-in to ${name} could not be imported.`, "bad"],
+      expired: ["The code expired before your computer used it. Make a new one.", "warn"],
+      cancelled: ["Cancelled. Make a new code whenever you are ready.", ""],
+      replaced: ["A newer code replaced this one.", ""],
+    };
+    const [text, tone] = texts[st] || [st, ""];
+    $("#pairing-title").textContent = `Connect ${name} from this computer`;
+    $("#pairing-command").textContent = pairing.command;
+    $("#pairing-code").textContent = pairing.code;
+    $("#pairing-expires").textContent = st === "waiting" ? `· expires in ${mmss}` : st === "paired" || st === "importing" ? `· token good for ${mmss}` : "";
+    $("#pairing-warning").hidden = !!pairing.secure;
+    $("#pairing-status-text").textContent = text;
+    $("#pairing-dot").className = `dot ${tone}`;
+    $("#pairing-status").className = `notice ${tone === "run" ? "" : tone}`;
+    const over = ["done", "failed", "expired", "cancelled", "replaced"].includes(st);
+    $("#btn-pairing-cancel").hidden = over;
+    $("#btn-pairing-new").hidden = !over || st === "done";
+    $("#btn-pairing-done").hidden = st !== "done";
+  }
+  $("#btn-pairing-copy").addEventListener("click", async () => { await navigator.clipboard.writeText(pairing?.command || "").catch(() => null); toast("Copied. Paste it in a terminal in the project folder.", "ok"); });
+  $("#btn-pairing-cancel").addEventListener("click", async () => { const p = pairing; closePairing(); pairing = null; if (p) await api(`/connections/${p.platform}/pairing`, { method: "DELETE" }).catch(() => null); });
+  $("#btn-pairing-new").addEventListener("click", () => { const p = pairing; pairing = null; if (p) startLocalSignIn(p.platform); });
+  $("#btn-pairing-done").addEventListener("click", () => { closePairing(); pairing = null; });
+  $("[data-pairing-close]").addEventListener("click", () => closePairing()); // keeps the code: "Show the connect code" brings it back
   function renderAll() {
     renderAiList();
     renderEngine();
@@ -246,6 +308,12 @@
       renderAiList(); renderEngine(); renderTabs(); renderRibbons(); renderLiveContext();
     });
     es.addEventListener("log", (e) => { if (view === "logs") Views.appendLog(JSON.parse(e.data), $("#view"), logFilter()); });
+    es.addEventListener("pairing", (e) => {
+      const p = JSON.parse(e.data);
+      if (pairing && p.id === pairing.id) { pairing.status = p.status; pairing.detail = p.detail; if (p.expires_at) pairing.expiresAt = p.expires_at; renderPairing(); }
+      if (p.status === "done") toast(`${aiName(p.platform)} is connected.`, "ok");
+      else if (p.status === "failed") toast(p.detail || `The sign-in to ${aiName(p.platform)} could not be imported.`, "bad");
+    });
     es.addEventListener("conversation", (e) => {
       const { action, conversation: c } = JSON.parse(e.data);
       if (action === "deleted") {
@@ -398,12 +466,20 @@
     const rows = connections.filter((c) => c.appUrl || c.builtin).map((c) => {
       const st = statusOf(c);
       const signingHere = browserState?.signIn?.platform === c.id;
-      const busyLabel = signingHere ? "Sign-in open on the cloud desktop" : busyP === c.id ? browserState.busy.label : null;
+      const pairingHere = !!(c.pairing && ["waiting", "paired", "importing"].includes(c.pairing.status));
+      const busyLabel = signingHere ? "Sign-in open on the cloud desktop" : pairingHere ? (c.pairing.status === "waiting" ? "Waiting for your computer…" : c.pairing.status === "paired" ? "Sign in on your computer…" : "Importing your sign-in…") : busyP === c.id ? browserState.busy.label : null;
       const showing = browserState?.active === c.id && browserState?.pages?.some((p) => p.platform === c.id);
+      const modeLabel = c.signInMode === "desktop" ? " (cloud desktop)" : c.signInMode === "local" ? " (from this computer)" : "";
+      const alternatives = [
+        c.signInMode !== "live" ? `<button class="btn small" data-connect="${c.id}" data-mode="live">${icon("eye", "sm")} Sign in in the live view</button>` : "",
+        c.signInMode !== "desktop" ? `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>` : "",
+        c.signInMode !== "local" ? `<button class="btn small" data-connect="${c.id}" data-mode="local">${icon("terminal", "sm")} Connect from this computer</button>` : "",
+      ].join("");
       const signInButtons = signingHere
         ? `<button class="btn small" data-signin-resume="${c.id}">${icon("panel", "sm")} Continue the sign-in</button><button class="btn small" data-signin-cancel="${c.id}">${icon("close", "sm")} Cancel the sign-in</button>`
-        : `${c.status === "logged_in" ? `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in${c.signInMode === "desktop" ? " (cloud desktop)" : ""}</button>`}
-          ${c.signInMode === "desktop" ? `<button class="btn small" data-connect="${c.id}" data-mode="live">${icon("eye", "sm")} Sign in in the live view</button>` : `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>`}`;
+        : pairingHere
+          ? `<button class="btn small" data-connect="${c.id}" data-mode="local">${icon("terminal", "sm")} Show the connect code</button><button class="btn small" data-pairing-cancel="${c.id}">${icon("close", "sm")} Cancel the connect</button>`
+          : `${c.status === "logged_in" ? `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again${modeLabel}</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in${modeLabel}</button>`}${alternatives}`;
       return `<div class="ai-row ${target === c.id ? "active" : ""}" data-ai="${c.id}" role="button" tabindex="0" title="${target === c.id ? "Sending to this AI. Click to go back to Auto." : `Send your next message to ${esc(c.name)}`}">
         <span class="avatar ${esc(c.id)}">${esc(c.name.slice(0, 1))}</span>
         <div class="info"><div class="name">${esc(c.name)}${showing ? `<span class="muted" title="Showing in the browser panel">${icon("eye", "sm")}</span>` : ""}</div>
@@ -724,14 +800,17 @@
         $("#signin-text").textContent = !desktopActive ? `Preparing a browser window for ${name}…` : signingIn.resumed ? `The sign-in window for ${name} is still open on the server's desktop from earlier. When you can see your chats there, press` : `A plain browser window with ${name} is open on the server's desktop. Sign in there; when you can see your chats, press`;
       }
       $("#btn-signin-desktop").hidden = true;
+      $("#btn-signin-local").hidden = !signingIn.localOk; // the way out when the check refuses even the plain window
     } else {
       ribbon.hidden = live.meta?.platform !== signingIn.platform;
       frame.hidden = true;
       $("#viewport").classList.remove("desktop");
-      $("#signin-text").textContent = signingIn.challenge ? `${name}'s sign-in page has a bot check that may refuse an automated browser. Sign in above if it lets you; otherwise use the cloud desktop. When you can see your chats, press` : "Sign in above, exactly as you normally do. When you can see your chats, press";
+      $("#signin-text").textContent = signingIn.challenge ? `${name}'s sign-in page has a bot check that may refuse a browser in a datacenter. Sign in above if it lets you; otherwise connect from this computer. When you can see your chats, press` : "Sign in above, exactly as you normally do. When you can see your chats, press";
       $("#btn-signin-desktop").hidden = !signingIn.desktopOk;
+      $("#btn-signin-local").hidden = !(signingIn.challenge && signingIn.localOk);
     }
   }
+  $("#btn-signin-local").addEventListener("click", async () => { const id = signingIn?.platform; if (!id) return; await cancelSignIn(id); startLocalSignIn(id); });
   $("#btn-control").addEventListener("click", () => { live.setOverride(!live.override); renderRibbons(); $("#viewport").focus({ preventScroll: true }); });
   /** The execution the browser panel is showing: agent, provider, task, current action, elapsed. */
   function renderLiveContext() {
@@ -787,20 +866,24 @@
     if (!c) return;
     if (browserState && browserState.enabled === false) return toast("The browser is off on this deployment, so there is nowhere to sign in.", "bad");
     const wanted = mode || c.signInMode || "live";
+    if (wanted === "local") return startLocalSignIn(id);
     showBrowser();
     if (wanted === "desktop") return startDesktopSignIn(id);
     signingIn = { platform: id, mode: "live" };
     renderRibbons();
     try {
       const r = await api(`/connections/${id}/connect`, { method: "POST", body: {} });
-      signingIn = { platform: id, mode: "live", challenge: r.challenge, desktopOk: !!(r.desktop && r.desktop.ok) };
+      signingIn = { platform: id, mode: "live", challenge: r.challenge, desktopOk: !!(r.desktop && r.desktop.ok), localOk: !!(r.local && r.local.ok) };
       live.watch(id);
       renderTabs(); renderRibbons();
       if (r.blocked && r.desktop && r.desktop.ok) {
         toast(`${c.name}'s sign-in page refused the automated browser. Switching to the cloud desktop.`);
         return startDesktopSignIn(id);
       }
-      if (r.blocked) toast(`${c.name}'s sign-in page refused the automated browser: ${r.desktop?.reason || "no desktop is available here"}.`, "bad");
+      if (r.blocked) {
+        toast(`${c.name}'s sign-in page refused the automated browser. Sign in from this computer instead.`);
+        return startLocalSignIn(id);
+      }
       $("#viewport").focus({ preventScroll: true });
       toast(`Sign in to ${c.name} in the browser panel.`);
     } catch (err) { signingIn = null; renderRibbons(); fail(err); }
@@ -812,7 +895,7 @@
     try {
       const r = await api(`/connections/${id}/signin`, { method: "POST", body: { mode: "desktop" } });
       const resumed = !!(r.signIn && r.signIn.since && Date.now() - new Date(r.signIn.since).getTime() > 15_000);
-      signingIn = { platform: id, mode: "desktop", vnc: r.vnc, desktopOk: true, resumed };
+      signingIn = { platform: id, mode: "desktop", vnc: r.vnc, desktopOk: true, localOk: !!(r.local && r.local.ok), resumed };
       renderRibbons(); renderTabs();
       toast(resumed ? `Back in the sign-in window for ${c?.name || id}.` : r.vnc?.available ? `Sign in to ${c?.name || id} in the desktop window.` : `A browser window with ${c?.name || id} opened on the server's desktop.`);
     } catch (err) { signingIn = null; renderRibbons(); fail(err); }
@@ -830,7 +913,7 @@
           live.followAgent();
           renderRibbons(); renderTabs();
         } else if (mode === "desktop") {
-          toast(r.status === "needs_login" ? `${r.name} still looks signed out. The window was closed; start the sign-in again if you were not finished.` : `Could not check ${r.name}: ${r.lastError || "try again"}`, "bad");
+          toast(r.status === "needs_login" ? `${r.name} still looks signed out. The window was closed; start the sign-in again, or use "Connect from this computer" from its menu if the site refused the check.` : `Could not check ${r.name}: ${r.lastError || "try again"}`, "bad");
           signingIn = null;
           renderRibbons();
         } else {
@@ -1024,7 +1107,7 @@ curl -X POST ${base}/api/ingest \\
   /* ---------- global clicks ---------- */
   document.addEventListener("click", async (e) => {
     for (const d of $$("details.menu[open]")) if (!d.contains(e.target)) d.removeAttribute("open");
-    const t = e.target.closest("[data-send],[data-del],[data-connect],[data-signin-resume],[data-signin-cancel],[data-view-ai],[data-check],[data-refresh],[data-remove],[data-read],[data-read-all],[data-shot],[data-open-settings],[data-close],[data-approve],[data-approve-id],[data-cancel],[data-stop-run],[data-run-task],[data-pause-task],[data-resume-task],[data-sync-all],[data-toggle],[data-conv],[data-rename],[data-delete-conv],[data-ai],[data-example],[data-nav],[data-filter],[data-filter-clear],[data-open-run],[data-open-task],[data-open-agent],[data-log-clear]");
+    const t = e.target.closest("[data-send],[data-del],[data-connect],[data-signin-resume],[data-signin-cancel],[data-pairing-cancel],[data-view-ai],[data-check],[data-refresh],[data-remove],[data-read],[data-read-all],[data-shot],[data-open-settings],[data-close],[data-approve],[data-approve-id],[data-cancel],[data-stop-run],[data-run-task],[data-pause-task],[data-resume-task],[data-sync-all],[data-toggle],[data-conv],[data-rename],[data-delete-conv],[data-ai],[data-example],[data-nav],[data-filter],[data-filter-clear],[data-open-run],[data-open-task],[data-open-agent],[data-log-clear]");
     if (!t) {
       const ov = e.target.closest("[data-close-on-click]");
       if (ov && e.target === ov) ov.hidden = true;
@@ -1057,6 +1140,7 @@ curl -X POST ${base}/api/ingest \\
       else if (d.connect) { if (t.closest(".overlay")) t.closest(".overlay").hidden = true; await startSignIn(d.connect, d.mode || null); }
       else if (d.signinResume) { showBrowser(); await startDesktopSignIn(d.signinResume); } // the server hands back the sign-in already open for this provider
       else if (d.signinCancel) { await busy(btn, () => cancelSignIn(d.signinCancel)); }
+      else if (d.pairingCancel) { await busy(btn, () => api(`/connections/${d.pairingCancel}/pairing`, { method: "DELETE" })); if (pairing?.platform === d.pairingCancel) { closePairing(); pairing = null; } toast("Cancelled. Make a new code whenever you are ready."); }
       else if (d.logClear !== undefined) { const l = $("#log-lines"); if (l) l.innerHTML = ""; }
       else if (d.viewAi) { showBrowser(); if (browserState?.pages?.some((p) => p.platform === d.viewAi)) live.watch(d.viewAi); else { await api("/browser/open", { method: "POST", body: { platform: d.viewAi, url: conn(d.viewAi)?.appUrl } }); live.watch(d.viewAi); } renderTabs(); }
       else if (d.check) { await busy(btn, async () => { const r = await api(`/connections/${d.check}/check`, { method: "POST", body: {} }); toast(r.status === "logged_in" ? `${r.name} is connected.` : `${r.name} is signed out.`, r.status === "logged_in" ? "ok" : "bad"); }); }

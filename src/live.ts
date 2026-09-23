@@ -49,6 +49,7 @@ bus.on("policy", (p: unknown) => broadcast("policy", p));
 bus.on("agent", (a: unknown) => broadcast("agent", a));
 bus.on("agent:deleted", (a: unknown) => broadcast("agent-deleted", a));
 bus.on("log", (l: unknown) => broadcast("log", l));
+bus.on("pairing", (p: unknown) => broadcast("pairing", p));
 
 export function streamClients() {
   return clients.size;
