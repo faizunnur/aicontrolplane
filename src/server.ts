@@ -62,13 +62,18 @@ app.use((req, res, next) => {
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, browser: browser.isRunning(), at: new Date().toISOString() }));
 
-// When PUBLIC_URL is not configured, learn it from the first browser request so
-// webhook payloads and alerts can carry absolute links back to this deployment.
+// When neither PUBLIC_URL nor the host's own domain says where this deployment lives, learn it from
+// the first browser request, so alerts, webhook payloads and the connect command carry a real address.
+// The proxy's forwarded host wins: it is the address the user typed, not the container's internal one.
 app.use((req, _res, next) => {
-  if (!config.publicUrl && req.headers.host && !req.path.startsWith("/api/ingest") && !req.path.startsWith("/api/inbox")) {
-    const proto = req.headers["x-forwarded-proto"] === "https" || req.secure ? "https" : "http";
-    config.publicUrl = `${proto}://${req.headers.host}`;
-    log.info(`public url detected: ${config.publicUrl}`);
+  if (!config.publicUrl && !req.path.startsWith("/api/ingest") && !req.path.startsWith("/api/inbox")) {
+    const fwd = req.headers["x-forwarded-host"];
+    const host = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim() || req.headers.host;
+    if (host) {
+      const proto = req.headers["x-forwarded-proto"] === "https" || req.secure ? "https" : "http";
+      config.publicUrl = `${proto}://${host}`;
+      log.info(`public url detected: ${config.publicUrl} (set PUBLIC_URL to pin it)`);
+    }
   }
   next();
 });

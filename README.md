@@ -87,6 +87,10 @@ sees a check fail:
   [Node 22 or newer](https://nodejs.org) and a Chrome-family browser (Chrome, Edge, Brave or Chromium). If you
   do have the project folder, `npm run connect -- <url> <code>` runs the same file.
 
+  The panel fills in your deployment's address for you, so the command is ready to paste with nothing to edit.
+  It uses `PUBLIC_URL` when that is set (a bare domain is fine), else the domain your host reports, else the
+  address you opened the app on. The panel names which of the three it used, so a wrong one is never silent.
+
   Your browser opens a plain window on the sign-in page, with nothing attached to it. You sign in as you always
   do, including through Google or another provider if that is how you sign in. When the site shows you signed in,
   the helper reads that one provider's cookies and localStorage, sends them to your deployment over HTTPS, and

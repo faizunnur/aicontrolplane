@@ -175,7 +175,7 @@
     try {
       const r = await api(`/connections/${id}/pairing`, { method: "POST", body: {} });
       if (signingIn && signingIn.platform === id) { signingIn = null; renderRibbons(); }
-      pairing = { platform: id, name: r.name || c?.name || id, id: r.id, code: r.code, connect: r.connect, expiresAt: r.expiresAt, secure: r.secure, status: "waiting", detail: null };
+      pairing = { platform: id, name: r.name || c?.name || id, id: r.id, code: r.code, connect: r.connect, expiresAt: r.expiresAt, secure: r.secure, publicUrl: r.publicUrl, publicUrlSource: r.publicUrlSource, status: "waiting", detail: null };
       openPairing();
     } catch (err) { fail(err); }
   }
@@ -212,6 +212,9 @@
     $("#pairing-command").textContent = pairingCommand();
     $("#pairing-repo").textContent = pairing.connect?.repo || "";
     for (const b of $$("#pairing-os [data-os]")) { b.classList.toggle("primary", b.dataset.os === pairingOs); b.classList.toggle("ghost", b.dataset.os !== pairingOs); }
+    // Which address the command carries, and where it came from: a wrong one is otherwise invisible.
+    const from = { env: "from PUBLIC_URL", host: "from your host's own domain", detected: "detected from this page", request: "detected from this page" }[pairing.publicUrlSource] || "";
+    $("#pairing-address").innerHTML = `The command points at <code>${esc(pairing.publicUrl || "")}</code> ${esc(from)}.${pairing.publicUrlSource === "env" || pairing.publicUrlSource === "host" ? "" : " If your computer cannot reach that address, set PUBLIC_URL in this deployment to the address you open it on."}`;
     $("#pairing-code").textContent = pairing.code;
     $("#pairing-expires").textContent = st === "waiting" ? `· expires in ${mmss}` : st === "paired" || st === "importing" ? `· token good for ${mmss}` : "";
     $("#pairing-warning").hidden = !!pairing.secure;

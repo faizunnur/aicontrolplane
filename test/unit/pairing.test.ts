@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 const db = await import("../../src/db.js");
 const auth = await import("../../src/auth.js");
 const pairing = await import("../../src/pairing.js");
+const { normalizePublicUrl } = await import("../../src/config.js");
 const { cookieMatchesDomain, selectProviderState, sessionDomains } = await import("../../src/providers/browser/domains.js");
 const { GROK_DEFAULTS, CHATGPT_DEFAULTS } = await import("../../src/providers/defaults.js");
 
@@ -58,6 +59,16 @@ describe("pairing: sign in from your own computer", () => {
     const failed = pairing.createPairing("chatgpt");
     pairing.finishPairing(failed.row.id, "failed", "still signed out");
     assert.ok(db.listAudit({ action: "signin.pairing_failed" }).length >= 1);
+  });
+
+  it("takes the deployment's address the way people write it", () => {
+    // Whatever is in PUBLIC_URL ends up in the command someone pastes on another computer.
+    assert.equal(normalizePublicUrl("my-app.up.railway.app"), "https://my-app.up.railway.app", "a bare domain is an address, not a mistake");
+    assert.equal(normalizePublicUrl("  https://my-app.up.railway.app/  "), "https://my-app.up.railway.app");
+    assert.equal(normalizePublicUrl("https://my-app.up.railway.app///"), "https://my-app.up.railway.app");
+    assert.equal(normalizePublicUrl("http://localhost:8080"), "http://localhost:8080", "http is kept: it is someone's own machine");
+    assert.equal(normalizePublicUrl(""), "");
+    assert.equal(normalizePublicUrl(undefined), "");
   });
 
   it("knows which cookies belong to a provider's session", () => {

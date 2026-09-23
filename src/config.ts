@@ -19,6 +19,23 @@ function list(v: string | undefined): string[] {
 const isProd = process.env.NODE_ENV === "production";
 
 /**
+ * The address this deployment is reachable at, written the way a browser would show it. A bare
+ * domain is accepted (PUBLIC_URL=my-app.up.railway.app) and becomes https://, because that is the
+ * shape people paste, and the connect command must carry an address their computer can reach.
+ */
+export function normalizePublicUrl(raw: string | undefined | null): string {
+  const s = String(raw ?? "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!s) return "";
+  if (/^https?:\/\//i.test(s)) return s;
+  return `https://${s}`;
+}
+/** Railway names the service's own domain; it saves setting PUBLIC_URL by hand. */
+const fromEnv = normalizePublicUrl(process.env.PUBLIC_URL);
+const fromHost = normalizePublicUrl(process.env.RAILWAY_PUBLIC_DOMAIN);
+
+/**
  * Where state lives. A Railway volume announces its mount path; when one exists it always wins,
  * so the volume can be mounted anywhere and a leftover DATA_DIR can't point the app elsewhere.
  */
@@ -51,7 +68,9 @@ export const config = {
   platformsFile: path.join(dataDir, "platforms.json"),
   adminToken,
   ingestToken,
-  publicUrl: (process.env.PUBLIC_URL || "").replace(/\/$/, ""),
+  publicUrl: fromEnv || fromHost,
+  /** Where that address came from, so the UI can say so and nudge when it is only a guess. */
+  publicUrlSource: (fromEnv ? "env" : fromHost ? "host" : "detected") as "env" | "host" | "detected",
 
   browser: {
     enabled: bool(process.env.BROWSER_ENABLED, true),

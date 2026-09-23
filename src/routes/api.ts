@@ -579,7 +579,7 @@ api.post("/connections/:id/pairing", (req, res, next) => {
       unix: `curl -fsSL ${helperUrl} -o acp-connect.mjs && node acp-connect.mjs ${base} ${code}`,
       repo: `npm run connect -- ${base} ${code}`,
     };
-    res.json({ ok: true, id: row.id, platform: a.id, name: a.name, code, expiresAt: row.expires_at, publicUrl: base, secure, connect, pairing: activePairing(a.id) });
+    res.json({ ok: true, id: row.id, platform: a.id, name: a.name, code, expiresAt: row.expires_at, publicUrl: base, publicUrlSource: config.publicUrl ? config.publicUrlSource : "request", secure, connect, pairing: activePairing(a.id) });
   } catch (err) {
     next(err);
   }
@@ -963,7 +963,7 @@ api.get("/diagnostics", async (_req, res) => {
     }
     return { id: p.id, name: p.name, syncable: !!p.tasksUrl, state: { ...s, meta: { finalUrl: meta.finalUrl, title: meta.title, snapshotAt: meta.snapshotAt } }, hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)), tasks: listTasks({ platform: p.id }).length, actions: availableActions(p) };
   });
-  res.json({ counts: { ...overviewCounts(), openMessages: openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: storageInfo(), scheduler: schedulerStatus(), browser: await browser.status(), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, schema: schemaVersion() });
+  res.json({ counts: { ...overviewCounts(), openMessages: openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: storageInfo(), scheduler: schedulerStatus(), browser: await browser.status(), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, publicUrlSource: config.publicUrlSource, schema: schemaVersion() });
 });
 
 /* ---------- agents (registry) ---------- */

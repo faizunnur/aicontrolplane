@@ -212,6 +212,7 @@
       <pre id="pairing-command" class="pairing-command"></pre>
       <div class="row" style="margin-top:8px"><button class="btn small" id="btn-pairing-copy">Copy command</button><span class="muted small">Code <code id="pairing-code" class="token"></code> <span id="pairing-expires"></span></span></div>
       <p class="muted small" style="margin-top:8px">It needs <a href="https://nodejs.org" target="_blank" rel="noopener">Node 22 or newer</a> and Chrome, Edge or Brave. Nothing else to install: the command downloads one file from this app and runs it. With the project folder you can run <code id="pairing-repo"></code> instead.</p>
+      <p class="muted small" id="pairing-address" style="margin-top:6px"></p>
       <p class="form-error" id="pairing-warning" hidden style="margin-top:10px">This deployment is not served over HTTPS. The helper refuses to send a sign-in over plain HTTP anywhere except localhost.</p>
       <div class="notice" id="pairing-status" style="margin-top:14px"><span class="dot run" id="pairing-dot"></span><div class="body" id="pairing-status-text">Waiting for your computer…</div></div>
       <div class="row end"><button class="btn ghost" type="button" id="btn-pairing-cancel">Cancel</button><button class="btn" type="button" id="btn-pairing-new" hidden>New code</button><button class="btn primary" type="button" id="btn-pairing-done" hidden>Done</button></div>

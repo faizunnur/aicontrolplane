@@ -96,6 +96,24 @@ describe("sign in from your own computer", { timeout: 300_000 }, () => {
     assert.deepEqual(statuses, ["waiting", "paired", "importing", "done"]);
   });
 
+  it("builds the command from PUBLIC_URL, so nobody has to edit an address by hand", async () => {
+    // A bare domain with a trailing slash: what people actually paste into a deployment's variables.
+    const pinned = await startServer({ PUBLIC_URL: "acp.example.test/" });
+    try {
+      const made = await pinned.api("/connections/chatgpt/pairing", { body: {} });
+      assert.equal(made.publicUrl, "https://acp.example.test");
+      assert.equal(made.publicUrlSource, "env");
+      assert.equal(made.secure, true);
+      assert.equal(made.connect.helperUrl, "https://acp.example.test/connect.mjs");
+      assert.equal(made.connect.unix, `curl -fsSL https://acp.example.test/connect.mjs -o acp-connect.mjs && node acp-connect.mjs https://acp.example.test ${made.code}`);
+      assert.equal(made.connect.windows, `irm https://acp.example.test/connect.mjs -OutFile acp-connect.mjs; node acp-connect.mjs https://acp.example.test ${made.code}`);
+      assert.equal(made.connect.repo, `npm run connect -- https://acp.example.test ${made.code}`);
+      assert.equal((await pinned.api("/diagnostics")).publicUrlSource, "env");
+    } finally {
+      await pinned.stop();
+    }
+  });
+
   it("rate-limits code guessing and lets a waiting code be cancelled", async () => {
     const guesser = { cookie: "", "content-type": "application/json", "x-forwarded-for": "203.0.113.9" };
     let last = 0;
