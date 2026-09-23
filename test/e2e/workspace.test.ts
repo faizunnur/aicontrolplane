@@ -120,6 +120,14 @@ describe("workspace end to end", { timeout: 600_000 }, () => {
     const failed = await s.api("/chat", { body: { text: "what failed today?", conversation_id: conversationId } });
     assert.equal(failed.routed, "control");
     assert.match(failed.message.response, /Nothing failed today/);
+    // A greeting is answered here too: it must not cost a browser run at a provider.
+    const runsBefore = (await s.api("/runs?limit=200")).length;
+    const hello = await s.api("/chat", { body: { text: "hi", conversation_id: conversationId } });
+    assert.equal(hello.routed, "control");
+    assert.equal(hello.intent.kind, "assistant");
+    assert.equal(hello.message.status, "done");
+    assert.match(hello.message.response, /agents · \d+ tasks/);
+    assert.equal((await s.api("/runs?limit=200")).length, runsBefore, "no run was started for a greeting");
   });
 
   it("manual mode: a rejection leaves the message unsent", async () => {
@@ -143,7 +151,7 @@ describe("workspace end to end", { timeout: 600_000 }, () => {
   it("conversation summaries carry counts, last status and rename", async () => {
     const list = await s.api("/conversations");
     const mine = list.find((c: any) => c.id === conversationId);
-    assert.equal(mine.message_count, 8);
+    assert.equal(mine.message_count, 9);
     assert.equal(mine.last_status, "cancelled");
     assert.equal(mine.active, 0);
     const renamed = await s.api(`/conversations/${conversationId}`, { method: "PATCH", body: { title: "Renamed thread" } });

@@ -298,7 +298,7 @@ function anthropic(): Anthropic {
   return client;
 }
 
-async function askJson<T extends z.ZodTypeAny>(system: string, user: string, schema: T): Promise<{ result: z.infer<T> | null; error?: string }> {
+export async function askJson<T extends z.ZodTypeAny>(system: string, user: string, schema: T): Promise<{ result: z.infer<T> | null; error?: string }> {
   if (config.router.provider === "claude-code") return askClaudeCode(system, user, schema);
   try {
     const response = await anthropic().messages.parse({

@@ -118,6 +118,21 @@ alone ends on its own after `DESKTOP_SIGNIN_TIMEOUT_MIN` minutes and the automat
 While the window is open, other browser work (a message to an AI, a look at a tasks page) is refused with that
 reason instead of waiting behind it, and the scheduled sync skips its turn.
 
+## Talking to the control plane
+
+The command panel is a conversation with the control plane itself, not with one of the AIs. Ask what is
+running, what failed today, what needs your approval, or how an agent has been doing, and the answer is read
+from your own runs and tasks. Tell it to run, pause, resume or stop a task, or to approve or reject a request,
+and it does that here. Greetings and "what can you do?" are answered here as well. Anything else goes to the AI
+you name, or to the best fit among the ones you have connected.
+
+Set `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`) and those answers are written by Claude rather than
+assembled from templates: it sees what the control plane just found or did, a briefing of your current state
+and the conversation so far, and it answers like an assistant who runs your agents. It cannot invent a run,
+change an outcome or decide an approval; those are settled in code before it is asked, and anything it cannot
+phrase falls back to the written sentence. The status block at the bottom of the sidebar says which of the two
+is in use.
+
 ## Execution modes
 
 **Auto approve** lets the agent perform everyday actions on its own. **Ask me first** makes it pause before
@@ -164,7 +179,7 @@ Optional variables, all set in the Railway service:
 
 | Variable | What it does |
 |---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Lets Claude pick which AI gets a message when several are connected, and double-check whether a message is a question for the control plane. Get it with `claude setup-token`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Turns the command panel into a conversation: Claude answers you in its own words from your own state, picks which AI gets a message, and tells a question from an instruction. Uses your Claude subscription; get it with `claude setup-token`. |
 | `ANTHROPIC_API_KEY` | Same, billed per token instead. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`, or `ALERT_WEBHOOK_URL` | Get a message when something fails or an AI signs you out. |
 | `IMAP_HOST`, `IMAP_USER`, `IMAP_PASS` | Read task notification emails (for example from ChatGPT) into the registry. |
@@ -235,7 +250,11 @@ shell script, a Claude Code routine prompt block and an MCP server for Cowork.
 - **Policy** (`src/policy.ts`) is the single gate; approvals persist in `approvals`; everything sensitive is
   written to `audit_log`.
 - **Intents** (`src/intents.ts`, `src/answers.ts`) keep control-plane questions and commands inside the control
-  plane.
+  plane. Greetings and "what can you do?" are answered here too, so they never cost a run at a provider.
+- **The assistant** (`src/assistant.ts`) gives those answers a voice when a Claude credential exists. The
+  control plane decides and acts first; Claude is then handed that outcome, a briefing of your real state and
+  the thread so far, and is told to add no facts, change no outcome and decide no approval. Every failure,
+  refusal or timeout falls back to the written sentence, so the control plane never depends on a model.
 - **Live** (`src/live.ts`, `src/browser/live.ts`): server-sent events for state, a WebSocket screencast of the
   tab the agent works in with input replayed back. Chromium keeps one persistent profile per deployment; sign-ins
   are backed up and restored across redeploys.

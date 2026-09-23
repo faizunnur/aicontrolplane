@@ -23,9 +23,13 @@ export type QuestionTopic = "running" | "scheduled" | "completed" | "failed" | "
 export type Timeframe = "today" | "yesterday" | "week" | "all";
 export type CommandAction = "run" | "pause" | "resume" | "stop" | "continue" | "approve" | "reject";
 
+export type AssistantTopic = "greeting" | "help";
+
 export type Intent =
   | { kind: "question"; topic: QuestionTopic; provider: string | null; timeframe: Timeframe; source: "rules" | "claude" }
   | { kind: "command"; action: CommandAction; target: string; provider: string | null; source: "rules" | "claude" }
+  /** Said to the control plane itself: a greeting, a thank-you, or "what can you do?". */
+  | { kind: "assistant"; topic: AssistantTopic; source: "rules" | "claude" }
   | { kind: "chat"; source: "rules" | "claude" };
 
 const QUESTION_START = /^(what|which|who|how|is|are|any|anything|do|does|did|show|list|summari[sz]e|give me|tell me|where)\b/;
@@ -78,10 +82,16 @@ const COMMANDS: [CommandAction, RegExp][] = [
   ["continue", /^(?:please\s+)?(continue|carry on with|pick up|keep going with|finish)\s+(?:the\s+)?(.+?)[.!]?$/],
 ];
 
+/* Said to the control plane, not to an AI: answering these here keeps a browser out of "thanks". */
+const GREETING = /^(hi|hello|hey|hiya|yo|good (morning|afternoon|evening|night)|thanks|thank you|thanks!|thx|cheers|ok|okay|cool|nice|great|perfect|got it|never ?mind|sorry)[\s!.,]*$/;
+const HELP = /^(help|what can you do|what else can you do|who are you|what are you|what do you do|how do you work|what can i ask( you)?|what can i say|how can you help( me)?|what are you for)\b[\s?.!]*$/;
+
 export function classify(raw: string): Intent {
   const text = raw.trim().toLowerCase().replace(/\s+/g, " ");
   if (!text) return { kind: "chat", source: "rules" };
   if (addressesProvider(text)) return { kind: "chat", source: "rules" };
+  if (GREETING.test(text)) return { kind: "assistant", topic: "greeting", source: "rules" };
+  if (HELP.test(text)) return { kind: "assistant", topic: "help", source: "rules" };
 
   for (const [action, re] of COMMANDS) {
     const m = re.exec(text);

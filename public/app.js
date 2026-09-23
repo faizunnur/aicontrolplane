@@ -510,7 +510,7 @@
     const r = home?.router;
     const tabs = b?.pages?.length ?? 0;
     const bl = !b || b.enabled === false ? ["", "Cloud browser off"] : b.running ? ["ok", `Cloud browser on · ${tabs} tab${tabs === 1 ? "" : "s"}`] : ["warn", "Cloud browser starting…"];
-    const rl = r?.llm ? `Routing by Claude${r.provider === "claude-code" ? " (subscription)" : ""}` : "Routing by name or keywords";
+    const rl = r?.llm ? `Claude answers and routes${r.provider === "claude-code" ? " (subscription)" : ""}` : "Routing by name or keywords";
     const ml = approvalMode === "manual" ? "Asks you before acting" : "Acts on its own";
     $("#engine").innerHTML = `<div class="line"><span class="dot ${bl[0]}"></span><b>${esc(bl[1])}</b></div><div class="line">${icon("bolt", "sm")}<b>${esc(rl)}</b></div><div class="line">${icon(approvalMode === "manual" ? "hand" : "check", "sm")}<b>${esc(ml)}</b></div>`;
   }
@@ -969,9 +969,9 @@
       settings = await api("/settings");
       $("#password-note").textContent = settings.passwordFromEnv ? "The password is set on the server (ACP_ADMIN_TOKEN). Change it there." : "";
       $("#password-form").hidden = settings.passwordFromEnv;
-      $("#router-note").textContent = settings.router.provider === "claude-code" ? "Claude decides which AI gets each message, using your Claude subscription (CLAUDE_CODE_OAUTH_TOKEN). Claude also double-checks whether a message is a question for the control plane."
-        : settings.router.provider === "api" ? `Claude (${settings.router.model}) decides which AI gets each message, using your Anthropic API key, and double-checks whether a message is a question for the control plane.`
-        : "Messages go to the AI you name, or to the only connected AI. Questions about your agents and tasks are answered by the control plane itself. To let Claude decide between several AIs, set CLAUDE_CODE_OAUTH_TOKEN (from “claude setup-token”) or ANTHROPIC_API_KEY on the server.";
+      $("#router-note").textContent = settings.router.provider === "claude-code" ? "Claude answers you here in its own words, using your Claude subscription (CLAUDE_CODE_OAUTH_TOKEN). It also decides which AI gets each message and whether a message is a question for the control plane. What it tells you is read from your own runs, tasks and approvals; it never invents an outcome, and it never decides an approval."
+        : settings.router.provider === "api" ? `Claude (${settings.router.model}) answers you here in its own words, using your Anthropic API key, decides which AI gets each message, and tells a control-plane question from an instruction. What it tells you is read from your own runs, tasks and approvals; it never invents an outcome, and it never decides an approval.`
+        : "The control plane answers about your agents and tasks in short written sentences, and messages go to the AI you name or to the only connected one. For replies written by Claude and for routing between several AIs, set CLAUDE_CODE_OAUTH_TOKEN (from “claude setup-token”) or ANTHROPIC_API_KEY on the server.";
       $("#alerts-note").textContent = settings.alerts.telegram || settings.alerts.webhook ? `Failures and sign-outs are sent to ${[settings.alerts.telegram ? "Telegram" : "", settings.alerts.webhook ? "your webhook" : ""].filter(Boolean).join(" and ")}.` : "Not set up. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or ALERT_WEBHOOK_URL, on the server to get notified when something fails or an AI signs you out.";
       const st = settings.storage;
       $("#storage-note").textContent = st.persistedBy === "database" ? `Sign-ins, chats and settings are mirrored to your Postgres database${st.database.lastSaveAt ? ` (last saved ${rel(st.database.lastSaveAt)})` : ""}. No volume needed.`

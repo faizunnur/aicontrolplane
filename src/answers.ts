@@ -1,3 +1,4 @@
+import { speak } from "./assistant.js";
 import { foldSteps, getMessage, getRun, getTask, listAgentProfiles, listEvents, listRuns, listTasks, runEvents, updateMessage, updateTask, type RunRow } from "./db.js";
 import type { Intent, QuestionTopic, Timeframe } from "./intents.js";
 import { resolveTarget } from "./intents.js";
@@ -151,6 +152,23 @@ function status(): Answer {
   };
 }
 
+/* ---------- said to the control plane itself ---------- */
+
+/** A greeting or "what can you do?". The facts are the same state everything else reads. */
+function answerAssistant(intent: Extract<Intent, { kind: "assistant" }>): Answer {
+  const state = status();
+  if (intent.topic === "greeting") return { text: `Hello. ${state.text}`, data: state.data };
+  const providers = listProviders().filter((a) => a.connectionStatus().status === "logged_in").map((a) => a.name);
+  return {
+    text: [
+      "I am your control plane. I keep every AI agent you use in one place: what they are doing now, what they have done, what is scheduled, and what needs your approval before it happens.",
+      "Ask me what is running, what failed today, what needs approval, or how an agent has been doing. Tell me to run, pause, resume, stop, approve or reject something and I do it here.",
+      providers.length ? `Anything else goes to the AI you name, or to the best fit among ${providers.join(", ")}, and you can watch it work in the browser panel.` : "Sign in to an AI from the left and I can send your messages to it and watch it work in the browser panel.",
+    ].join("\n"),
+    data: { providers, ...(state.data as object) },
+  };
+}
+
 /* ---------- commands ---------- */
 
 export async function executeCommand(intent: Extract<Intent, { kind: "command" }>, ctx: { messageId: number }): Promise<Answer> {
@@ -217,18 +235,29 @@ function notFound(target: string, candidates: { id: number; name: string; platfo
 
 /** Run a control-plane intent for a message and record the outcome on the message. */
 export async function handleControl(intent: Exclude<Intent, { kind: "chat" }>, messageId: number): Promise<Answer> {
-  updateMessage(messageId, { routing: { method: "control", confidence: 1, reason: intent.kind === "question" ? `Answered from the control plane (${intent.topic}).` : `Control-plane command: ${intent.action}.`, intent }, status: "delivered", delivered_at: new Date().toISOString() });
+  const reason = intent.kind === "question" ? `Answered from the control plane (${intent.topic}).` : intent.kind === "command" ? `Control-plane command: ${intent.action}.` : "Said to the control plane.";
+  updateMessage(messageId, { routing: { method: "control", confidence: 1, reason, intent }, status: "delivered", delivered_at: new Date().toISOString() });
   let answer: Answer;
   try {
-    answer = intent.kind === "question" ? answerQuestion(intent) : await executeCommand(intent, { messageId });
+    answer = intent.kind === "question" ? answerQuestion(intent) : intent.kind === "assistant" ? answerAssistant(intent) : await executeCommand(intent, { messageId });
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     updateMessage(messageId, { status: "failed", error });
     return { text: error, data: null, status: "failed" };
   }
-  const status = answer.status ?? "done";
   const m = getMessage(messageId);
-  updateMessage(messageId, { status, response: answer.text, acked_at: status === "done" ? new Date().toISOString() : null, error: status === "failed" ? answer.text : null, run_id: m?.run_id ?? null });
+  // The control plane has decided and acted; Claude, when configured, only says it in better words.
+  const spoken = await speak({ text: m?.text ?? "", intent, answer, conversationId: m?.conversation_id ?? null });
+  answer = { ...answer, text: spoken.text };
+  const status = answer.status ?? "done";
+  updateMessage(messageId, {
+    status,
+    response: answer.text,
+    routing: { method: "control", confidence: 1, reason: spoken.source === "claude" ? `${reason} Worded by Claude.` : reason, intent },
+    acked_at: status === "done" ? new Date().toISOString() : null,
+    error: status === "failed" ? answer.text : null,
+    run_id: m?.run_id ?? null,
+  });
   return answer;
 }
 
