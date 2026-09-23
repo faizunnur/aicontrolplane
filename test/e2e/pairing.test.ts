@@ -41,8 +41,17 @@ describe("sign in from your own computer", { timeout: 300_000 }, () => {
 
     const made = await s.api("/connections/mock-ai/pairing", { body: {} });
     assert.match(made.code, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
-    assert.match(made.command, /^npm run connect -- http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
     assert.equal(made.secure, true, "loopback counts as safe for the helper");
+    // A computer with no copy of the project fetches the helper from the deployment itself.
+    assert.equal(made.connect.helperUrl, `${s.base}/connect.mjs`);
+    assert.match(made.connect.windows, /^irm http:\/\/127\.0\.0\.1:\d+\/connect\.mjs -OutFile acp-connect\.mjs; node acp-connect\.mjs http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
+    assert.match(made.connect.unix, /^curl -fsSL http:\/\/127\.0\.0\.1:\d+\/connect\.mjs -o acp-connect\.mjs && node acp-connect\.mjs http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
+    assert.match(made.connect.repo, /^npm run connect -- http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
+    const helper = await s.raw("/connect.mjs", { headers: { cookie: "" } });
+    assert.equal(helper.status, 200, "the helper downloads without a password: it holds no secrets");
+    const source = await helper.text();
+    assert.ok(source.includes("/api/pairing/exchange") && source.includes("--remote-debugging-port"), "and it is the helper");
+    assert.ok(!/import .* from "(?!node:)/.test(source), "with nothing to install: only Node's own modules");
     assert.equal((await s.api("/connections/mock-ai/pairing")).status, "waiting");
     const card = (await s.api("/connections")).find((c: any) => c.id === "mock-ai");
     assert.equal(card.pairing?.status, "waiting", "the connection card carries the pairing");

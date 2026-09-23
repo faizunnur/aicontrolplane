@@ -23,8 +23,10 @@
   let view = "chat"; // chat | overview | agents | tasks | runs | approvals | activity | notifications
   let viewFilter = "";
   let signingIn = null; // { platform, mode: "live" | "desktop", vnc, desktopOk, localOk } while the sign-in ribbon shows
-  let pairing = null; // { platform, name, id, code, command, expiresAt, secure, status, detail } while the connect panel is relevant
+  let pairing = null; // { platform, name, id, code, connect, expiresAt, secure, status, detail } while the connect panel is relevant
   let pairingTimer = null;
+  // Which command to show. The sign-in may happen on a different computer than the one reading this.
+  let pairingOs = store.get("acp-connect-os", /win/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent) ? "windows" : "unix");
   const openActivity = new Map(); // message id -> user toggled open/closed
   const runningRuns = new Map(); // run id -> { ...run, current_step }
   const app = $("#app");
@@ -173,7 +175,7 @@
     try {
       const r = await api(`/connections/${id}/pairing`, { method: "POST", body: {} });
       if (signingIn && signingIn.platform === id) { signingIn = null; renderRibbons(); }
-      pairing = { platform: id, name: r.name || c?.name || id, id: r.id, code: r.code, command: r.command, expiresAt: r.expiresAt, secure: r.secure, status: "waiting", detail: null };
+      pairing = { platform: id, name: r.name || c?.name || id, id: r.id, code: r.code, connect: r.connect, expiresAt: r.expiresAt, secure: r.secure, status: "waiting", detail: null };
       openPairing();
     } catch (err) { fail(err); }
   }
@@ -206,8 +208,10 @@
       replaced: ["A newer code replaced this one.", ""],
     };
     const [text, tone] = texts[st] || [st, ""];
-    $("#pairing-title").textContent = `Connect ${name} from this computer`;
-    $("#pairing-command").textContent = pairing.command;
+    $("#pairing-title").textContent = `Connect ${name} from your computer`;
+    $("#pairing-command").textContent = pairingCommand();
+    $("#pairing-repo").textContent = pairing.connect?.repo || "";
+    for (const b of $$("#pairing-os [data-os]")) { b.classList.toggle("primary", b.dataset.os === pairingOs); b.classList.toggle("ghost", b.dataset.os !== pairingOs); }
     $("#pairing-code").textContent = pairing.code;
     $("#pairing-expires").textContent = st === "waiting" ? `· expires in ${mmss}` : st === "paired" || st === "importing" ? `· token good for ${mmss}` : "";
     $("#pairing-warning").hidden = !!pairing.secure;
@@ -219,7 +223,9 @@
     $("#btn-pairing-new").hidden = !over || st === "done";
     $("#btn-pairing-done").hidden = st !== "done";
   }
-  $("#btn-pairing-copy").addEventListener("click", async () => { await navigator.clipboard.writeText(pairing?.command || "").catch(() => null); toast("Copied. Paste it in a terminal in the project folder.", "ok"); });
+  const pairingCommand = () => pairing?.connect?.[pairingOs] || pairing?.connect?.unix || "";
+  $("#pairing-os").addEventListener("click", (e) => { const b = e.target.closest("[data-os]"); if (!b) return; pairingOs = b.dataset.os; store.set("acp-connect-os", pairingOs); renderPairing(); });
+  $("#btn-pairing-copy").addEventListener("click", async () => { await navigator.clipboard.writeText(pairingCommand()).catch(() => null); toast("Copied. Paste it in a terminal on the computer you want to sign in from.", "ok"); });
   $("#btn-pairing-cancel").addEventListener("click", async () => { const p = pairing; closePairing(); pairing = null; if (p) await api(`/connections/${p.platform}/pairing`, { method: "DELETE" }).catch(() => null); });
   $("#btn-pairing-new").addEventListener("click", () => { const p = pairing; pairing = null; if (p) startLocalSignIn(p.platform); });
   $("#btn-pairing-done").addEventListener("click", () => { closePairing(); pairing = null; });

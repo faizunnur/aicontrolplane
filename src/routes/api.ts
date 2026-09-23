@@ -570,7 +570,16 @@ api.post("/connections/:id/pairing", (req, res, next) => {
     const { row, code } = createPairing(a.id);
     const base = (config.publicUrl || `${req.protocol}://${req.headers.host}`).replace(/\/$/, "");
     const secure = /^https:/i.test(base) || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/i.test(base);
-    res.json({ ok: true, id: row.id, platform: a.id, name: a.name, code, expiresAt: row.expires_at, publicUrl: base, secure, command: `npm run connect -- ${base} ${code}`, pairing: activePairing(a.id) });
+    // The helper is one plain Node file this deployment serves, so a computer with no copy of the
+    // project can fetch it and run it. Nothing in it is secret; it does nothing without a live code.
+    const helperUrl = `${base}/connect.mjs`;
+    const connect = {
+      helperUrl,
+      windows: `irm ${helperUrl} -OutFile acp-connect.mjs; node acp-connect.mjs ${base} ${code}`,
+      unix: `curl -fsSL ${helperUrl} -o acp-connect.mjs && node acp-connect.mjs ${base} ${code}`,
+      repo: `npm run connect -- ${base} ${code}`,
+    };
+    res.json({ ok: true, id: row.id, platform: a.id, name: a.name, code, expiresAt: row.expires_at, publicUrl: base, secure, connect, pairing: activePairing(a.id) });
   } catch (err) {
     next(err);
   }

@@ -71,21 +71,31 @@ sees a check fail:
   your session in it. This is enough for checks that object to automation.
 - **From your computer**: for checks that refuse any browser in a datacenter (Grok's accounts.x.ai does, even to
   a plain window). Open the provider's menu, choose "Connect from this computer", and run the one-line command
-  it shows in a terminal in this project's folder on your own computer (Node 20 or newer):
+  the panel shows, on whichever computer you want to sign in from:
 
+  ```powershell
+  # Windows (PowerShell)
+  irm https://your-app.up.railway.app/connect.mjs -OutFile acp-connect.mjs; node acp-connect.mjs https://your-app.up.railway.app ABCD-EFGH
   ```
-  npm run connect -- https://your-app.up.railway.app ABCD-EFGH
+  ```bash
+  # macOS or Linux
+  curl -fsSL https://your-app.up.railway.app/connect.mjs -o acp-connect.mjs && node acp-connect.mjs https://your-app.up.railway.app ABCD-EFGH
   ```
 
-  Your own Google Chrome opens a plain window on the sign-in page, with nothing attached to it. You sign in as
-  you always do. When the site shows you signed in, the helper reads that one provider's cookies and localStorage,
-  sends them to your deployment over HTTPS, and the cloud browser is signed in. The panel in the app follows every
-  step and ends with "connected". Grok starts in this mode; any provider that needed it once uses it next time,
-  and a sign-out notification for such a provider says so.
+  **No copy of this project is needed.** The deployment serves the helper itself, as one plain file with no
+  dependencies: anyone you hand the app to can sign in from their own laptop with nothing installed but
+  [Node 22 or newer](https://nodejs.org) and a Chrome-family browser (Chrome, Edge, Brave or Chromium). If you
+  do have the project folder, `npm run connect -- <url> <code>` runs the same file.
+
+  Your browser opens a plain window on the sign-in page, with nothing attached to it. You sign in as you always
+  do, including through Google or another provider if that is how you sign in. When the site shows you signed in,
+  the helper reads that one provider's cookies and localStorage, sends them to your deployment over HTTPS, and
+  the cloud browser is signed in. The panel in the app follows every step and ends with "connected". Grok starts
+  in this mode; any provider that needed it once uses it next time, and a sign-out notification says so.
 
   The code is good for ten minutes and works once. It buys a token that can do exactly one thing, hand that one
   provider's session over, for twenty minutes, once. Both are stored hashed; every step is in the audit log.
-  The helper never writes your session to disk; Chrome's own profile for these sign-ins lives under
+  The helper never writes your session to disk; the browser profile it opens lives under
   `~/.aicontrolplane/connect-profile` and can be deleted at any time.
 
 Nothing here pretends to be a different browser or solves a check for you. The desktop mode removes the automation
@@ -240,5 +250,7 @@ shell script, a Claude Code routine prompt block and an MCP server for Cowork.
 - "Connect from this computer" uses a single-use pairing code (ten minutes) and a token scoped to one provider's
   session import (twenty minutes, once). Guessing codes is rate limited; the helper refuses plain HTTP except to
   localhost; the token cannot read or change anything else.
+- The connect helper at `/connect.mjs` is served without a password on purpose: it is client code with no secrets
+  in it, and it does nothing without a live code. It is one readable file, so anyone can check it before running it.
 - These are consumer accounts driven from one extra browser. The app talks to each AI the way you would, at a
   human pace, and never claims an API a provider does not document.
