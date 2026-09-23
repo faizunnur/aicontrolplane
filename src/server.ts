@@ -46,6 +46,20 @@ app.use((req, res, next) => {
   next();
 });
 
+// Request log: every change and every failure at info or above, reads at debug. Streams and health checks stay quiet.
+app.use((req, res, next) => {
+  if (req.path === "/healthz" || req.path === "/api/stream" || req.path.startsWith("/vnc") || (!req.path.startsWith("/api") && req.method === "GET")) return next();
+  const t0 = Date.now();
+  res.on("finish", () => {
+    const line = `${req.method} ${req.originalUrl.split("?")[0]} → ${res.statusCode} in ${Date.now() - t0}ms`;
+    if (res.statusCode >= 500) log.error(line);
+    else if (res.statusCode >= 400) log.warn(line);
+    else if (req.method === "GET") log.debug(line);
+    else log.info(line);
+  });
+  next();
+});
+
 app.get("/healthz", (_req, res) => res.json({ ok: true, browser: browser.isRunning(), at: new Date().toISOString() }));
 
 // When PUBLIC_URL is not configured, learn it from the first browser request so
@@ -91,7 +105,8 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   if (err instanceof UnsupportedOperationError) return res.status(501).json(err.toJSON());
   const status = err && typeof err === "object" && typeof (err as { status?: unknown }).status === "number" ? (err as { status: number }).status : 500;
   const msg = err instanceof Error ? err.message : String(err);
-  if (status >= 500) log.error("request failed", err);
+  if (status >= 500) log.error(`${_req.method} ${_req.originalUrl.split("?")[0]} failed`, err);
+  else log.warn(`${_req.method} ${_req.originalUrl.split("?")[0]} refused (${status}): ${msg}`);
   res.status(status).json({ error: msg });
 });
 

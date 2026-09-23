@@ -78,6 +78,8 @@ class LiveView {
         return;
       }
       if (msg.t === "state") {
+        // State also arrives over the event stream; whichever channel is behind must not undo the newer one.
+        if (this.state && typeof msg.browser.seq === "number" && typeof this.state.seq === "number" && msg.browser.seq < this.state.seq) return;
         this.state = msg.browser;
         this.viewport.classList.toggle("interactive", this.interactive);
         this.onState(this.state);

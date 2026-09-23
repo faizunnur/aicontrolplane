@@ -108,6 +108,7 @@ export async function guard(scope: GuardScope, action: string, summary: string, 
     return "approved";
   }
   const row = createApproval({ run_id: scope.runId ?? null, message_id: scope.messageId ?? null, action, provider: scope.provider ?? null, summary, detail: detail ?? null });
+  log.info(`approval #${row.id} requested for ${action} (${policy.mode}): ${summary}`);
   scope.track?.waiting("approve", summary, detail ?? null);
   if (scope.runId) addRunEvent(scope.runId, { type: "approval", label: `Approval requested: ${summary}`, detail: policy.mode === "always" ? "this action always asks" : null, metadata: { approval_id: row.id } });
   addAudit({ actor: "policy", action: `${action}.requested`, target: `approval:${row.id}`, detail: summary });
@@ -143,6 +144,7 @@ export function decide(id: number, decision: "approved" | "rejected", by = "you"
   if (!a || a.status !== "pending") return null;
   const row = updateApproval(id, { status: decision, decided_by: by, reason })!;
   addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
+  log.info(`approval #${id} ${decision} by ${by}${reason ? `: ${reason}` : ""}`);
   waiters.get(id)?.(decision);
   return row;
 }

@@ -98,6 +98,7 @@ function sendJson(c: Client, msg: unknown) {
 function onConnect(ws: WebSocket) {
   const client: Client = { ws, platform: null, follow: true, level: "medium", override: false, stream: null };
   clients.add(client);
+  log.info(`live view connected (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
   sendJson(client, { t: "state", browser: browser.snapshot() });
   void attach(client);
 
@@ -114,6 +115,7 @@ function onConnect(ws: WebSocket) {
   ws.on("close", () => {
     clients.delete(client);
     detach(client);
+    log.info(`live view left (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
   });
   ws.on("error", (err) => log.warn("live socket error", err));
 }

@@ -1,5 +1,8 @@
 import { addRunEvent, finishRun, foldSteps, getMessage, getRun, listRuns, runEvents, startRun, updateMessage, type StartRunInput } from "./db.js";
+import { logger } from "./logger.js";
 import type { Run, RunStatus, Step, StepStatus } from "./types.js";
+
+const log = logger("runs");
 
 /*
   The run lifecycle. Every piece of work the control plane executes (a chat message, a sync, an
@@ -43,7 +46,11 @@ export class RunTracker {
   }
 
   private emit(key: string, label: string, status: StepStatus, detail?: string | null) {
-    addRunEvent(this.runId, { type: "step", key, label: label || this.read().find((s) => s.key === key)?.label || key, status, detail: detail ?? null });
+    const text = label || this.read().find((s) => s.key === key)?.label || key;
+    addRunEvent(this.runId, { type: "step", key, label: text, status, detail: detail ?? null });
+    const line = `run #${this.runId} · ${text} → ${status}${detail ? ` (${detail.slice(0, 160)})` : ""}`;
+    if (status === "failed") log.warn(line);
+    else log.info(line);
     this.mirror();
   }
 
@@ -89,6 +96,7 @@ export class RunTracker {
 export function beginRun(input: StartRunInput): { run: Run; track: RunTracker } {
   const run = startRun(input);
   clearCancel(run.id);
+  log.info(`run #${run.id} started: ${input.kind} "${input.label}" on ${input.provider ?? "the control plane"} (trigger: ${input.trigger ?? "user"}${input.message_id ? `, message ${input.message_id}` : ""}${input.task_id ? `, task ${input.task_id}` : ""})`);
   return { run, track: new RunTracker(run.id, input.message_id ?? null) };
 }
 
@@ -102,6 +110,10 @@ export function endRun(runId: number, outcome: { status: RunStatus; summary?: st
   if (run?.message_id && outcome.status === "success") updateMessage(run.message_id, { steps: foldSteps(runEvents(runId)) });
   clearCancel(runId);
   const finished = finishRun(runId, outcome);
+  const summary = (outcome.error ?? outcome.summary ?? "").slice(0, 200);
+  const line = `run #${runId} ${outcome.status}${summary ? `: ${summary}` : ""}${run?.started_at ? ` (${Math.round((Date.now() - new Date(run.started_at).getTime()) / 1000)}s)` : ""}`;
+  if (outcome.status === "failed") log.warn(line);
+  else log.info(line);
   // A task run that a chat command started reports back into that message when it ends.
   if (finished?.kind === "task" && finished.message_id) for (const h of afterRunHooks) h(finished.id);
   return finished;

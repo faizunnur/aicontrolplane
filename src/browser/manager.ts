@@ -75,6 +75,8 @@ export interface BrowserSnapshot {
   pages: { platform: string; url: string; title: string }[];
   /** A sign-in in progress in a plain browser window on the cloud desktop, if any. */
   signIn: DesktopSignIn | null;
+  /** Rises with every snapshot. The page receives state over two channels (event stream, live-view socket) and drops any snapshot older than the one it has. */
+  seq: number;
 }
 
 /**
@@ -120,8 +122,9 @@ class BrowserManager {
       if (page.isClosed()) continue;
       pages.push({ platform, url: page.url(), title: this.titles.get(platform) ?? "" });
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages, signIn: this.desktop };
+    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages, signIn: this.desktop, seq: ++this.snapshotSeq };
   }
+  private snapshotSeq = 0;
 
   /* ---------- desktop sign-in: a plain browser window, no automation attached ---------- */
 
@@ -140,7 +143,9 @@ class BrowserManager {
   async startDesktopSignIn(platformId: string, name: string, url: string): Promise<DesktopSignIn> {
     const can = this.canDesktopSignIn();
     if (!can.ok) throw Object.assign(new Error(can.reason), { status: 409 });
-    if (this.desktop) throw Object.assign(new Error(`a sign-in to ${this.desktop.platform} is already in progress`), { status: 409 });
+    // Asking again for the same provider (a reloaded page, a second tab) joins the sign-in in progress.
+    if (this.desktop && this.desktop.platform === platformId) return this.desktop;
+    if (this.desktop) throw Object.assign(new Error(`a sign-in to ${this.desktop.platform} is already in progress; finish or cancel it first`), { status: 409 });
     const started = deferred<DesktopSignIn>();
     const done = deferred<"finished" | "cancelled">();
     this.desktopDone = done;
@@ -240,8 +245,11 @@ class BrowserManager {
   private track(platformId: string, page: Page) {
     const isMain = (f: import("playwright").Frame) => f === page.mainFrame();
     page.on("framenavigated", (f) => {
-      if (isMain(f)) this.announce();
+      if (!isMain(f)) return;
+      log.debug(`${platformId} tab → ${f.url()}`);
+      this.announce();
     });
+    page.on("crash", () => log.error(`${platformId} tab crashed; the next job opens a fresh one`));
     page.on("load", () => {
       page
         .title()
@@ -369,6 +377,9 @@ class BrowserManager {
    * The task label is shown in the live view while the job runs ("Sending to ChatGPT").
    */
   withLock<T>(fn: () => Promise<T>, task?: { label: string; platform?: string | null; messageId?: number | null }): Promise<T> {
+    // A desktop sign-in holds the browser for as long as its window is open, minutes at a time. Work that
+    // arrives meanwhile is refused at once with the reason, rather than queued behind it in silence.
+    if (this.desktop) return Promise.reject(Object.assign(new Error(`a sign-in to ${this.desktop.platform} is in progress on the cloud desktop; finish or cancel it first`), { status: 409 }));
     const job = () => this.runLocked(fn, task);
     const run = this.queue.then(job, job);
     this.queue = run.catch(() => undefined);

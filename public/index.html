@@ -24,6 +24,7 @@
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
     <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
     <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></symbol>
     <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></symbol>
     <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
@@ -96,6 +97,7 @@
           <div class="nav-title">Monitoring</div>
           <a class="nav-item" href="#activity" data-nav="activity"><svg class="ic sm"><use href="#i-activity"/></svg><span>Activity</span></a>
           <a class="nav-item" href="#notifications" data-nav="notifications"><svg class="ic sm"><use href="#i-bell"/></svg><span>Notifications</span><span class="nav-count" data-count="unread" hidden></span></a>
+          <a class="nav-item" href="#logs" data-nav="logs"><svg class="ic sm"><use href="#i-terminal"/></svg><span>Logs</span></a>
           <div class="nav-title">Connections <button class="btn icon ghost" id="btn-add-ai" title="Add a provider" aria-label="Add a provider" style="width:22px;height:22px;margin-left:auto"><svg class="ic sm"><use href="#i-plus"/></svg></button></div>
           <div id="ai-list"></div>
           <a class="ai-row custom" href="#agents" data-nav="agents" data-filter="custom" id="custom-agents-row"><span class="avatar system"><svg class="ic sm"><use href="#i-agents"/></svg></span><div class="info"><div class="name">Custom agents</div><div class="sub" id="custom-agents-sub">none registered</div></div></a>
@@ -173,7 +175,7 @@
         <iframe id="desktop-frame" class="desktop-frame" title="Cloud desktop" allow="clipboard-read; clipboard-write" hidden></iframe>
         <div class="viewport-msg" id="viewport-msg"><strong>Nothing open yet</strong><span>Send a message or sign in to an AI and the browser shows up here.</span></div>
         <div class="ribbon top busy" id="busy-ribbon" hidden><span class="dot run"></span><span class="txt" id="busy-text"></span><button class="btn xs" id="btn-control">Take control</button></div>
-        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt" id="signin-text">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs ghost" id="btn-signin-desktop" hidden title="Sites with a bot check refuse the automated browser; this opens a plain browser window on the cloud desktop instead">Use the cloud desktop</button><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn icon ghost" id="btn-signin-dismiss" style="width:22px;height:22px" aria-label="Cancel"><svg class="ic sm"><use href="#i-close"/></svg></button></div>
+        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt" id="signin-text">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs ghost" id="btn-signin-desktop" hidden title="Sites with a bot check refuse the automated browser; this opens a plain browser window on the cloud desktop instead">Use the cloud desktop</button><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn xs ghost" id="btn-signin-dismiss" title="Close the sign-in window and give the browser back to the agents">Cancel</button></div>
       </div>
       <div class="statusbar">
         <span class="dot" id="live-dot"></span>

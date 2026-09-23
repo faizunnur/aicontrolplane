@@ -16,14 +16,17 @@ const clients = new Set<Response>();
 function broadcast(event: string, data: unknown) {
   if (!clients.size) return;
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  const failed: Response[] = [];
   for (const res of clients) {
     try {
       res.write(payload);
-    } catch (err) {
-      log.warn("dropping stream client", err);
-      clients.delete(res);
+    } catch {
+      failed.push(res);
     }
   }
+  // Drop before logging: a log line is itself broadcast, and must not retry the dead client.
+  for (const res of failed) clients.delete(res);
+  if (failed.length && event !== "log") log.warn(`dropped ${failed.length} stream client(s) that could not be written to`);
 }
 
 // "msg" rather than "message": an EventSource treats unnamed events as "message" too, so keep the names distinct.
@@ -45,6 +48,7 @@ bus.on("approval", (a: unknown) => broadcast("approval", a));
 bus.on("policy", (p: unknown) => broadcast("policy", p));
 bus.on("agent", (a: unknown) => broadcast("agent", a));
 bus.on("agent:deleted", (a: unknown) => broadcast("agent-deleted", a));
+bus.on("log", (l: unknown) => broadcast("log", l));
 
 export function streamClients() {
   return clients.size;
@@ -61,6 +65,7 @@ export function streamHandler(req: Request, res: Response) {
   res.write("retry: 2000\n\n");
   res.write(`event: hello\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
   clients.add(res);
+  log.debug(`stream client connected (${clients.size} open)`);
   const ping = setInterval(() => {
     try {
       res.write(": ping\n\n");
@@ -73,5 +78,6 @@ export function streamHandler(req: Request, res: Response) {
   req.on("close", () => {
     clearInterval(ping);
     clients.delete(res);
+    log.debug(`stream client left (${clients.size} open)`);
   });
 }

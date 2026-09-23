@@ -170,7 +170,30 @@
     },
   };
 
-  const TITLES = { overview: "Overview", agents: "Agents", tasks: "Tasks", runs: "Runs", approvals: "Approvals", activity: "Activity", notifications: "Notifications" };
+  /* ---------- the server log, tailed live ---------- */
+  const LOG_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
+  const LOG_LEVELS = ["debug", "info", "warn", "error"];
+  const stamp = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); };
+  const logLine = (l) => `<div class="log-line lv-${esc(l.level)}" data-log-id="${l.id}"><span class="t" title="${esc(l.at)}">${esc(stamp(l.at))}</span><span class="lv">${esc(l.level)}</span><span class="sc">${esc(l.scope)}</span><span class="m">${esc(l.msg)}${l.extra ? `<span class="x">${esc(l.extra)}</span>` : ""}</span></div>`;
+  const passes = (l, f) => LOG_RANK[l.level] >= (LOG_RANK[f.level] ?? 1) && (!f.scope || l.scope === f.scope);
+
+  V.logs = async (root, ctx) => {
+    const f = { level: ctx.store?.get("acp-log-level", "info") || "info", scope: ctx.store?.get("acp-log-scope", "") || "" };
+    const r = await ctx.api(`/logs?limit=500&level=${f.level}${f.scope ? `&scope=${encodeURIComponent(f.scope)}` : ""}`);
+    const sel = (attr, value, options, label) => `<select ${attr}>${options.map((o) => `<option value="${esc(o)}"${o === value ? " selected" : ""}>${esc(label(o))}</option>`).join("")}</select>`;
+    root.innerHTML = `<div class="vhead wrap">
+        <label class="muted small">Show ${sel("data-log-level", f.level, LOG_LEVELS, (l) => (l === "debug" ? "everything" : `${l} and above`))}</label>
+        <label class="muted small">from ${sel("data-log-scope", f.scope, ["", ...r.scopes.filter((s) => s !== f.scope), ...(f.scope ? [f.scope] : [])].sort(), (s) => s || "every part")}</label>
+        <span class="spacer"></span>
+        <label class="muted small" title="What the server prints to its own console, which is what the host (Railway) shows. This view always keeps everything the server logged, whatever the console prints.">Console prints ${sel("data-console-level", r.level, LOG_LEVELS, (l) => `${l} and above`)}</label>
+        <button class="btn xs ghost" data-log-clear title="Clear the screen; the server keeps its lines">Clear</button>
+      </div>
+      <div class="loglist" id="log-lines">${r.lines.map(logLine).join("")}</div>
+      ${r.lines.length ? "" : empty("Nothing at this level yet", "New lines appear here live as the server works. Show everything to include debug lines.")}
+      <p class="muted small vfoot">The server keeps its last 2000 lines in memory since it started; they are gone after a restart. Set LOG_LEVEL=debug in the deployment to print this much to the host's log as well.</p>`;
+  };
+
+  const TITLES = { overview: "Overview", agents: "Agents", tasks: "Tasks", runs: "Runs", approvals: "Approvals", activity: "Activity", notifications: "Notifications", logs: "Logs" };
 
   window.Views = {
     titles: TITLES,
@@ -180,5 +203,15 @@
       await fn(root, ctx);
     },
     detail: { agent: V.agentDetail, task: V.taskDetail, run: V.runDetail },
+    /** A line from the live stream lands at the bottom of the open logs view, if it passes the filter. */
+    appendLog(line, root, filter) {
+      const list = root.querySelector("#log-lines");
+      if (!list || !passes(line, filter)) return;
+      const atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 48;
+      list.insertAdjacentHTML("beforeend", logLine(line));
+      while (list.children.length > 2000) list.firstElementChild.remove();
+      root.querySelector(".view-empty")?.remove();
+      if (atBottom) root.scrollTop = root.scrollHeight;
+    },
   };
 })();

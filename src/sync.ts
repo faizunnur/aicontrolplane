@@ -70,6 +70,8 @@ async function tick() {
   try {
     if (vncState.connections > 0 || Date.now() - vncState.lastActivityAt < 60_000) {
       log.info("skipping scheduled sync: browser screen is in use");
+    } else if (browser.signIn) {
+      log.info(`skipping scheduled sync: a sign-in to ${browser.signIn.platform} is in progress on the cloud desktop`);
     } else {
       await syncAll();
     }

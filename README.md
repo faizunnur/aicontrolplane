@@ -79,6 +79,14 @@ provider refuses even the plain window, the last resort remains importing a sess
 The Docker image installs Google Chrome and uses it for both modes, so sites see an ordinary browser and the
 profile never changes hands between two browser versions.
 
+A desktop sign-in belongs to the server, not to the page that started it. If you close or reload the tab while
+one is open, the page picks it up again when it loads: the desktop window comes back with "I'm signed in" and
+"Cancel", the provider's menu on the left offers "Continue the sign-in" and "Cancel the sign-in", and asking
+to sign in to the same provider again joins the window already open rather than being refused. A sign-in left
+alone ends on its own after `DESKTOP_SIGNIN_TIMEOUT_MIN` minutes and the automation takes the browser back.
+While the window is open, other browser work (a message to an AI, a look at a tasks page) is refused with that
+reason instead of waiting behind it, and the scheduled sync skips its turn.
+
 ## Execution modes
 
 **Auto approve** lets the agent perform everyday actions on its own. **Ask me first** makes it pause before
@@ -130,8 +138,17 @@ Optional variables, all set in the Railway service:
 | `IMAP_HOST`, `IMAP_USER`, `IMAP_PASS` | Read task notification emails (for example from ChatGPT) into the registry. |
 | `ACP_ADMIN_TOKEN`, `ACP_INGEST_TOKEN` | Only if you prefer to set the password and the agent token on the server instead of in the app. |
 | `SYNC_INTERVAL_MIN` | How often the control plane looks at each provider's tasks page. Default 20. |
+| `LOG_LEVEL` | What the server prints to Railway's log: `debug`, `info` (default), `warn` or `error`. |
 
 The full list with defaults is in `.env.example`. Database migrations run automatically on boot.
+
+**Debugging on Railway.** Railway shows only what the server prints to its console, and the server prints at
+`LOG_LEVEL` and above. Every request that changes something, every run and step, every approval, sign-in and
+live-view connection is logged at `info`; page reads and navigation land at `debug`. You do not need Railway to
+read it: **Monitoring › Logs** in the app tails the server live, keeps the last 2000 lines at every level
+(including `debug`) since the server started, filters by level and part, and can raise what the console prints
+without a redeploy. The buffer is in memory, so a restart clears it; set `LOG_LEVEL=debug` when you want
+everything in Railway's log as well.
 
 ### Locally
 
@@ -190,6 +207,9 @@ shell script, a Claude Code routine prompt block and an MCP server for Cowork.
 - **Live** (`src/live.ts`, `src/browser/live.ts`): server-sent events for state, a WebSocket screencast of the
   tab the agent works in with input replayed back. Chromium keeps one persistent profile per deployment; sign-ins
   are backed up and restored across redeploys.
+- **Logs** (`src/logger.ts`): one logger for every part, printing at `LOG_LEVEL` and keeping the last 2000 lines
+  in memory; each line is also sent over the event stream, which is what the Logs view tails (`GET /api/logs`,
+  `PUT /api/logs/level`).
 
 ## Security notes
 

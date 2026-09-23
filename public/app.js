@@ -137,6 +137,7 @@
     conversations = h.conversations;
     approvalMode = h.approvalMode;
     browserState = h.browser;
+    live.state = h.browser; // the freshest snapshot; the socket and the stream only replace it with newer ones
     overview = h.overview;
     agents = h.agents || [];
     runningRuns.clear();
@@ -144,6 +145,22 @@
     if (conversationId === null) { current = null; messages = []; }
     else { current = h.conversation; messages = h.messages; }
     renderAll();
+    if (adoptSignIn()) {
+      renderRibbons();
+      toast(`A sign-in to ${aiName(signingIn.platform)} is still open on the cloud desktop. Continue it in the browser panel, or cancel it there.`);
+    }
+  }
+  /**
+   * A desktop sign-in the server still has open (this page was reloaded, or the tab was closed
+   * while it ran) is picked up again rather than lost: the server owns that state, not the page.
+   */
+  function adoptSignIn() {
+    const s = browserState?.signIn;
+    if (!s) return false;
+    if (signingIn && signingIn.platform === s.platform && signingIn.mode === "desktop") return false;
+    const opts = home?.signInOptions || {};
+    signingIn = { platform: s.platform, mode: "desktop", vnc: opts.vnc, desktopOk: true, resumed: true };
+    return true;
   }
   function renderAll() {
     renderAiList();
@@ -184,7 +201,9 @@
       if (view === "overview") renderView();
     } catch (err) { fail(err); }
   }, 400);
-  const refreshView = debounce(() => { if (view !== "chat") renderView(); }, 500);
+  // The logs view tails the stream itself; re-rendering it on every run event would lose the reader's place.
+  const refreshView = debounce(() => { if (view !== "chat" && view !== "logs") renderView(); }, 500);
+  const logFilter = () => ({ level: store.get("acp-log-level", "info"), scope: store.get("acp-log-scope", "") });
 
   /* ---------- live updates (server-sent events) ---------- */
   let es = null;
@@ -210,16 +229,23 @@
       renderAiList(); renderTargets(); refreshOverview();
     });
     es.addEventListener("browser", (e) => {
+      const next = JSON.parse(e.data);
+      if (browserState && typeof next.seq === "number" && typeof browserState.seq === "number" && next.seq < browserState.seq) return; // older than what the live-view socket already delivered
       const before = browserState?.signIn;
-      browserState = JSON.parse(e.data);
+      browserState = next;
+      live.state = next;
       // A desktop sign-in that ended on its own (window closed, or timed out): check where we stand.
       if (before && !browserState.signIn && signingIn?.mode === "desktop" && signingIn.platform === before.platform) {
         const id = before.platform;
         signingIn = null;
         api(`/connections/${id}/check`, { method: "POST", body: {} }).then((r) => toast(r.status === "logged_in" ? `${r.name} is connected.` : `The sign-in window for ${r.name} closed before you were signed in. Start it again when you are ready.`, r.status === "logged_in" ? "ok" : "bad")).catch(() => null);
       }
+      // A desktop sign-in started or cancelled from another tab: this page follows the server.
+      if (!browserState.signIn && signingIn?.resumed) signingIn = null;
+      adoptSignIn();
       renderAiList(); renderEngine(); renderTabs(); renderRibbons(); renderLiveContext();
     });
+    es.addEventListener("log", (e) => { if (view === "logs") Views.appendLog(JSON.parse(e.data), $("#view"), logFilter()); });
     es.addEventListener("conversation", (e) => {
       const { action, conversation: c } = JSON.parse(e.data);
       if (action === "deleted") {
@@ -348,7 +374,7 @@
     return { name: name || "chat", filter: filter ? decodeURIComponent(filter) : "" };
   }
   window.addEventListener("hashchange", () => { const h = viewFromHash(); if (h.name !== view || h.filter !== viewFilter) setView(h.name, h.filter); });
-  const viewCtx = { api, esc, icon, rel, dur, aiName, conn, get filter() { return viewFilter; }, set filter(v) { viewFilter = v; }, overview: null };
+  const viewCtx = { api, esc, icon, rel, dur, aiName, conn, store, get filter() { return viewFilter; }, set filter(v) { viewFilter = v; }, overview: null };
   let viewSeq = 0;
   async function renderView() {
     const root = $("#view");
@@ -359,7 +385,7 @@
       await Views.render(view, tmp, viewCtx);
       if (seq !== viewSeq) return; // a newer render is on its way
       root.innerHTML = tmp.innerHTML;
-      root.scrollTop = keepScroll;
+      root.scrollTop = view === "logs" ? root.scrollHeight : keepScroll; // a log reads newest-last, like a terminal
       tickTimers();
     } catch (err) {
       if (seq === viewSeq) root.innerHTML = `<div class="view-empty"><strong>Could not load this view</strong><span>${esc(err.message)}</span></div>`;
@@ -371,16 +397,21 @@
     const busyP = browserState?.busy?.platform;
     const rows = connections.filter((c) => c.appUrl || c.builtin).map((c) => {
       const st = statusOf(c);
-      const busyLabel = busyP === c.id ? browserState.busy.label : null;
+      const signingHere = browserState?.signIn?.platform === c.id;
+      const busyLabel = signingHere ? "Sign-in open on the cloud desktop" : busyP === c.id ? browserState.busy.label : null;
       const showing = browserState?.active === c.id && browserState?.pages?.some((p) => p.platform === c.id);
+      const signInButtons = signingHere
+        ? `<button class="btn small" data-signin-resume="${c.id}">${icon("panel", "sm")} Continue the sign-in</button><button class="btn small" data-signin-cancel="${c.id}">${icon("close", "sm")} Cancel the sign-in</button>`
+        : `${c.status === "logged_in" ? `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in${c.signInMode === "desktop" ? " (cloud desktop)" : ""}</button>`}
+          ${c.signInMode === "desktop" ? `<button class="btn small" data-connect="${c.id}" data-mode="live">${icon("eye", "sm")} Sign in in the live view</button>` : `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>`}`;
       return `<div class="ai-row ${target === c.id ? "active" : ""}" data-ai="${c.id}" role="button" tabindex="0" title="${target === c.id ? "Sending to this AI. Click to go back to Auto." : `Send your next message to ${esc(c.name)}`}">
         <span class="avatar ${esc(c.id)}">${esc(c.name.slice(0, 1))}</span>
         <div class="info"><div class="name">${esc(c.name)}${showing ? `<span class="muted" title="Showing in the browser panel">${icon("eye", "sm")}</span>` : ""}</div>
         <div class="sub ${busyLabel ? "busy" : ""}">${esc(busyLabel || st.label)}${c.lastError && c.status !== "logged_in" && !busyLabel ? ` · ${esc(c.lastError)}` : ""}</div></div>
         <span class="dot ${busyLabel ? "run" : st.dot}"></span>
         <details class="menu"><summary class="btn icon ghost" aria-label="More" style="width:24px;height:24px">${icon("more", "sm")}</summary><div class="menu-list">
-          ${c.status === "logged_in" ? `<button class="btn small" data-view-ai="${c.id}">${icon("eye", "sm")} Show in browser</button><button class="btn small" data-check="${c.id}">${icon("check", "sm")} Check sign-in</button>${c.canSync ? `<button class="btn small" data-refresh="${c.id}">${icon("reload", "sm")} Look at its tasks now</button>` : ""}<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in${c.signInMode === "desktop" ? " (cloud desktop)" : ""}</button>`}
-          ${c.signInMode === "desktop" ? `<button class="btn small" data-connect="${c.id}" data-mode="live">${icon("eye", "sm")} Sign in in the live view</button>` : `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>`}
+          ${c.status === "logged_in" && !signingHere ? `<button class="btn small" data-view-ai="${c.id}">${icon("eye", "sm")} Show in browser</button><button class="btn small" data-check="${c.id}">${icon("check", "sm")} Check sign-in</button>${c.canSync ? `<button class="btn small" data-refresh="${c.id}">${icon("reload", "sm")} Look at its tasks now</button>` : ""}` : ""}
+          ${signInButtons}
           <a class="btn small" href="#tasks" data-nav="tasks">${icon("tasks", "sm")} Its tasks</a>
           <button class="btn small" data-open-settings="ai" data-ai-id="${c.id}">${icon("edit", "sm")} Edit</button>
           <button class="btn small danger" data-remove="${c.id}">${icon("trash", "sm")} Remove</button></div></details>
@@ -688,9 +719,9 @@
         if (!frame.getAttribute("src")) frame.src = signingIn.vnc.url;
         frame.hidden = !desktopActive;
         $("#viewport").classList.toggle("desktop", desktopActive);
-        $("#signin-text").textContent = desktopActive ? `A plain browser window is open on the cloud desktop with ${name}, without any automation attached. Sign in there as you normally do; when you can see your chats, press` : `Preparing the cloud desktop for ${name}…`;
+        $("#signin-text").textContent = !desktopActive ? `Preparing the cloud desktop for ${name}…` : signingIn.resumed ? `The sign-in window for ${name} is still open on the cloud desktop from earlier. Carry on there; when you can see your chats, press` : `A plain browser window is open on the cloud desktop with ${name}, without any automation attached. Sign in there as you normally do; when you can see your chats, press`;
       } else {
-        $("#signin-text").textContent = desktopActive ? `A plain browser window with ${name} is open on the server's desktop. Sign in there; when you can see your chats, press` : `Preparing a browser window for ${name}…`;
+        $("#signin-text").textContent = !desktopActive ? `Preparing a browser window for ${name}…` : signingIn.resumed ? `The sign-in window for ${name} is still open on the server's desktop from earlier. When you can see your chats there, press` : `A plain browser window with ${name} is open on the server's desktop. Sign in there; when you can see your chats, press`;
       }
       $("#btn-signin-desktop").hidden = true;
     } else {
@@ -724,7 +755,11 @@
     const el = $("#viewport-msg");
     const st = live.status();
     if (st.kind === "off") { el.hidden = false; el.innerHTML = `<strong>The browser is off on this deployment</strong><span>Run the Docker image (or set BROWSER_ENABLED=true) to watch and drive your AIs here.</span>`; }
-    else if (st.kind === "desktop") { el.hidden = !!(signingIn && signingIn.mode === "desktop" && signingIn.vnc?.available); if (!el.hidden) el.innerHTML = `<strong>Sign-in in progress on the cloud desktop</strong><span>The live view resumes when it is finished.</span>`; }
+    else if (st.kind === "desktop") {
+      el.hidden = !!(signingIn && signingIn.mode === "desktop" && signingIn.vnc?.available);
+      const id = browserState?.signIn?.platform;
+      if (!el.hidden) el.innerHTML = `<strong>Sign-in to ${esc(aiName(id))} in progress on the cloud desktop</strong><span>${signingIn?.vnc && !signingIn.vnc.available ? "The desktop view is not reachable from here, so the window cannot be shown. Finish it there, or cancel it." : "The live view resumes when it is finished."}</span><span class="row" style="justify-content:center;margin-top:8px"><button class="btn xs" data-signin-resume="${esc(id)}">Continue the sign-in</button><button class="btn xs ghost" data-signin-cancel="${esc(id)}">Cancel it</button></span>`;
+    }
     else if (st.kind === "down") { el.hidden = false; el.innerHTML = `<strong>${esc(st.text)}</strong><span>The live view reconnects on its own.</span>`; }
     else if (st.kind === "idle") { el.hidden = false; el.innerHTML = `<strong>Nothing open yet</strong><span>Send a message, or sign in to a provider from the left, and its tab shows up here.</span>`; }
     else el.hidden = true;
@@ -776,9 +811,10 @@
     renderRibbons();
     try {
       const r = await api(`/connections/${id}/signin`, { method: "POST", body: { mode: "desktop" } });
-      signingIn = { platform: id, mode: "desktop", vnc: r.vnc, desktopOk: true };
+      const resumed = !!(r.signIn && r.signIn.since && Date.now() - new Date(r.signIn.since).getTime() > 15_000);
+      signingIn = { platform: id, mode: "desktop", vnc: r.vnc, desktopOk: true, resumed };
       renderRibbons(); renderTabs();
-      toast(r.vnc?.available ? `Sign in to ${c?.name || id} in the desktop window.` : `A browser window with ${c?.name || id} opened on the server's desktop.`);
+      toast(resumed ? `Back in the sign-in window for ${c?.name || id}.` : r.vnc?.available ? `Sign in to ${c?.name || id} in the desktop window.` : `A browser window with ${c?.name || id} opened on the server's desktop.`);
     } catch (err) { signingIn = null; renderRibbons(); fail(err); }
   }
   $("#btn-signin-desktop").addEventListener("click", () => { if (signingIn) startDesktopSignIn(signingIn.platform); });
@@ -803,12 +839,20 @@
       });
     } catch (err) { fail(err); }
   });
-  $("#btn-signin-dismiss").addEventListener("click", async () => {
+  $("#btn-signin-dismiss").addEventListener("click", () => cancelSignIn(signingIn?.platform));
+  /** Cancel a sign-in wherever it was started from: this page, another tab, or a tab that was closed. */
+  async function cancelSignIn(id) {
     const s = signingIn;
     signingIn = null;
     renderRibbons();
-    if (s?.mode === "desktop") await api(`/connections/${s.platform}/signin/cancel`, { method: "POST", body: {} }).catch(() => null);
-  });
+    const platform = id || s?.platform;
+    if (s?.mode === "desktop" || browserState?.signIn?.platform === platform) {
+      try {
+        await api(`/connections/${platform}/signin/cancel`, { method: "POST", body: {} });
+        toast(`The sign-in to ${aiName(platform)} was cancelled. Start it again whenever you are ready.`);
+      } catch (err) { fail(err); }
+    }
+  }
 
   /* ---------- add a provider ---------- */
   $("#btn-add-ai").addEventListener("click", () => { $("#add-modal").hidden = false; $("#add-name").focus(); });
@@ -980,7 +1024,7 @@ curl -X POST ${base}/api/ingest \\
   /* ---------- global clicks ---------- */
   document.addEventListener("click", async (e) => {
     for (const d of $$("details.menu[open]")) if (!d.contains(e.target)) d.removeAttribute("open");
-    const t = e.target.closest("[data-send],[data-del],[data-connect],[data-view-ai],[data-check],[data-refresh],[data-remove],[data-read],[data-read-all],[data-shot],[data-open-settings],[data-close],[data-approve],[data-approve-id],[data-cancel],[data-stop-run],[data-run-task],[data-pause-task],[data-resume-task],[data-sync-all],[data-toggle],[data-conv],[data-rename],[data-delete-conv],[data-ai],[data-example],[data-nav],[data-filter],[data-filter-clear],[data-open-run],[data-open-task],[data-open-agent]");
+    const t = e.target.closest("[data-send],[data-del],[data-connect],[data-signin-resume],[data-signin-cancel],[data-view-ai],[data-check],[data-refresh],[data-remove],[data-read],[data-read-all],[data-shot],[data-open-settings],[data-close],[data-approve],[data-approve-id],[data-cancel],[data-stop-run],[data-run-task],[data-pause-task],[data-resume-task],[data-sync-all],[data-toggle],[data-conv],[data-rename],[data-delete-conv],[data-ai],[data-example],[data-nav],[data-filter],[data-filter-clear],[data-open-run],[data-open-task],[data-open-agent],[data-log-clear]");
     if (!t) {
       const ov = e.target.closest("[data-close-on-click]");
       if (ov && e.target === ov) ov.hidden = true;
@@ -1011,6 +1055,9 @@ curl -X POST ${base}/api/ingest \\
       else if (d.deleteConv) { if (confirm("Delete this chat and its messages?")) await api(`/conversations/${d.deleteConv}`, { method: "DELETE" }); }
       else if (d.ai !== undefined) { const c = conn(d.ai); setTarget(target === d.ai ? "" : d.ai); if (c && browserState?.pages?.some((p) => p.platform === c.id)) { live.watch(c.id); renderTabs(); } }
       else if (d.connect) { if (t.closest(".overlay")) t.closest(".overlay").hidden = true; await startSignIn(d.connect, d.mode || null); }
+      else if (d.signinResume) { showBrowser(); await startDesktopSignIn(d.signinResume); } // the server hands back the sign-in already open for this provider
+      else if (d.signinCancel) { await busy(btn, () => cancelSignIn(d.signinCancel)); }
+      else if (d.logClear !== undefined) { const l = $("#log-lines"); if (l) l.innerHTML = ""; }
       else if (d.viewAi) { showBrowser(); if (browserState?.pages?.some((p) => p.platform === d.viewAi)) live.watch(d.viewAi); else { await api("/browser/open", { method: "POST", body: { platform: d.viewAi, url: conn(d.viewAi)?.appUrl } }); live.watch(d.viewAi); } renderTabs(); }
       else if (d.check) { await busy(btn, async () => { const r = await api(`/connections/${d.check}/check`, { method: "POST", body: {} }); toast(r.status === "logged_in" ? `${r.name} is connected.` : `${r.name} is signed out.`, r.status === "logged_in" ? "ok" : "bad"); }); }
       else if (d.refresh) { await busy(btn, async () => { const c = conn(d.refresh); if (c?.canSync) await api(`/platforms/${c.id}/sync`, { method: "POST" }); else await api(`/connections/${d.refresh}/check`, { method: "POST", body: {} }); }); refreshView(); }
@@ -1024,6 +1071,16 @@ curl -X POST ${base}/api/ingest \\
       else if (d.openTask) { if (e.target.closest("button, a, details")) return; await toggleDetail("task", Number(d.openTask), t); }
       else if (d.openAgent) { if (e.target.closest("button, a")) return; await toggleDetail("agent", Number(d.openAgent), t); }
     } catch (err) { fail(err); }
+  });
+  // The logs view's filters; the console level is a server setting and is audited.
+  $("#view").addEventListener("change", async (e) => {
+    const t = e.target;
+    if (!(t instanceof HTMLSelectElement)) return;
+    if (t.dataset.logLevel !== undefined) { store.set("acp-log-level", t.value); renderView(); }
+    else if (t.dataset.logScope !== undefined) { store.set("acp-log-scope", t.value); renderView(); }
+    else if (t.dataset.consoleLevel !== undefined) {
+      try { await api("/logs/level", { method: "PUT", body: { level: t.value } }); toast(`The server now prints ${t.value} and above to its console.`, "ok"); } catch (err) { fail(err); }
+    }
   });
   $("#lc-stop").addEventListener("click", async (e) => {
     const id = Number(e.currentTarget.dataset.stopRun);

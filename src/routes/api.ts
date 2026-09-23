@@ -63,6 +63,7 @@ import { streamClients, streamHandler } from "../live.js";
 import { routeMessage } from "../router.js";
 import { handleControl } from "../answers.js";
 import { classifyIntent } from "../intents.js";
+import { logLevel, logScopes, recentLogs, setLogLevel, type Level } from "../logger.js";
 import { activity, overview } from "../overview.js";
 import { beginRun, endRun, requestCancel, runForMessage, RunTracker } from "../runs.js";
 import { listTaskViews, startTask, taskView } from "../tasks.js";
@@ -711,6 +712,8 @@ api.get("/home", async (req, res) => {
     approvals: pendingApprovals().map(approvalView),
     agents: listAgentProfiles(),
     overview: overview(),
+    // So a reloaded page can pick up a desktop sign-in that is still in progress.
+    signInOptions: { desktop: browser.canDesktopSignIn(), vnc: { available: await vncAvailable(), url: VNC_PATH } },
     attention,
     activity,
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
@@ -750,6 +753,20 @@ api.post("/settings/password", (req, res) => {
 });
 /** Who did what: logins, approvals, policy changes, exports, live-view control. */
 api.get("/audit", (req, res) => res.json(listAudit({ limit: num(req.query.limit, 100), action: typeof req.query.action === "string" ? req.query.action : undefined })));
+/** The server log, from memory: the last lines at any level, for debugging from inside the product. */
+api.get("/logs", (req, res) => {
+  const level = typeof req.query.level === "string" && ["debug", "info", "warn", "error"].includes(req.query.level) ? (req.query.level as Level) : undefined;
+  res.json({ level: logLevel(), scopes: logScopes(), lines: recentLogs({ limit: num(req.query.limit, 500), level, scope: typeof req.query.scope === "string" ? req.query.scope : undefined, after: req.query.after ? num(req.query.after, 0) : undefined }) });
+});
+api.put("/logs/level", (req, res, next) => {
+  try {
+    const level = setLogLevel(String(req.body?.level ?? ""));
+    addAudit({ actor: "you", action: "log.level", detail: level });
+    res.json({ level });
+  } catch (err) {
+    next(err);
+  }
+});
 api.post("/settings/ingest-token/rotate", (_req, res) => res.json({ ingestToken: rotateIngestToken(), fromEnv: !!process.env.ACP_INGEST_TOKEN }));
 
 /* ---------- messages (instructions from you, routed to agents) ---------- */

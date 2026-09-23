@@ -189,6 +189,27 @@ describe("workspace end to end", { timeout: 600_000 }, () => {
     }
   });
 
+  it("keeps a server log you can read from the product, and tells a reloaded page how to reach a sign-in", async () => {
+    const home = await s.api("/home");
+    assert.equal(home.signInOptions.desktop.ok, false, "headless here; a page can still learn where the desktop view would be");
+    assert.match(home.signInOptions.vnc.url, /^\/vnc\//);
+    await s.api("/connections/mock-ai/check", { body: {} }); // a POST lands in the request log
+    const logs = await s.api("/logs?limit=200");
+    assert.ok(Array.isArray(logs.lines) && logs.lines.length > 0);
+    assert.ok(logs.lines.some((l: any) => l.scope === "server" && /POST \/api\/connections\/mock-ai\/check → 200/.test(l.msg)), "requests that change something are logged with their outcome");
+    assert.ok(logs.scopes.includes("server"));
+    const warnOnly = await s.api("/logs?level=warn&limit=200");
+    assert.ok(warnOnly.lines.every((l: any) => l.level === "warn" || l.level === "error"));
+    const set = await s.api("/logs/level", { method: "PUT", body: { level: "debug" } });
+    assert.equal(set.level, "debug");
+    assert.equal((await s.api("/logs?limit=1")).level, "debug");
+    const bad = await s.raw("/api/logs/level", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ level: "loud" }) });
+    assert.equal(bad.status, 400);
+    await s.api("/logs/level", { method: "PUT", body: { level: "info" } });
+    const audit = await s.api("/audit?action=log.level");
+    assert.ok(audit.length >= 2, "changing what the console prints is audited");
+  });
+
   it("custom agents register, report runs under a named profile, and appear beside the assistants", async () => {
     const token = (await s.api("/settings")).ingestToken;
     const ingest = (p: string, body: unknown) => fetch(`${s.base}/api${p}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, data: await r.json() }));

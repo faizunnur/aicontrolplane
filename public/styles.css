@@ -322,6 +322,24 @@ label.btn { margin: 0; color: var(--text); }
 .view { flex: 1; overflow-y: auto; min-height: 0; padding: 18px 20px 32px; }
 .view > * { max-width: 960px; margin-left: auto; margin-right: auto; }
 .vhead { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.vhead.wrap { flex-wrap: wrap; row-gap: 8px; }
+.vhead label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.vhead select { width: auto; padding: 3px 8px; font-size: 12px; }
+/* the server log, read like a terminal: newest last */
+.loglist { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); font-family: var(--mono); font-size: 12px; }
+.loglist:empty { display: none; }
+.log-line { display: grid; grid-template-columns: 62px 42px 76px minmax(0, 1fr); gap: 8px; padding: 3px 10px; border-top: 1px solid var(--border); line-height: 1.45; align-items: baseline; }
+.log-line:first-child { border-top: 0; }
+.log-line .t { color: var(--muted); font-size: 11px; }
+.log-line .lv { font-weight: 600; text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.04em; color: var(--muted); }
+.log-line.lv-debug { color: var(--text-2); }
+.log-line.lv-warn .lv { color: var(--warn); }
+.log-line.lv-error .lv { color: var(--bad); }
+.log-line.lv-error { background: color-mix(in srgb, var(--bad) 6%, transparent); }
+.log-line .sc { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-line .m { overflow-wrap: anywhere; white-space: pre-wrap; }
+.log-line .x { display: block; color: var(--muted); font-size: 11px; max-height: 9em; overflow: auto; margin-top: 2px; }
+@media (max-width: 720px) { .log-line { grid-template-columns: 56px minmax(0, 1fr); } .log-line .lv, .log-line .sc { display: none; } }
 .vsec { margin-bottom: 22px; }
 .vsec h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); display: flex; gap: 8px; align-items: center; }
 .vsec h3 .muted { font-weight: 500; letter-spacing: 0; text-transform: none; }
