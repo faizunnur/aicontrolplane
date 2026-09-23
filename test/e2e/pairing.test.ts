@@ -44,7 +44,8 @@ describe("sign in from your own computer", { timeout: 300_000 }, () => {
     assert.equal(made.secure, true, "loopback counts as safe for the helper");
     // A computer with no copy of the project fetches the helper from the deployment itself.
     assert.equal(made.connect.helperUrl, `${s.base}/connect.mjs`);
-    assert.match(made.connect.windows, /^irm http:\/\/127\.0\.0\.1:\d+\/connect\.mjs -OutFile acp-connect\.mjs; node acp-connect\.mjs http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
+    // Two lines with curl.exe: the one form that runs in Command Prompt and in PowerShell alike.
+    assert.match(made.connect.windows, /^curl\.exe -fsSL http:\/\/127\.0\.0\.1:\d+\/connect\.mjs -o acp-connect\.mjs\nnode acp-connect\.mjs http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
     assert.match(made.connect.unix, /^curl -fsSL http:\/\/127\.0\.0\.1:\d+\/connect\.mjs -o acp-connect\.mjs && node acp-connect\.mjs http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
     assert.match(made.connect.repo, /^npm run connect -- http:\/\/127\.0\.0\.1:\d+ [A-Z2-9-]+$/);
     const helper = await s.raw("/connect.mjs", { headers: { cookie: "" } });
@@ -106,7 +107,7 @@ describe("sign in from your own computer", { timeout: 300_000 }, () => {
       assert.equal(made.secure, true);
       assert.equal(made.connect.helperUrl, "https://acp.example.test/connect.mjs");
       assert.equal(made.connect.unix, `curl -fsSL https://acp.example.test/connect.mjs -o acp-connect.mjs && node acp-connect.mjs https://acp.example.test ${made.code}`);
-      assert.equal(made.connect.windows, `irm https://acp.example.test/connect.mjs -OutFile acp-connect.mjs; node acp-connect.mjs https://acp.example.test ${made.code}`);
+      assert.equal(made.connect.windows, `curl.exe -fsSL https://acp.example.test/connect.mjs -o acp-connect.mjs\nnode acp-connect.mjs https://acp.example.test ${made.code}`);
       assert.equal(made.connect.repo, `npm run connect -- https://acp.example.test ${made.code}`);
       assert.equal((await pinned.api("/diagnostics")).publicUrlSource, "env");
     } finally {

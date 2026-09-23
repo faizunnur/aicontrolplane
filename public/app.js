@@ -210,6 +210,7 @@
     const [text, tone] = texts[st] || [st, ""];
     $("#pairing-title").textContent = `Connect ${name} from your computer`;
     $("#pairing-command").textContent = pairingCommand();
+    $("#pairing-shell").textContent = pairingOs === "windows" ? "Both lines, in Command Prompt or PowerShell." : "";
     $("#pairing-repo").textContent = pairing.connect?.repo || "";
     for (const b of $$("#pairing-os [data-os]")) { b.classList.toggle("primary", b.dataset.os === pairingOs); b.classList.toggle("ghost", b.dataset.os !== pairingOs); }
     // Which address the command carries, and where it came from: a wrong one is otherwise invisible.

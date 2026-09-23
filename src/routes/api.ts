@@ -575,7 +575,10 @@ api.post("/connections/:id/pairing", (req, res, next) => {
     const helperUrl = `${base}/connect.mjs`;
     const connect = {
       helperUrl,
-      windows: `irm ${helperUrl} -OutFile acp-connect.mjs; node acp-connect.mjs ${base} ${code}`,
+      // Two lines, and curl.exe rather than curl: Command Prompt has no "irm", Windows PowerShell has
+      // no "&&", and plain "curl" in PowerShell is an alias for Invoke-WebRequest, which rejects these
+      // flags. This pair is the one form that works in both shells as it stands.
+      windows: `curl.exe -fsSL ${helperUrl} -o acp-connect.mjs\nnode acp-connect.mjs ${base} ${code}`,
       unix: `curl -fsSL ${helperUrl} -o acp-connect.mjs && node acp-connect.mjs ${base} ${code}`,
       repo: `npm run connect -- ${base} ${code}`,
     };

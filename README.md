@@ -73,9 +73,10 @@ sees a check fail:
   a plain window). Open the provider's menu, choose "Connect from this computer", and run the one-line command
   the panel shows, on whichever computer you want to sign in from:
 
-  ```powershell
-  # Windows (PowerShell)
-  irm https://your-app.up.railway.app/connect.mjs -OutFile acp-connect.mjs; node acp-connect.mjs https://your-app.up.railway.app ABCD-EFGH
+  ```bat
+  :: Windows, in Command Prompt or PowerShell: both lines
+  curl.exe -fsSL https://your-app.up.railway.app/connect.mjs -o acp-connect.mjs
+  node acp-connect.mjs https://your-app.up.railway.app ABCD-EFGH
   ```
   ```bash
   # macOS or Linux
