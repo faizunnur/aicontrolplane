@@ -165,6 +165,30 @@ describe("workspace end to end", { timeout: 600_000 }, () => {
     }
   });
 
+  it("recognises a sign-in page blocked by a bot check and offers the desktop mode", async () => {
+    mock.setSignedIn(false);
+    mock.setChallenge(true);
+    try {
+      const r = await s.api("/connections/mock-ai/connect", { body: {} });
+      assert.equal(r.mode, "live");
+      assert.equal(r.challenge, "cloudflare");
+      assert.equal(r.blocked, true);
+      assert.equal(r.preferred, "live", "an unknown provider starts in the live view");
+      assert.equal(r.desktop.ok, false, "the test server runs headless: no desktop to sign in on");
+      assert.match(r.desktop.reason, /without a display/);
+      const desk = await s.raw("/api/connections/mock-ai/signin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "desktop" }) });
+      assert.equal(desk.status, 409);
+      const audit = await s.api("/audit?action=signin.blocked");
+      assert.ok(audit.some((a: any) => a.target === "mock-ai"));
+      const grok = (await s.api("/providers")).find((p: any) => p.id === "grok") ?? (await s.api("/providers/grok"));
+      assert.ok(grok, "grok is still known even if hidden");
+    } finally {
+      mock.setChallenge(false);
+      mock.setSignedIn(true);
+      await s.api("/connections/mock-ai/check", { body: {} });
+    }
+  });
+
   it("custom agents register, report runs under a named profile, and appear beside the assistants", async () => {
     const token = (await s.api("/settings")).ingestToken;
     const ingest = (p: string, body: unknown) => fetch(`${s.base}/api${p}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, data: await r.json() }));

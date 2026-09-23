@@ -5,6 +5,7 @@ import {
   type CapabilityNotes,
   type ChatResult,
   type ConnectionStatus,
+  type ConnectResult,
   type ExecutionContext,
   type ProviderAdapter,
   type ProviderCapabilities,
@@ -12,6 +13,7 @@ import {
   type ProviderOperation,
   type RunTaskInput,
   type RunTaskResult,
+  type SignInMode,
   type TaskListResult,
   type TaskRef,
 } from "./types.js";
@@ -77,8 +79,11 @@ export class CustomProviderAdapter implements ProviderAdapter {
   connectionStatus(): ConnectionStatus {
     return { status: "none", lastCheckedAt: null, lastError: null };
   }
-  async connect(): Promise<void> {
+  async connect(): Promise<ConnectResult> {
     throw this.unsupported("signIn");
+  }
+  preferredSignIn(): SignInMode {
+    return "live";
   }
   async checkAuth(): Promise<SessionStatus> {
     throw this.unsupported("checkAuth");

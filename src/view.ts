@@ -44,6 +44,7 @@ export function connectionCard(p: PlatformConfig) {
     capabilities: adapter?.capabilities() ?? null,
     canChat: adapter ? adapter.supports("chat") : !!p.composerSelector,
     canSync: adapter ? adapter.supports("listTasks") : !!p.tasksUrl,
+    signInMode: adapter?.preferredSignIn() ?? "live",
     builtin: adapter?.builtin ?? false,
     status, // logged_in | needs_login | error | unknown | none
     lastSync: s.last_sync_at,

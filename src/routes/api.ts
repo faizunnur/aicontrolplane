@@ -50,6 +50,7 @@ import {
   recordRun,
   runStats,
   schemaVersion,
+  setSetting,
   updateAgentProfile,
   updateTask,
   updateConversation,
@@ -477,13 +478,72 @@ api.post("/connections/:id/restore", (req, res) => {
   const p = getPlatform(req.params.id);
   res.json(p ? connectionCard(p) : { ok: true });
 });
+/* ---------- signing in ----------
+   live:    the provider's site opens in its automated tab and the live view shows it.
+   desktop: the automation steps aside and a plain browser window opens on the cloud display
+            (shown through the desktop view) for sites whose sign-in page has a bot check. */
+
+const VNC_PATH = "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1";
+let vncProbe: { at: number; ok: boolean } | null = null;
+/** Is the desktop view (noVNC bridge) reachable? Probed at most every 30 seconds. */
+async function vncAvailable(): Promise<boolean> {
+  if (vncProbe && Date.now() - vncProbe.at < 30_000) return vncProbe.ok;
+  let ok = false;
+  try {
+    const r = await fetch(config.vnc.target + "/vnc.html", { method: "HEAD", signal: AbortSignal.timeout(800) });
+    ok = r.ok;
+  } catch {
+    ok = false;
+  }
+  vncProbe = { at: Date.now(), ok };
+  return ok;
+}
+const signInOptions = async (a: ReturnType<typeof requireProvider>) => ({ preferred: a.preferredSignIn(), desktop: browser.canDesktopSignIn(), vnc: { available: await vncAvailable(), url: VNC_PATH } });
+
 /** Bring the AI's sign-in page up in its tab; the live view then shows that tab for the user to sign in. */
 api.post("/connections/:id/connect", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
-    await a.connect();
-    res.json({ ok: true, platform: a.id, screen: "/vnc/vnc.html?autoconnect=1&resize=scale&path=vnc/websockify&reconnect=1" });
+    const found = await a.connect();
+    if (found.blocked) addAudit({ actor: "system", action: "signin.blocked", target: a.id, detail: found.challenge });
+    res.json({ ok: true, platform: a.id, mode: "live", ...found, ...(await signInOptions(a)), screen: VNC_PATH });
+  } catch (err) {
+    next(err);
+  }
+});
+/** Desktop sign-in: open a plain browser window on the cloud display with the provider's site. */
+api.post("/connections/:id/signin", async (req, res, next) => {
+  try {
+    const a = requireProvider(req.params.id);
+    if (!a.supports("signIn")) throw a.unsupported("signIn");
+    const c = a.config();
+    const signIn = await browser.startDesktopSignIn(c.id, c.name, c.appUrl);
+    addAudit({ actor: "you", action: "signin.desktop_started", target: a.id });
+    res.json({ ok: true, platform: a.id, mode: "desktop", signIn, ...(await signInOptions(a)) });
+  } catch (err) {
+    next(err);
+  }
+});
+/** The user pressed "I'm signed in": close the plain window, hand the profile back, and check. */
+api.post("/connections/:id/signin/finish", async (req, res, next) => {
+  try {
+    const a = requireProvider(req.params.id);
+    const wasDesktop = await browser.finishDesktopSignIn();
+    const status = await a.checkAuth();
+    if (status === "logged_in") {
+      if (wasDesktop) setSetting(`signin_mode:${a.id}`, "desktop");
+      addAudit({ actor: "you", action: "signin.completed", target: a.id, detail: wasDesktop ? "desktop" : "live" });
+    }
+    res.json({ ...connectionCard(a.config()), status, mode: wasDesktop ? "desktop" : "live" });
+  } catch (err) {
+    next(err);
+  }
+});
+api.post("/connections/:id/signin/cancel", async (req, res, next) => {
+  try {
+    requireProvider(req.params.id);
+    res.json({ ok: await browser.cancelDesktopSignIn() });
   } catch (err) {
     next(err);
   }

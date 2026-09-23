@@ -36,3 +36,23 @@ export async function detectLoginState(p: PlatformConfig, page: Page, extra: { u
   }
   return "logged_in";
 }
+
+export interface ChallengeState {
+  /** A bot check is on the page. */
+  challenge: "cloudflare" | null;
+  /** It has already told the visitor it failed. */
+  blocked: boolean;
+}
+
+/**
+ * Is the page behind a bot check, and has it already failed? Cloudflare's Turnstile widget and
+ * interstitial are recognised; a failed one shows "Verification failed". A remote-controlled
+ * browser scores badly on these, which is what the desktop sign-in mode is for.
+ */
+export async function detectChallenge(page: Page): Promise<ChallengeState> {
+  const title = await page.title().catch(() => "");
+  const widget = await page.locator('iframe[src*="challenges.cloudflare.com"], #challenge-running, #challenge-error-text, #challenge-stage, .cf-turnstile, [id^="cf-chl"]').count().catch(() => 0);
+  const failed = await page.getByText(/verification failed|please refresh the page and try again|checking if the site connection is secure/i).count().catch(() => 0);
+  const challenge = widget > 0 || failed > 0 || /just a moment|attention required/i.test(title) ? "cloudflare" : null;
+  return { challenge, blocked: failed > 0 || /attention required/i.test(title) };
+}

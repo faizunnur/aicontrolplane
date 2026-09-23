@@ -58,6 +58,27 @@ execution header: which agent, on which provider, which task, the current action
 Stop button. When nothing is running you can click, type and scroll in the tab yourself; signing in to a
 provider happens right here.
 
+## Signing in, including sites with a bot check
+
+Most providers let you sign in inside the live view. Some guard their sign-in page with a bot check
+(Grok's accounts.x.ai uses Cloudflare Turnstile) that refuses a browser with a debugging session attached,
+which is exactly what a live view needs. For those the app has a second mode, and it switches to it on its own
+when it sees the check fail:
+
+- **Live view** (default): the provider's site opens in its automated tab and you sign in through the stream.
+- **Cloud desktop**: the automation closes its browser, opens the same profile in a plain Google Chrome window on
+  the cloud display, with no debugging session and no automation flags, and shows you that window. You sign in
+  as you would at home, press "I'm signed in", the window closes, and the automation takes the profile back with
+  your session in it. Grok starts in this mode; any provider that needed it once uses it next time.
+
+Nothing here pretends to be a different browser or solves a check for you; it removes the automation from the
+moment you type your password. A datacenter address can still be judged harshly by a strict check. If a
+provider refuses even the plain window, the last resort remains importing a session from your own computer
+(Settings › Saved sign-ins, or `npm run login` and `npm run push-state`).
+
+The Docker image installs Google Chrome and uses it for both modes, so sites see an ordinary browser and the
+profile never changes hands between two browser versions.
+
 ## Execution modes
 
 **Auto approve** lets the agent perform everyday actions on its own. **Ask me first** makes it pause before

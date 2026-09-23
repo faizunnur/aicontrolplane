@@ -40,6 +40,21 @@ export interface ConnectionStatus {
   lastError: string | null;
 }
 
+/** What connect() found on the sign-in page. */
+export interface ConnectResult {
+  /** A bot check guards the page. */
+  challenge: "cloudflare" | null;
+  /** The check has already refused this browser. */
+  blocked: boolean;
+}
+
+/**
+ * live     sign in inside the live view, in the automated browser (works for most sites)
+ * desktop  sign in in a plain browser window on the cloud desktop, automation stepped aside
+ *          (for sites whose sign-in page is guarded by a bot check)
+ */
+export type SignInMode = "live" | "desktop";
+
 /** What an execution carries with it so the adapter can report progress and honour approvals. */
 export interface ExecutionContext {
   /** Message that triggered the execution, when it came from the chat. */
@@ -162,9 +177,11 @@ export interface ProviderAdapter {
   supports(op: ProviderOperation): boolean;
   connectionStatus(): ConnectionStatus;
 
-  /** Bring the provider's site up in its tab so the user can sign in through the live view. */
-  connect(ctx?: ExecutionContext): Promise<void>;
+  /** Bring the provider's site up in its tab so the user can sign in through the live view, and say what guards it. */
+  connect(ctx?: ExecutionContext): Promise<ConnectResult>;
   checkAuth(ctx?: ExecutionContext): Promise<SessionStatus>;
+  /** The sign-in mode this provider is known to need. */
+  preferredSignIn(): SignInMode;
   sendMessage(text: string, ctx: ExecutionContext): Promise<ChatResult>;
   listTasks(ctx: ExecutionContext): Promise<TaskListResult>;
   runTask(task: TaskRef, ctx: ExecutionContext, input?: RunTaskInput): Promise<RunTaskResult>;

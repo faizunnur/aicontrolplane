@@ -170,9 +170,10 @@
       </div>
       <div class="viewport empty" id="viewport" tabindex="0" aria-label="Live browser screen. Click to interact.">
         <canvas id="screen" width="16" height="9"></canvas>
+        <iframe id="desktop-frame" class="desktop-frame" title="Cloud desktop" allow="clipboard-read; clipboard-write" hidden></iframe>
         <div class="viewport-msg" id="viewport-msg"><strong>Nothing open yet</strong><span>Send a message or sign in to an AI and the browser shows up here.</span></div>
         <div class="ribbon top busy" id="busy-ribbon" hidden><span class="dot run"></span><span class="txt" id="busy-text"></span><button class="btn xs" id="btn-control">Take control</button></div>
-        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn icon ghost" id="btn-signin-dismiss" style="width:22px;height:22px" aria-label="Dismiss"><svg class="ic sm"><use href="#i-close"/></svg></button></div>
+        <div class="ribbon bottom signin" id="signin-ribbon" hidden><span class="txt" id="signin-text">Sign in above, exactly as you normally do. When you can see your chats, press</span><button class="btn xs ghost" id="btn-signin-desktop" hidden title="Sites with a bot check refuse the automated browser; this opens a plain browser window on the cloud desktop instead">Use the cloud desktop</button><button class="btn xs primary" id="btn-signed-in">I'm signed in</button><button class="btn icon ghost" id="btn-signin-dismiss" style="width:22px;height:22px" aria-label="Cancel"><svg class="ic sm"><use href="#i-close"/></svg></button></div>
       </div>
       <div class="statusbar">
         <span class="dot" id="live-dot"></span>

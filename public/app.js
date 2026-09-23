@@ -22,7 +22,7 @@
   let agents = [];
   let view = "chat"; // chat | overview | agents | tasks | runs | approvals | activity | notifications
   let viewFilter = "";
-  let signingIn = null; // platform id while the sign-in ribbon shows
+  let signingIn = null; // { platform, mode: "live" | "desktop", vnc, desktopOk } while the sign-in ribbon shows
   const openActivity = new Map(); // message id -> user toggled open/closed
   const runningRuns = new Map(); // run id -> { ...run, current_step }
   const app = $("#app");
@@ -210,7 +210,14 @@
       renderAiList(); renderTargets(); refreshOverview();
     });
     es.addEventListener("browser", (e) => {
+      const before = browserState?.signIn;
       browserState = JSON.parse(e.data);
+      // A desktop sign-in that ended on its own (window closed, or timed out): check where we stand.
+      if (before && !browserState.signIn && signingIn?.mode === "desktop" && signingIn.platform === before.platform) {
+        const id = before.platform;
+        signingIn = null;
+        api(`/connections/${id}/check`, { method: "POST", body: {} }).then((r) => toast(r.status === "logged_in" ? `${r.name} is connected.` : `The sign-in window for ${r.name} closed before you were signed in. Start it again when you are ready.`, r.status === "logged_in" ? "ok" : "bad")).catch(() => null);
+      }
       renderAiList(); renderEngine(); renderTabs(); renderRibbons(); renderLiveContext();
     });
     es.addEventListener("conversation", (e) => {
@@ -372,7 +379,8 @@
         <div class="sub ${busyLabel ? "busy" : ""}">${esc(busyLabel || st.label)}${c.lastError && c.status !== "logged_in" && !busyLabel ? ` · ${esc(c.lastError)}` : ""}</div></div>
         <span class="dot ${busyLabel ? "run" : st.dot}"></span>
         <details class="menu"><summary class="btn icon ghost" aria-label="More" style="width:24px;height:24px">${icon("more", "sm")}</summary><div class="menu-list">
-          ${c.status === "logged_in" ? `<button class="btn small" data-view-ai="${c.id}">${icon("eye", "sm")} Show in browser</button><button class="btn small" data-check="${c.id}">${icon("check", "sm")} Check sign-in</button>${c.canSync ? `<button class="btn small" data-refresh="${c.id}">${icon("reload", "sm")} Look at its tasks now</button>` : ""}<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in</button>`}
+          ${c.status === "logged_in" ? `<button class="btn small" data-view-ai="${c.id}">${icon("eye", "sm")} Show in browser</button><button class="btn small" data-check="${c.id}">${icon("check", "sm")} Check sign-in</button>${c.canSync ? `<button class="btn small" data-refresh="${c.id}">${icon("reload", "sm")} Look at its tasks now</button>` : ""}<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in again</button>` : `<button class="btn small" data-connect="${c.id}">${icon("login", "sm")} Sign in${c.signInMode === "desktop" ? " (cloud desktop)" : ""}</button>`}
+          ${c.signInMode === "desktop" ? `<button class="btn small" data-connect="${c.id}" data-mode="live">${icon("eye", "sm")} Sign in in the live view</button>` : `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>`}
           <a class="btn small" href="#tasks" data-nav="tasks">${icon("tasks", "sm")} Its tasks</a>
           <button class="btn small" data-open-settings="ai" data-ai-id="${c.id}">${icon("edit", "sm")} Edit</button>
           <button class="btn small danger" data-remove="${c.id}">${icon("trash", "sm")} Remove</button></div></details>
@@ -658,8 +666,40 @@
       busyRibbon.hidden = true;
       if (live.override) live.setOverride(false);
     }
-    $("#signin-ribbon").hidden = !signingIn || live.meta?.platform !== signingIn;
+    renderSignIn();
     $("#viewport").classList.toggle("interactive", live.interactive);
+  }
+  /** The sign-in ribbon and, for a desktop sign-in, the cloud desktop in place of the screencast. */
+  function renderSignIn() {
+    const ribbon = $("#signin-ribbon");
+    const frame = $("#desktop-frame");
+    const desktopActive = !!browserState?.signIn;
+    if (!signingIn) {
+      ribbon.hidden = true;
+      frame.hidden = true;
+      frame.removeAttribute("src");
+      $("#viewport").classList.remove("desktop");
+      return;
+    }
+    const name = aiName(signingIn.platform);
+    if (signingIn.mode === "desktop") {
+      ribbon.hidden = false;
+      if (signingIn.vnc?.available) {
+        if (!frame.getAttribute("src")) frame.src = signingIn.vnc.url;
+        frame.hidden = !desktopActive;
+        $("#viewport").classList.toggle("desktop", desktopActive);
+        $("#signin-text").textContent = desktopActive ? `A plain browser window is open on the cloud desktop with ${name}, without any automation attached. Sign in there as you normally do; when you can see your chats, press` : `Preparing the cloud desktop for ${name}…`;
+      } else {
+        $("#signin-text").textContent = desktopActive ? `A plain browser window with ${name} is open on the server's desktop. Sign in there; when you can see your chats, press` : `Preparing a browser window for ${name}…`;
+      }
+      $("#btn-signin-desktop").hidden = true;
+    } else {
+      ribbon.hidden = live.meta?.platform !== signingIn.platform;
+      frame.hidden = true;
+      $("#viewport").classList.remove("desktop");
+      $("#signin-text").textContent = signingIn.challenge ? `${name}'s sign-in page has a bot check that may refuse an automated browser. Sign in above if it lets you; otherwise use the cloud desktop. When you can see your chats, press` : "Sign in above, exactly as you normally do. When you can see your chats, press";
+      $("#btn-signin-desktop").hidden = !signingIn.desktopOk;
+    }
   }
   $("#btn-control").addEventListener("click", () => { live.setOverride(!live.override); renderRibbons(); $("#viewport").focus({ preventScroll: true }); });
   /** The execution the browser panel is showing: agent, provider, task, current action, elapsed. */
@@ -684,6 +724,7 @@
     const el = $("#viewport-msg");
     const st = live.status();
     if (st.kind === "off") { el.hidden = false; el.innerHTML = `<strong>The browser is off on this deployment</strong><span>Run the Docker image (or set BROWSER_ENABLED=true) to watch and drive your AIs here.</span>`; }
+    else if (st.kind === "desktop") { el.hidden = !!(signingIn && signingIn.mode === "desktop" && signingIn.vnc?.available); if (!el.hidden) el.innerHTML = `<strong>Sign-in in progress on the cloud desktop</strong><span>The live view resumes when it is finished.</span>`; }
     else if (st.kind === "down") { el.hidden = false; el.innerHTML = `<strong>${esc(st.text)}</strong><span>The live view reconnects on its own.</span>`; }
     else if (st.kind === "idle") { el.hidden = false; el.innerHTML = `<strong>Nothing open yet</strong><span>Send a message, or sign in to a provider from the left, and its tab shows up here.</span>`; }
     else el.hidden = true;
@@ -705,39 +746,69 @@
   });
   document.addEventListener("fullscreenchange", () => $("#btn-fullscreen").innerHTML = icon(document.fullscreenElement ? "close" : "expand"));
 
-  /* sign-in inside the live view */
-  async function startSignIn(id) {
+  /* sign-in: in the live view, or on the cloud desktop for sites with a bot check */
+  async function startSignIn(id, mode) {
     const c = conn(id);
     if (!c) return;
     if (browserState && browserState.enabled === false) return toast("The browser is off on this deployment, so there is nowhere to sign in.", "bad");
-    signingIn = id;
+    const wanted = mode || c.signInMode || "live";
     showBrowser();
+    if (wanted === "desktop") return startDesktopSignIn(id);
+    signingIn = { platform: id, mode: "live" };
+    renderRibbons();
     try {
-      await api(`/connections/${id}/connect`, { method: "POST", body: {} });
+      const r = await api(`/connections/${id}/connect`, { method: "POST", body: {} });
+      signingIn = { platform: id, mode: "live", challenge: r.challenge, desktopOk: !!(r.desktop && r.desktop.ok) };
       live.watch(id);
       renderTabs(); renderRibbons();
+      if (r.blocked && r.desktop && r.desktop.ok) {
+        toast(`${c.name}'s sign-in page refused the automated browser. Switching to the cloud desktop.`);
+        return startDesktopSignIn(id);
+      }
+      if (r.blocked) toast(`${c.name}'s sign-in page refused the automated browser: ${r.desktop?.reason || "no desktop is available here"}.`, "bad");
       $("#viewport").focus({ preventScroll: true });
       toast(`Sign in to ${c.name} in the browser panel.`);
     } catch (err) { signingIn = null; renderRibbons(); fail(err); }
   }
+  async function startDesktopSignIn(id) {
+    const c = conn(id);
+    signingIn = { platform: id, mode: "desktop" };
+    renderRibbons();
+    try {
+      const r = await api(`/connections/${id}/signin`, { method: "POST", body: { mode: "desktop" } });
+      signingIn = { platform: id, mode: "desktop", vnc: r.vnc, desktopOk: true };
+      renderRibbons(); renderTabs();
+      toast(r.vnc?.available ? `Sign in to ${c?.name || id} in the desktop window.` : `A browser window with ${c?.name || id} opened on the server's desktop.`);
+    } catch (err) { signingIn = null; renderRibbons(); fail(err); }
+  }
+  $("#btn-signin-desktop").addEventListener("click", () => { if (signingIn) startDesktopSignIn(signingIn.platform); });
   $("#btn-signed-in").addEventListener("click", async (e) => {
     if (!signingIn) return;
-    const id = signingIn;
+    const { platform: id, mode } = signingIn;
     try {
       await busy(e.currentTarget, async () => {
-        const r = await api(`/connections/${id}/check`, { method: "POST", body: {} });
+        const r = await api(`/connections/${id}/${mode === "desktop" ? "signin/finish" : "check"}`, { method: "POST", body: {} });
         if (r.status === "logged_in") {
           toast(`${r.name} is connected.`, "ok");
           signingIn = null;
           live.followAgent();
           renderRibbons(); renderTabs();
+        } else if (mode === "desktop") {
+          toast(r.status === "needs_login" ? `${r.name} still looks signed out. The window was closed; start the sign-in again if you were not finished.` : `Could not check ${r.name}: ${r.lastError || "try again"}`, "bad");
+          signingIn = null;
+          renderRibbons();
         } else {
           toast(r.status === "needs_login" ? `${r.name} still looks signed out. Finish signing in, then press again.` : `Could not check ${r.name}: ${r.lastError || "try again"}`, "bad");
         }
       });
     } catch (err) { fail(err); }
   });
-  $("#btn-signin-dismiss").addEventListener("click", () => { signingIn = null; renderRibbons(); });
+  $("#btn-signin-dismiss").addEventListener("click", async () => {
+    const s = signingIn;
+    signingIn = null;
+    renderRibbons();
+    if (s?.mode === "desktop") await api(`/connections/${s.platform}/signin/cancel`, { method: "POST", body: {} }).catch(() => null);
+  });
 
   /* ---------- add a provider ---------- */
   $("#btn-add-ai").addEventListener("click", () => { $("#add-modal").hidden = false; $("#add-name").focus(); });
@@ -939,7 +1010,7 @@ curl -X POST ${base}/api/ingest \\
       else if (d.rename) { const c = conversations.find((x) => x.id === Number(d.rename)); const title = prompt("Rename this chat", c?.title || ""); if (title !== null) await api(`/conversations/${d.rename}`, { method: "PATCH", body: { title: title.trim() } }); }
       else if (d.deleteConv) { if (confirm("Delete this chat and its messages?")) await api(`/conversations/${d.deleteConv}`, { method: "DELETE" }); }
       else if (d.ai !== undefined) { const c = conn(d.ai); setTarget(target === d.ai ? "" : d.ai); if (c && browserState?.pages?.some((p) => p.platform === c.id)) { live.watch(c.id); renderTabs(); } }
-      else if (d.connect) { if (t.closest(".overlay")) t.closest(".overlay").hidden = true; await startSignIn(d.connect); }
+      else if (d.connect) { if (t.closest(".overlay")) t.closest(".overlay").hidden = true; await startSignIn(d.connect, d.mode || null); }
       else if (d.viewAi) { showBrowser(); if (browserState?.pages?.some((p) => p.platform === d.viewAi)) live.watch(d.viewAi); else { await api("/browser/open", { method: "POST", body: { platform: d.viewAi, url: conn(d.viewAi)?.appUrl } }); live.watch(d.viewAi); } renderTabs(); }
       else if (d.check) { await busy(btn, async () => { const r = await api(`/connections/${d.check}/check`, { method: "POST", body: {} }); toast(r.status === "logged_in" ? `${r.name} is connected.` : `${r.name} is signed out.`, r.status === "logged_in" ? "ok" : "bad"); }); }
       else if (d.refresh) { await busy(btn, async () => { const c = conn(d.refresh); if (c?.canSync) await api(`/platforms/${c.id}/sync`, { method: "POST" }); else await api(`/connections/${d.refresh}/check`, { method: "POST", body: {} }); }); refreshView(); }

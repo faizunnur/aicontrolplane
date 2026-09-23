@@ -1,13 +1,19 @@
 import { BrowserProviderAdapter } from "./browser-adapter.js";
-import type { CapabilityNotes } from "./types.js";
+import type { CapabilityNotes, SignInMode } from "./types.js";
 
 /**
  * Grok (grok.com). Verified 2026-09-22: xAI's Automations (scheduled and email-triggered jobs)
  * have no documented management API; the xAI API covers model calls only. Browser throughout.
+ * Its sign-in page (accounts.x.ai) sits behind a Cloudflare bot check that refuses a
+ * remote-controlled browser, so signing in happens in a plain window on the cloud desktop.
  */
 export class GrokAdapter extends BrowserProviderAdapter {
   protected extraAliases() {
     return ["grok", "xai", "x.ai"];
+  }
+
+  protected defaultSignIn(): SignInMode {
+    return "desktop";
   }
 
   protected extraNotes(): CapabilityNotes {

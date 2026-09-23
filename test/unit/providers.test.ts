@@ -66,6 +66,16 @@ describe("provider registry", () => {
     assert.equal(getProvider("claude")!.canRunTask({ id: 1, key: "k", name: "n", configuration: {} }).ok, false, "but only once the task holds its fire URL and token");
   });
 
+  it("providers declare the sign-in mode they need, and a remembered mode wins", async () => {
+    const { setSetting } = await import("../../src/db.js");
+    assert.equal(getProvider("grok")!.preferredSignIn(), "desktop", "Grok's sign-in page sits behind a bot check");
+    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live");
+    setSetting("signin_mode:chatgpt", "desktop");
+    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "desktop");
+    setSetting("signin_mode:chatgpt", "live");
+    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live");
+  });
+
   it("aliases are what the router recognises", () => {
     assert.ok(getProvider("chatgpt")!.aliases.includes("gpt"));
     assert.ok(getProvider("claude")!.aliases.includes("anthropic"));

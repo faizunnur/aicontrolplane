@@ -1,3 +1,4 @@
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { chromium, type BrowserContext, type Cookie, type Page } from "playwright";
@@ -7,6 +8,53 @@ import { logger } from "../logger.js";
 import { persistStatus, saveToDatabase } from "../persist.js";
 
 const log = logger("browser");
+
+/** A sign-in happening in a plain browser window on the cloud desktop, outside any automation. */
+export interface DesktopSignIn {
+  platform: string;
+  url: string;
+  since: string;
+  pid: number | null;
+}
+
+const DESKTOP_SIGNIN_TIMEOUT_MS = Math.max(1, Number(process.env.DESKTOP_SIGNIN_TIMEOUT_MIN) || 10) * 60_000;
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * The browser binary the app drives. BROWSER_EXECUTABLE wins; then the channel's standard
+ * install location (Google Chrome in the Docker image); then Playwright's bundled Chromium.
+ * The same binary is used for automation and for desktop sign-ins, so one profile serves both.
+ */
+export function resolveExecutable(): { path: string; source: "env" | "channel" | "bundled" } {
+  const env = process.env.BROWSER_EXECUTABLE;
+  if (env && fs.existsSync(env)) return { path: env, source: "env" };
+  if (config.browser.channel === "chrome") {
+    const pf = process.env["PROGRAMFILES"] ?? "C:\\Program Files";
+    const pf86 = process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)";
+    const candidates =
+      process.platform === "win32"
+        ? [path.join(pf, "Google", "Chrome", "Application", "chrome.exe"), path.join(pf86, "Google", "Chrome", "Application", "chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google", "Chrome", "Application", "chrome.exe")]
+        : process.platform === "darwin"
+          ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+          : ["/opt/google/chrome/chrome", "/usr/bin/google-chrome-stable", "/usr/bin/google-chrome"];
+    const found = candidates.find((c) => c && fs.existsSync(c));
+    if (found) return { path: found, source: "channel" };
+    log.warn("BROWSER_CHANNEL=chrome but Google Chrome was not found; using the bundled Chromium");
+  }
+  return { path: chromium.executablePath(), source: "bundled" };
+}
+
+/** Software WebGL under a virtual display: a browser without any WebGL is an oddity sites notice. */
+const GPU_ARGS = process.platform === "linux" ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : [];
 
 export interface BusyTask {
   /** Short human label: "Sending to ChatGPT", "Checking Claude", "Looking at Grok's tasks". */
@@ -25,6 +73,8 @@ export interface BrowserSnapshot {
   active: string | null;
   busy: BusyTask | null;
   pages: { platform: string; url: string; title: string }[];
+  /** A sign-in in progress in a plain browser window on the cloud desktop, if any. */
+  signIn: DesktopSignIn | null;
 }
 
 /**
@@ -41,9 +91,17 @@ class BrowserManager {
   private queue: Promise<unknown> = Promise.resolve();
   private activePlatform: string | null = null;
   private busyTask: BusyTask | null = null;
+  private desktop: DesktopSignIn | null = null;
+  private desktopDone: ReturnType<typeof deferred<"finished" | "cancelled">> | null = null;
+  private desktopJob: Promise<void> | null = null;
 
   isRunning() {
     return this.context !== null;
+  }
+
+  /** The desktop sign-in in progress, if any. */
+  get signIn() {
+    return this.desktop;
   }
 
   /** Platform whose tab is in front. */
@@ -62,7 +120,96 @@ class BrowserManager {
       if (page.isClosed()) continue;
       pages.push({ platform, url: page.url(), title: this.titles.get(platform) ?? "" });
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages };
+    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages, signIn: this.desktop };
+  }
+
+  /* ---------- desktop sign-in: a plain browser window, no automation attached ---------- */
+
+  /**
+   * Sites that gate their sign-in page with a bot check score a remote-controlled browser badly.
+   * For those, the automation steps aside: the profile is opened in a plain window on the cloud
+   * display (the same binary, the same cookies, no debugging session, no automation flags), you
+   * sign in through the desktop view, and the automation takes the profile back afterwards.
+   */
+  canDesktopSignIn(): { ok: boolean; reason?: string } {
+    if (!this.enabled) return { ok: false, reason: "the browser is disabled on this deployment" };
+    if (config.browser.headless) return { ok: false, reason: "this deployment runs the browser without a display, so there is no desktop to sign in on; import a session from your own computer instead" };
+    return { ok: true };
+  }
+
+  async startDesktopSignIn(platformId: string, name: string, url: string): Promise<DesktopSignIn> {
+    const can = this.canDesktopSignIn();
+    if (!can.ok) throw Object.assign(new Error(can.reason), { status: 409 });
+    if (this.desktop) throw Object.assign(new Error(`a sign-in to ${this.desktop.platform} is already in progress`), { status: 409 });
+    const started = deferred<DesktopSignIn>();
+    const done = deferred<"finished" | "cancelled">();
+    this.desktopDone = done;
+    this.desktopJob = this.withLock(
+      async () => {
+        let child: ChildProcess | null = null;
+        try {
+          await this.close(); // automation out of the way; sessions backed up first
+          const exe = resolveExecutable();
+          const [w, h] = config.browser.windowSize;
+          const args = [
+            `--user-data-dir=${config.profileDir}`,
+            "--password-store=basic",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            `--window-size=${w},${h}`,
+            "--window-position=0,0",
+            "--lang=en-US",
+            ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage", ...GPU_ARGS] : []),
+            url,
+          ];
+          log.info(`desktop sign-in for ${platformId}: opening ${exe.path} (${exe.source}) on ${process.env.DISPLAY ?? "the desktop"}`);
+          child = spawn(exe.path, args, { stdio: "ignore", env: process.env });
+          const state: DesktopSignIn = { platform: platformId, url, since: new Date().toISOString(), pid: child.pid ?? null };
+          this.desktop = state;
+          this.announce();
+          child.on("exit", () => {
+            // The user closed the window themselves: that counts as finished.
+            if (this.desktop === state) done.resolve("finished");
+          });
+          child.on("error", (err) => {
+            log.error("desktop sign-in browser failed to start", err);
+            started.reject(err);
+            done.resolve("cancelled");
+          });
+          started.resolve(state);
+          const outcome = await Promise.race([done.promise, new Promise<"cancelled">((r) => setTimeout(() => r("cancelled"), DESKTOP_SIGNIN_TIMEOUT_MS).unref?.())]);
+          log.info(`desktop sign-in for ${platformId} ${outcome}`);
+          await stopChild(child, outcome === "finished" ? 10_000 : 4_000);
+        } catch (err) {
+          started.reject(err);
+          throw err;
+        } finally {
+          this.desktop = null;
+          this.desktopDone = null;
+          this.announce();
+        }
+      },
+      { label: `Signing in to ${name}`, platform: platformId },
+    );
+    this.desktopJob.catch(() => undefined);
+    return started.promise;
+  }
+
+  /** The user says they are signed in: close the plain window and give the profile back to the automation. */
+  async finishDesktopSignIn(): Promise<boolean> {
+    if (!this.desktopDone) return false;
+    this.desktopDone.resolve("finished");
+    await this.desktopJob?.catch(() => undefined);
+    return true;
+  }
+
+  async cancelDesktopSignIn(): Promise<boolean> {
+    if (!this.desktopDone) return false;
+    this.desktopDone.resolve("cancelled");
+    await this.desktopJob?.catch(() => undefined);
+    return true;
   }
 
   private announce() {
@@ -115,6 +262,7 @@ class BrowserManager {
   async getContext(): Promise<BrowserContext> {
     if (!this.enabled) throw new Error("browser is disabled (BROWSER_ENABLED=false)");
     if (this.context) return this.context;
+    if (this.desktop) throw new Error(`a sign-in to ${this.desktop.platform} is in progress on the desktop; try again when it is finished`);
     if (this.launching) return this.launching;
     this.launching = this.launch().finally(() => (this.launching = null));
     return this.launching;
@@ -132,10 +280,12 @@ class BrowserManager {
       }
     }
     const [w, h] = config.browser.windowSize;
-    log.info(`launching chromium (headless=${config.browser.headless}) profile=${config.profileDir}`);
+    const exe = resolveExecutable();
+    log.info(`launching browser (headless=${config.browser.headless}, ${exe.source}: ${exe.path}) profile=${config.profileDir}`);
     const ctx = await chromium.launchPersistentContext(config.profileDir, {
       headless: config.browser.headless,
-      channel: config.browser.channel,
+      // The same binary a desktop sign-in opens, so the profile never changes hands between versions.
+      ...(exe.source === "bundled" ? {} : { executablePath: exe.path }),
       viewport: config.browser.headless ? { width: w, height: h } : null,
       locale: "en-US",
       args: [
@@ -149,6 +299,7 @@ class BrowserManager {
         "--window-position=0,0",
         "--no-first-run",
         "--no-default-browser-check",
+        ...GPU_ARGS,
       ],
       ignoreDefaultArgs: ["--enable-automation"],
     });
@@ -316,6 +467,20 @@ class BrowserManager {
     await ctx.close().catch(() => undefined);
     this.announce();
   }
+}
+
+/** Ask a plain browser window to close and give it time to flush its profile; force it only if it will not. */
+async function stopChild(child: ChildProcess, graceMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((r) => child.once("exit", () => r()));
+  if (process.platform === "win32" && child.pid) spawnSync("taskkill", ["/PID", String(child.pid)], { stdio: "ignore" }); // graceful window close
+  else child.kill("SIGTERM");
+  const graceful = await Promise.race([exited.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), graceMs))]);
+  if (graceful) return;
+  log.warn("desktop sign-in browser did not close in time; forcing it");
+  if (process.platform === "win32" && child.pid) spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
+  else child.kill("SIGKILL");
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 3_000))]);
 }
 
 /**

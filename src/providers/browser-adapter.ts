@@ -1,8 +1,9 @@
 import { browser } from "../browser/manager.js";
-import { getPlatformState } from "../db.js";
+import { getPlatformState, getSetting } from "../db.js";
 import type { PlatformConfig, SessionStatus } from "../types.js";
 import { runConfiguredAction } from "./browser/actions.js";
 import { checkSignIn, sendThroughBrowser } from "./browser/chat.js";
+import { detectChallenge } from "./browser/login.js";
 import { collectTasks } from "./browser/tasks.js";
 import {
   UnsupportedOperationError,
@@ -10,6 +11,7 @@ import {
   type CapabilityNotes,
   type ChatResult,
   type ConnectionStatus,
+  type ConnectResult,
   type ExecutionContext,
   type ProviderAdapter,
   type ProviderCapabilities,
@@ -17,6 +19,7 @@ import {
   type ProviderOperation,
   type RunTaskInput,
   type RunTaskResult,
+  type SignInMode,
   type TaskListResult,
   type TaskRef,
 } from "./types.js";
@@ -114,10 +117,28 @@ export class BrowserProviderAdapter implements ProviderAdapter {
     return { status: this.cfg().appUrl ? s.session_status : "none", lastCheckedAt: s.last_sync_at, lastError: s.last_error };
   }
 
-  async connect(): Promise<void> {
+  async connect(): Promise<ConnectResult> {
     this.require("signIn");
     const c = this.cfg();
-    await browser.withLock(() => browser.consolePage(c.id, c.appUrl), { label: `Opening ${c.name}`, platform: c.id });
+    return browser.withLock(
+      async () => {
+        const page = await browser.consolePage(c.id, c.appUrl);
+        await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+        await page.waitForTimeout(1_500); // a bot check renders after load
+        return detectChallenge(page);
+      },
+      { label: `Opening ${c.name}`, platform: c.id },
+    );
+  }
+
+  /** What worked last time wins; otherwise what the provider is known to need; otherwise the live view. */
+  preferredSignIn(): SignInMode {
+    const remembered = getSetting(`signin_mode:${this.id}`);
+    if (remembered === "desktop" || remembered === "live") return remembered;
+    return this.defaultSignIn();
+  }
+  protected defaultSignIn(): SignInMode {
+    return "live";
   }
 
   async checkAuth(): Promise<SessionStatus> {

@@ -15,6 +15,11 @@ export const MOCK_SELECTORS = {
   loginUrlPatterns: ["/login"],
 };
 
+/** A sign-in page guarded by a Turnstile-like widget that has already refused the visitor. */
+const challengePage = `<!doctype html><html><head><meta charset="utf-8"><title>Sign in</title></head><body>
+<h1>Log in with your email</h1><input id="email" /><div class="cf-turnstile"><iframe src="https://challenges.cloudflare.com/turnstile/v0/stub" title="Widget"></iframe></div>
+<p id="challenge-error-text">Verification failed. Please refresh the page and try again.</p><button>Login</button></body></html>`;
+
 const page = (signedIn: boolean) => `<!doctype html><html><head><meta charset="utf-8"><title>Mock AI</title>
 <style>body{font-family:system-ui;background:#f6f7f9;margin:0;padding:24px;color:#111}
 .wrap{max-width:720px;margin:0 auto}.msg{padding:12px 16px;border-radius:12px;margin:10px 0;max-width:80%}
@@ -40,15 +45,18 @@ export interface MockProvider {
   url: string;
   /** Flip the site into a signed-out state; the app should detect it. */
   setSignedIn(v: boolean): void;
+  /** Put a failed bot check on the sign-in page. */
+  setChallenge(v: boolean): void;
   close(): Promise<void>;
 }
 
 export function startMockProvider(): Promise<MockProvider> {
   let signedIn = true;
+  let challenge = false;
   const server = http.createServer((req, res) => {
     if (req.url?.startsWith("/login")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      return res.end("<h1>Please log in</h1>");
+      return res.end(challenge ? challengePage : "<h1>Please log in</h1>");
     }
     if (!signedIn) {
       res.writeHead(302, { location: "/login" });
@@ -63,6 +71,7 @@ export function startMockProvider(): Promise<MockProvider> {
       resolve({
         url: `http://127.0.0.1:${port}/`,
         setSignedIn: (v) => (signedIn = v),
+        setChallenge: (v) => (challenge = v),
         // Drop keep-alive connections too, or a lingering browser tab keeps the test process alive.
         close: () =>
           new Promise((r) => {

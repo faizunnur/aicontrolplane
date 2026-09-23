@@ -42,6 +42,7 @@ class LiveView {
 
   status() {
     if (this.state && this.state.enabled === false) return { kind: "off", text: "The browser is off on this deployment" };
+    if (this.state && this.state.signIn) return { kind: "desktop", text: `Desktop sign-in to ${this.state.signIn.platform} in progress` };
     if (!this.connected) return { kind: "down", text: this.retry ? "Reconnecting…" : "Connecting…" };
     if (!this.meta || !this.meta.platform) return { kind: "idle", text: "Live · nothing open" };
     const who = this.meta.title || this.meta.platform;
