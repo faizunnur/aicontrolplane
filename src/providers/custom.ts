@@ -129,6 +129,10 @@ export class CustomProviderAdapter implements ProviderAdapter {
   async runAction(_action: string, _vars: Record<string, string>, _ctx: ExecutionContext): Promise<ActionResult> {
     throw this.unsupported("runAction");
   }
+
+  async openConsole(_url: string): Promise<ActionResult> {
+    return { ok: false, action: "open", message: `${this.name} has no browser console; your agents run on their own infrastructure` };
+  }
   outputUrlFor() {
     return null;
   }

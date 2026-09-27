@@ -1,6 +1,6 @@
 import { runAction } from "./actions.js";
 import { ensureProviderAgent, ensureTaskAgent } from "./agents.js";
-import { browser } from "./browser/manager.js";
+
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
 import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
@@ -31,7 +31,7 @@ export function resolveMode(task: Task): Exclude<DeliveryMode, "auto"> {
   if (task.source === "push") return "inbox";
   const p = getPlatform(task.platform);
   const action = d.action || "send_message";
-  if (task.source === "discovered" && browser.enabled && p?.actions?.[action]) return "browser";
+  if (task.source === "discovered" && config.browser.enabled && p?.actions?.[action]) return "browser";
   return "manual";
 }
 

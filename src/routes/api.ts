@@ -530,7 +530,8 @@ api.put("/connections/:id", async (req, res) => {
 api.delete("/connections/:id", async (req, res) => {
   const p = getPlatform(req.params.id);
   if (!p) return bad(res, "unknown AI", 404);
-  if (["chatgpt", "claude", "grok"].includes(p.id)) await savePlatformOverride(p.id, { hidden: true });
+  // A built-in provider is hidden (its defaults come back if re-added); a hand-added one is really removed.
+  if (getProvider(p.id)?.builtin) await savePlatformOverride(p.id, { hidden: true });
   else await deletePlatformOverride(p.id);
   res.json({ ok: true });
 });
@@ -1242,7 +1243,8 @@ api.post("/browser/open", async (req, res) => {
   if (!p) return bad(res, "unknown platform", 404);
   const url = typeof req.body?.url === "string" && /^https?:\/\//.test(req.body.url) ? req.body.url : p.tasksUrl || p.appUrl;
   if (!url) return bad(res, "no url");
-  await browser.withLock(() => browser.consolePage(p.id, url), { label: `Opening ${p.name}`, platform: p.id });
+  const r = await requireProvider(p.id).openConsole(url);
+  if (!r.ok) return bad(res, r.message, 409);
   res.json({ ok: true, url });
 });
 

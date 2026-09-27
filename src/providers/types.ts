@@ -197,6 +197,8 @@ export interface ProviderAdapter {
   /** Whether this particular task can be started now, given its configuration. */
   canRunTask(task: TaskRef): { ok: boolean; reason?: string };
   runAction(action: string, vars: Record<string, string>, ctx: ExecutionContext): Promise<ActionResult>;
+  /** Bring a URL up in the provider's console tab for the live view. Browser-backed providers only. */
+  openConsole(url: string, ctx?: ExecutionContext): Promise<ActionResult>;
   /** Structured error for an operation this provider cannot do. */
   unsupported(op: ProviderOperation): UnsupportedOperationError;
 

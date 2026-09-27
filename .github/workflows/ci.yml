@@ -36,10 +36,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Boundary checks (only packages/data touches SQL)
+      - name: Boundary checks (only packages/data touches SQL; core routes/orchestration never drive the browser directly)
         run: |
           ! grep -rn "better-sqlite3" src/ --include="*.ts"
           ! grep -rn "\.prepare(" src/ --include="*.ts"
+          ! grep -n "browser/manager" src/router.ts src/actions.ts src/deliver.ts src/tasks.ts src/policy.ts src/answers.ts
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build

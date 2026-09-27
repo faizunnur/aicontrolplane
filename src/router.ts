@@ -33,7 +33,7 @@ export interface ConnectionRouting {
 /** AIs that are ready to take an instruction right now. */
 export async function connectedPlatforms(): Promise<PlatformConfig[]> {
   const out: PlatformConfig[] = [];
-  for (const p of visiblePlatforms()) if (p.composerSelector && (await getPlatformState(p.id)).session_status === "logged_in") out.push(p);
+  for (const p of visiblePlatforms()) if (getProvider(p.id)?.supports("chat") && (await getPlatformState(p.id)).session_status === "logged_in") out.push(p);
   return out;
 }
 
@@ -46,7 +46,7 @@ function mentioned(text: string, p: PlatformConfig): boolean {
 
 export async function routeToConnection(text: string): Promise<ConnectionRouting> {
   const connected = await connectedPlatforms();
-  const all = visiblePlatforms().filter((p) => p.composerSelector);
+  const all = visiblePlatforms().filter((p) => getProvider(p.id)?.supports("chat"));
   const choice = (p: PlatformConfig, confidence: number, reason: string): ConnectionChoice => ({ platform: p.id, name: p.name, confidence, reason });
 
   if (all.length === 0) return { method: "none", top: null, options: [], reason: "No AI is set up yet. Open Connect and sign in to one." };

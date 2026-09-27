@@ -170,6 +170,12 @@ export class BrowserProviderAdapter implements ProviderAdapter {
     return await runConfiguredAction(this.cfg(), action, vars, ctx);
   }
 
+  async openConsole(url: string, ctx: ExecutionContext = {}): Promise<ActionResult> {
+    if (!browser.enabled) return { ok: false, action: "open", message: "the browser is disabled on this deployment" };
+    await browser.withLock(() => browser.consolePage(this.id, url), { label: `Opening ${this.name}`, platform: this.id, messageId: ctx.messageId ?? null });
+    return { ok: true, action: "open", message: `console tab is on ${url}. Watch it in the live view.`, url };
+  }
+
   outputUrlFor(_raw: Record<string, unknown>): string | null {
     return null;
   }

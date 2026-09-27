@@ -1,5 +1,5 @@
 import { ensureSystemAgent } from "./agents.js";
-import { browser } from "./browser/manager.js";
+import { config } from "./config.js";
 import { getTask } from "./db.js";
 import { getPlatform } from "./platforms.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
@@ -41,7 +41,7 @@ export function availableActions(p: PlatformConfig) {
 }
 
 export async function runAction(p: PlatformConfig, action: string, task?: Task, extraVars: Record<string, string> = {}, ctx: ExecutionContext = {}): Promise<ActionResult> {
-  if (!browser.enabled) return { ok: false, action, message: "browser is disabled" };
+  if (!config.browser.enabled) return { ok: false, action, message: "browser is disabled" };
   const adapter = getProvider(p.id);
   if (!adapter) return { ok: false, action, message: `unknown provider ${p.id}` };
   // A sync is its own kind of run and makes one for itself.
@@ -96,9 +96,10 @@ async function perform(p: PlatformConfig, adapter: NonNullable<ReturnType<typeof
     const url = task?.native_url || p.tasksUrl || p.appUrl;
     if (!url) return { ok: false, action, message: "no URL to open" };
     await ctx.track?.start("open", `Opening ${url}`);
-    await browser.withLock(() => browser.consolePage(p.id, url), { label: `Opening ${p.name}`, platform: p.id, messageId: ctx.messageId ?? null });
-    await ctx.track?.done("open");
-    return { ok: true, action, message: `console tab is on ${url}. Watch it in the live view.`, url };
+    const r = await adapter.openConsole(url, ctx);
+    if (r.ok) await ctx.track?.done("open");
+    else await ctx.track?.fail("open", r.message);
+    return { ...r, action };
   }
   if (action === "screenshot") {
     await ctx.track?.start("screenshot", `Taking a screenshot of ${p.name}`);
