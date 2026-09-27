@@ -12,6 +12,7 @@ describe("outbox event log", () => {
     const t = await db.upsertTask({ platform: "chatgpt", key: "outbox-probe", name: "Outbox probe", source: "discovered" });
     const { run, track } = await beginRun({ kind: "sync", label: "probe", provider: "chatgpt", task_id: t.id });
     await track.start("open", "Opening");
+    await db.flushNotifications(); // appends are chained behind the announcing write
     const after = await db.outboxAfter(cursor, 2000);
     const topics = after.map((e) => e.topic);
     assert.ok(topics.includes("task"), "the task upsert was logged");

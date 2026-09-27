@@ -139,6 +139,10 @@ export async function callBrowserOp<T>(op: BrowserOpName, payload: unknown, time
     if (cur.status === "done") return (cur.result ? JSON.parse(cur.result) : undefined) as T;
     if (cur.status === "failed") throw new BrowserOpError(cur.result ? (JSON.parse(cur.result) as { error?: string }).error ?? "browser op failed" : "browser op failed");
   }
+  // Close the op before giving up: a worker that picks the job up later must find it settled,
+  // not perform a browser action whose caller already reported failure. (Guarded update — if
+  // the worker finished in this same instant, its answer stands and this is a no-op.)
+  await finishBrowserOp(row.id, "failed", { error: "no browser worker answered in time" });
   throw new BrowserOpError("no browser worker answered in time; is one running?", 504);
 }
 

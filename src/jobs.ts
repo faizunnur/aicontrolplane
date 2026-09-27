@@ -3,12 +3,12 @@ import { pruneBrowserOps, pruneOutbox } from "./db.js";
 import { deliverMessage, deliverToConnection } from "./deliver.js";
 import { emailConfigured, pollOnce } from "./ingest/email.js";
 import { logger } from "./logger.js";
-import { settleDecision, sweepApprovals } from "./policy.js";
+import { reconcileParkedRuns, settleDecision, sweepApprovals } from "./policy.js";
 import { reapStaleRuns } from "./runs.js";
 import { syncTick } from "./sync.js";
 import { executeBrowserOpJob } from "./browser-ops.js";
 import { JOB, queue, type BrowserOpJob, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "./queue.js";
-import { executeTaskRun } from "./tasks.js";
+import { executeTaskRun, requeueStuckTaskRuns } from "./tasks.js";
 
 const log = logger("jobs");
 
@@ -42,6 +42,8 @@ export function registerJobHandlers(scope: HandlerScope): void {
       await sweepApprovals();
       await pruneOutbox();
       await reapStaleRuns();
+      await requeueStuckTaskRuns();
+      await reconcileParkedRuns();
       await pruneBrowserOps();
     });
     queue.work("cron.email", async () => {

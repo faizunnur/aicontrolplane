@@ -12,7 +12,7 @@ import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { dbReady } from "./db.js";
+import { dbReady, flushNotifications } from "./db.js";
 import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
 import { saveToDatabase, stopPersistLoop } from "./persist.js";
@@ -204,6 +204,7 @@ async function shutdown(signal: string) {
   // Stop claiming jobs, back up sessions and close Chromium cleanly, then push the final
   // state to Postgres — but never hang a redeploy: a few seconds each, then exit regardless.
   await Promise.race([queue.stop(), new Promise((r) => setTimeout(r, 8_000))]);
+  await Promise.race([flushNotifications(), new Promise((r) => setTimeout(r, 2_000))]);
   await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 6_000))]);
   await Promise.race([saveToDatabase(true), new Promise((r) => setTimeout(r, 5_000))]);
   process.exit(0);

@@ -41,6 +41,7 @@ describe("conversations and messages", () => {
     const c = await db.createConversation();
     const m = await db.createMessage("hello", c.id);
     await db.updateMessage(m.id, { status: "done", response: "ok" });
+    await db.flushNotifications(); // announcements are chained behind the outbox append
     bus.off("message:row", h);
     assert.deepEqual(seen, [m.id, m.id]);
   });

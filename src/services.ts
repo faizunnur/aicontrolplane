@@ -6,8 +6,9 @@ import { registerJobHandlers, type HandlerScope } from "./jobs.js";
 import { queue } from "./queue.js";
 import { logger } from "./logger.js";
 import { persistEnabled, startPersistLoop } from "./persist.js";
-import { recoverInterruptedApprovals, sweepApprovals } from "./policy.js";
+import { reconcileParkedRuns, recoverInterruptedApprovals, sweepApprovals } from "./policy.js";
 import { reapStaleRuns } from "./runs.js";
+import { requeueStuckTaskRuns } from "./tasks.js";
 import { startScheduler } from "./sync.js";
 
 const log = logger("services");
@@ -41,6 +42,8 @@ export async function startExecutionServices(scope: HandlerScope): Promise<void>
         void sweepApprovals().catch((err) => log.error("approval sweep failed", err));
         void pruneOutbox().catch((err) => log.error("outbox prune failed", err));
         void reapStaleRuns().catch((err) => log.error("stale run reap failed", err));
+        void requeueStuckTaskRuns().catch((err) => log.error("stuck run requeue failed", err));
+        void reconcileParkedRuns().catch((err) => log.error("parked run reconcile failed", err));
       }, 60_000);
       sweep.unref?.();
     }

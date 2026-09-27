@@ -115,17 +115,41 @@ export async function verifyUser(password: string, email?: string): Promise<Auth
   return { id: user.id, email: user.email, role: user.role };
 }
 
-/** Kept for scripts and the bearer path: does this password belong to any account? */
-export async function verifyAdmin(password: string): Promise<boolean> {
-  if (envAdmin && safeEqual(password, envAdmin)) return true;
-  // Bearer credentials carry no email; accept the password of any user. Argon2 verification
-  // is deliberate work — bearer callers are scripts, not hot paths.
+/**
+ * Which account a bare password (bearer credential) belongs to — with ITS OWN role, never
+ * more. Successful matches are cached briefly (by token hash) and failures are counted per
+ * caller, because argon2id is deliberate work and this path guards every API route.
+ */
+const bearerHits = new Map<string, { at: number; user: AuthUser }>();
+const bearerFails = new Map<string, { count: number; resetAt: number }>();
+
+export async function matchUserByPassword(password: string, callerIp = "unknown"): Promise<AuthUser | null> {
+  const key = tokenHash(password);
+  const hit = bearerHits.get(key);
+  if (hit && Date.now() - hit.at < 30_000) return hit.user;
+  const fails = bearerFails.get(callerIp);
+  if (fails && fails.resetAt > Date.now() && fails.count > 20) return null; // guessing costs nothing further
   const { listUsers } = await import("./db.js");
   for (const u of await listUsers()) {
     const row = await getUser(u.id);
-    if (row && (await verifyPassword(row.password_hash, password))) return true;
+    if (row && (await verifyPassword(row.password_hash, password))) {
+      const user: AuthUser = { id: row.id, email: row.email, role: row.role };
+      if (bearerHits.size > 1000) bearerHits.clear();
+      bearerHits.set(key, { at: Date.now(), user });
+      return user;
+    }
   }
-  return false;
+  const now = Date.now();
+  const f = fails && fails.resetAt > now ? fails : { count: 0, resetAt: now + 60_000 };
+  f.count++;
+  bearerFails.set(callerIp, f);
+  return null;
+}
+
+/** Kept for scripts and the ingest path: does this password belong to any account? */
+export async function verifyAdmin(password: string): Promise<boolean> {
+  if (envAdmin && safeEqual(password, envAdmin)) return true;
+  return (await matchUserByPassword(password)) !== null;
 }
 
 /** Change the signed-in user's password; every session (all users') stays untouched except theirs. */
@@ -251,12 +275,15 @@ export async function revokeSession(req: IncomingMessage): Promise<boolean> {
   return ok;
 }
 
-/** Whoever this request is, or null: a live session, or any account's password as a bearer token. */
+/** Whoever this request is, or null: a live session, or their own password as a bearer token. */
 export async function authUser(req: IncomingMessage): Promise<AuthUser | null> {
   const b = bearer(req);
   if (b) {
     if (envAdmin && safeEqual(b, envAdmin)) return ENV_OWNER;
-    if (await verifyAdmin(b)) return ENV_OWNER; // scripts: password, no email — acts as the owner
+    // A password identifies ITS account, with its own role — a member's password must never
+    // act as the owner.
+    const matched = await matchUserByPassword(b, clientIp(req));
+    if (matched) return matched;
   }
   return (await sessionFromCookie(req))?.user ?? null;
 }

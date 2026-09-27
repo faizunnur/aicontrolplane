@@ -1,5 +1,5 @@
 import { bus } from "./bus.js";
-import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, setPolicyOverride, setSetting, transitionRun, updateApproval, type ApprovalRow } from "./db.js";
+import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, listRuns, setPolicyOverride, setSetting, transitionRun, updateApproval, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
 import { queue, resumeJobFor, type RunResumeJob } from "./queue.js";
 import { endRun, finishParked, RunTracker } from "./runs.js";
@@ -151,6 +151,13 @@ export async function guard(scope: GuardScope, action: string, summary: string, 
     await updateApproval(row.id, { status: "expired", decided_by: "system", reason: "the run ended before anyone decided" });
     throw new ApprovalPending(row.id, scope.runId);
   }
+  // The approval was visible before the run was parked; a fast decision may have landed in
+  // between (settleDecision saw "running" then and could only wait). Pick it up ourselves.
+  const settled = await getApproval(row.id);
+  if (settled && settled.status !== "pending") {
+    const decision: Decision = settled.status === "approved" ? "approved" : settled.status === "rejected" ? "rejected" : "timeout";
+    await queue.send<RunResumeJob>(resumeJobFor(scope.kind), { runId: scope.runId, approvalId: row.id, decision }, { singletonKey: `resume:${row.id}:late` });
+  }
   throw new ApprovalPending(row.id, scope.runId);
 }
 
@@ -158,7 +165,8 @@ export async function guard(scope: GuardScope, action: string, summary: string, 
 export async function decide(id: number, decision: "approved" | "rejected", by = "you", reason: string | null = null): Promise<ApprovalRow | null> {
   const a = await getApproval(id);
   if (!a || a.status !== "pending") return null;
-  const row = (await updateApproval(id, { status: decision, decided_by: by, reason }))!;
+  const row = await updateApproval(id, { status: decision, decided_by: by, reason });
+  if (!row) return null; // the timeout sweep (or a concurrent decision) got there first
   await addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
   log.info(`approval #${id} ${decision} by ${by}${reason ? `: ${reason}` : ""}`);
   if (a.run_id) {
@@ -174,7 +182,15 @@ export async function decide(id: number, decision: "approved" | "rejected", by =
 export async function settleDecision(runId: number, approvalId: number, decision: Decision): Promise<void> {
   const approval = await getApproval(approvalId);
   if (!approval) return;
-  const run = await getRun(runId);
+  let run = await getRun(runId);
+  if (run && run.status === "running") {
+    // Decided in the moment between the approval appearing and the run parking. The park is
+    // one UPDATE away; wait for it briefly. (The maintenance reconciler is the durable net.)
+    for (let i = 0; i < 24 && run && run.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      run = await getRun(runId);
+    }
+  }
   if (!run || run.status !== "waiting_approval") return; // decided while running (legacy) or already settled
   const track = new RunTracker(run.id, run.message_id);
   if (decision !== "approved") {
@@ -262,6 +278,28 @@ export async function requestExternalApproval(input: { action: string; summary: 
   return { approval, decision: "pending" };
 }
 
+/**
+ * The durable net for parked runs: whatever crashed or raced, a waiting_approval run whose
+ * approval is no longer pending gets resumed, and one whose approval vanished gets settled.
+ * Runs from the maintenance sweep; every path is idempotent (guarded claims, singleton jobs).
+ */
+export async function reconcileParkedRuns(): Promise<number> {
+  let handled = 0;
+  for (const run of await listRuns({ status: "waiting_approval", limit: 200 })) {
+    const approval = (await listApprovals({ run_id: run.id, limit: 1 }))[0];
+    if (!approval) {
+      await finishParked(run, "failed", { error: "It was parked for an approval that no longer exists." });
+      handled++;
+      continue;
+    }
+    if (approval.status === "pending") continue; // sweepApprovals expires it when its time comes
+    const decision: Decision = approval.status === "approved" ? "approved" : approval.status === "rejected" ? "rejected" : "timeout";
+    await queue.send<RunResumeJob>(resumeJobFor(run.kind), { runId: run.id, approvalId: approval.id, decision }, { singletonKey: `resume:${approval.id}:rec` });
+    handled++;
+  }
+  return handled;
+}
+
 /* ---------- restart recovery ---------- */
 
 /**
@@ -277,6 +315,7 @@ export async function recoverInterruptedApprovals(): Promise<number> {
     if (!a.run_id) continue;
     const run = await getRun(a.run_id);
     if (run && run.status === "waiting_approval") continue; // parked and healthy: survives the restart
+    if (run && run.status === "running") continue; // mid-park on a live instance, or under a decided gate
     await updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the run ended before anyone decided" });
     await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval was interrupted by a restart", body: a.summary, dedupe_key: `approval_interrupted:${a.id}` });
     repaired++;

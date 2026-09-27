@@ -1,13 +1,13 @@
 import { ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { findRunByIdempotencyKey, getAgentProfile, getRun, getTask, listRuns, listTasks, recentStatusesByTask, transitionRun, type TaskWithLastRun } from "./db.js";
+import { findRunByIdempotencyKey, getAgentProfile, getRun, getTask, listRuns, listStuckQueuedRuns, listTasks, recentStatusesByTask, transitionRun, type TaskWithLastRun } from "./db.js";
 import { JOB, queue, type TaskStartJob } from "./queue.js";
 import { logger } from "./logger.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import type { ProviderAdapter, TaskRef } from "./providers/types.js";
-import { beginRun, endRun, isCancelled, RunTracker } from "./runs.js";
+import { beginRun, endRun, finishParked, isCancelled, RunTracker } from "./runs.js";
 import type { Run, RunTrigger } from "../packages/core/src/index.js";
 
 const log = logger("tasks");
@@ -145,6 +145,30 @@ export async function executeTaskRun(runId: number): Promise<void> {
     }
     await performTaskStart(claimed.id, track, task.id, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined });
   });
+}
+
+/**
+ * A queued run whose start job was lost (the send raced a crash, or the job expired unclaimed
+ * with no retries) would wait forever: the silence reaper only watches "running". Re-send the
+ * job — the guarded queued/retrying -> running claim makes redelivery harmless. After a few
+ * lost attempts, stop retrying and say so.
+ */
+export async function requeueStuckTaskRuns(olderThanMs = 10 * 60_000): Promise<number> {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  let handled = 0;
+  for (const run of await listStuckQueuedRuns(cutoff)) {
+    if (run.kind !== "task") continue; // only task runs are born queued today
+    if ((run.attempt ?? 0) >= 5) {
+      await finishParked(run, "failed", { error: "Its start job kept getting lost. Start it again by hand." });
+      handled++;
+      continue;
+    }
+    const bumped = await transitionRun(run.id, [run.status], "queued", { attempt: (run.attempt ?? 0) + 1, queued_at: new Date().toISOString() });
+    if (!bumped) continue; // someone claimed it meanwhile — alive after all
+    await queue.send<TaskStartJob>(JOB.taskStart, { runId: run.id }, { singletonKey: `task-run:${run.id}:r${bumped.attempt}` });
+    handled++;
+  }
+  return handled;
 }
 
 function checkpointInputs(run: Run): { text?: string | null; trigger?: RunTrigger; message_id?: number | null } {

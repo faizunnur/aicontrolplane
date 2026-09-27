@@ -67,17 +67,25 @@ async function sealSecretsIn<T extends Record<string, unknown> | null | undefine
  * to carry events across instances) — then handed to the wired announcer (the in-process
  * bus today). A log append failing must never break the write it describes.
  */
+let outboxChain: Promise<void> = Promise.resolve();
 const notify: Notify = (topic, payload) => {
-  void appendOutbox(topic, payload)
-    .catch(() => undefined)
-    .then((id) => {
-      try {
-        _notify(topic, payload, id ?? undefined);
-      } catch {
-        /* an announcement failing must never break the write it announces */
-      }
-    });
+  // Appends and emits are chained so events keep their write order — outbox ids are the
+  // replay cursor, and an inversion (finish logged before start) would corrupt every
+  // reconnecting client's view.
+  outboxChain = outboxChain.then(async () => {
+    const id = await appendOutbox(topic, payload).catch(() => undefined);
+    try {
+      _notify(topic, payload, id ?? undefined);
+    } catch {
+      /* an announcement failing must never break the write it announces */
+    }
+  });
 };
+
+/** Settles once every announcement queued so far has been logged and emitted (tests, shutdown drains). */
+export async function flushNotifications(): Promise<void> {
+  await outboxChain;
+}
 
 async function appendOutbox(topic: string, payload: unknown): Promise<number | undefined> {
   let body: string | null = null;
@@ -428,7 +436,9 @@ export async function startRun(input: StartRunInput): Promise<Run> {
     if (existing) return existing;
   }
   const status = input.status ?? "running";
-  const row = await q.get<{ id: number }>(
+  let row: { id: number } | undefined;
+  try {
+    row = await q.get<{ id: number }>(
     `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at, idempotency_key, priority, queued_at, checkpoint)
      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?) RETURNING id`,
     [
@@ -449,6 +459,15 @@ export async function startRun(input: StartRunInput): Promise<Run> {
       input.checkpoint ?? null,
     ],
   );
+  } catch (err) {
+    // Two simultaneous submissions with one key: the unique index lets one in; the loser
+    // honours the contract and returns the winner's run instead of surfacing a 500.
+    if (input.idempotency_key) {
+      const existing = await findRunByIdempotencyKey(input.idempotency_key);
+      if (existing) return existing;
+    }
+    throw err;
+  }
   const run = (await getRun(row!.id))!;
   if (input.message_id) await q.run("UPDATE messages SET run_id = ? WHERE id = ?", [run.id, input.message_id]);
   notify("run", run);
@@ -519,6 +538,11 @@ export async function cancelRequested(id: number): Promise<boolean> {
 /** A run already recorded under this idempotency key, if any. */
 export async function findRunByIdempotencyKey(key: string): Promise<Run | undefined> {
   return q.get<Run>("SELECT * FROM runs WHERE idempotency_key = ?", [key]);
+}
+
+/** Queued/retrying runs nobody picked up since the cutoff — their job was lost; re-send it. */
+export async function listStuckQueuedRuns(cutoffIso: string, limit = 100): Promise<Run[]> {
+  return q.all<Run>("SELECT * FROM runs WHERE status IN ('queued','retrying') AND COALESCE(queued_at, created_at) < ? LIMIT ?", [cutoffIso, limit]);
 }
 
 /**
@@ -998,7 +1022,17 @@ export async function getApproval(id: number): Promise<ApprovalRow | undefined> 
 export async function updateApproval(id: number, patch: { status: ApprovalStatus; decided_by?: string | null; reason?: string | null }): Promise<ApprovalRow | undefined> {
   const a = await getApproval(id);
   if (!a) return undefined;
-  await q.run("UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, reason = ? WHERE id = ?", [patch.status, patch.status === "pending" ? null : now(), patch.decided_by ?? a.decided_by, patch.reason ?? a.reason, id]);
+  // Guarded: only a pending approval can be decided/expired/interrupted. Whoever loses the
+  // race (a decision landing at the same moment as the timeout sweep) gets undefined and
+  // backs off — an approval never carries one outcome while its run settles with another.
+  const res = await q.run("UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, reason = ? WHERE id = ? AND status = 'pending'", [
+    patch.status,
+    patch.status === "pending" ? null : now(),
+    patch.decided_by ?? a.decided_by,
+    patch.reason ?? a.reason,
+    id,
+  ]);
+  if (res.changes === 0) return undefined;
   const next = (await getApproval(id))!;
   notify("approval", next);
   return next;
