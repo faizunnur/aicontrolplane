@@ -1,5 +1,6 @@
 import http from "node:http";
 import { startRedisBridge } from "../../../packages/realtime/src/index.js";
+import { startLiveRelay } from "../../../src/browser/live-relay.js";
 import { settleCommandMessage } from "../../../src/answers.js";
 import { bus } from "../../../src/bus.js";
 import { browser } from "../../../src/browser/manager.js";
@@ -27,6 +28,7 @@ await initPlatforms();
 if (config.redisUrl) {
   await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
   log.info("redis event bridge up");
+  await startLiveRelay(config.redisUrl);
 }
 await startExecutionServices("browser");
 await queue.start();

@@ -32,6 +32,9 @@ export const MIRRORED_TOPICS = [
   "agent",
   "agent:deleted",
   "pairing",
+  // Browser state snapshots (tabs, busy, sign-in) originate on the browser worker but the
+  // dashboards hang off any api instance. Frames stay local; snapshots are small JSON.
+  "browser",
 ] as const;
 
 export interface RedisBridgeOptions {

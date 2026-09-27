@@ -65,6 +65,27 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
         return ["done", "failed", "cancelled"].includes(m.status) ? m : null;
       }, 120_000);
       assert.equal(resumed?.status, "done", `the resume executed on the worker (got ${resumed?.status}: ${resumed?.error ?? ""})`);
+
+      // The live view: a WS on the api (no Chrome here) receives frames relayed from the
+      // browser worker's screencast over Redis.
+      const { WebSocket } = await import("ws");
+      const ws = new WebSocket(api.base.replace("http", "ws") + "/live", { headers: { cookie: api.cookie, origin: api.base } });
+      let sawState = false;
+      let sawFrame = false;
+      ws.on("message", (data: Buffer, isBinary: boolean) => {
+        if (isBinary) sawFrame = true;
+        else if (JSON.parse(data.toString()).t === "state") sawState = true;
+      });
+      await new Promise<void>((resolve, reject) => {
+        ws.on("open", () => {
+          ws.send(JSON.stringify({ t: "watch", platform: "mock-ai" }));
+          resolve();
+        });
+        ws.on("error", reject);
+      });
+      const gotFrames = await waitFor(async () => sawState && sawFrame, 30_000);
+      ws.close();
+      assert.ok(gotFrames, "live frames crossed from the browser worker to the api's socket");
     } finally {
       await browserWorker.stop();
       await worker.stop();
