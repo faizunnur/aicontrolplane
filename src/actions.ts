@@ -1,10 +1,12 @@
 import { ensureSystemAgent } from "./agents.js";
 import { browser } from "./browser/manager.js";
-import { guard } from "./policy.js";
+import { getTask } from "./db.js";
+import { getPlatform } from "./platforms.js";
+import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { screenshotProvider } from "./providers/browser/actions.js";
 import { getProvider } from "./providers/registry.js";
 import type { ActionResult, ExecutionContext } from "./providers/types.js";
-import { beginRun, endRun } from "./runs.js";
+import { beginRun, endRun, RunTracker } from "./runs.js";
 import { syncProvider } from "./sync.js";
 import type { PlatformConfig, Task } from "../packages/core/src/index.js";
 
@@ -54,10 +56,40 @@ export async function runAction(p: PlatformConfig, action: string, task?: Task, 
   const own = !ctx.runId;
   const scope = own ? await beginRun({ kind: "action", label: `${label} on ${p.name}`, provider: p.id, task_id: task?.id ?? null, trigger: ctx.trigger ?? "user", agent_id: (await ensureSystemAgent()).id }) : null;
   const c: ExecutionContext = own ? { ...ctx, runId: scope!.run.id, track: scope!.track } : ctx;
-  const result = await perform(adapter.config(), adapter, action, task, extraVars, c);
+  let result: ActionResult;
+  try {
+    result = await perform(adapter.config(), adapter, action, task, extraVars, c);
+  } catch (err) {
+    if (err instanceof ApprovalPending && own) {
+      // The run is parked on its approval; the decision resumes or settles it.
+      return { ok: true, action, message: "Waiting for your approval.", pending: true };
+    }
+    throw err; // a caller-owned run: whoever began it decides what parking means
+  }
   if (scope) await endRun(scope.run.id, { status: result.ok ? "success" : "failed", summary: result.message, error: result.ok ? null : result.message, output_url: result.url ?? null });
   return result;
 }
+
+registerResumer("action", async (run) => {
+  const checkpoint = (() => {
+    try {
+      return run.checkpoint ? (JSON.parse(run.checkpoint) as { inputs?: { action?: string; vars?: Record<string, string>; task_id?: number | null; platform?: string } }) : null;
+    } catch {
+      return null;
+    }
+  })();
+  const inputs = checkpoint?.inputs;
+  const p = inputs?.platform ? getPlatform(inputs.platform) : run.provider ? getPlatform(run.provider) : undefined;
+  const adapter = p ? getProvider(p.id) : undefined;
+  if (!p || !adapter || !inputs?.action) {
+    await endRun(run.id, { status: "failed", error: "the action behind this run cannot be reconstructed" });
+    return;
+  }
+  const task = inputs.task_id ? await getTask(inputs.task_id) : undefined;
+  const track = new RunTracker(run.id, run.message_id);
+  const result = await perform(adapter.config(), adapter, inputs.action, task ?? undefined, inputs.vars ?? {}, { runId: run.id, track, approved: true });
+  await endRun(run.id, { status: result.ok ? "success" : "failed", summary: result.message, error: result.ok ? null : result.message, output_url: result.url ?? null });
+});
 
 async function perform(p: PlatformConfig, adapter: NonNullable<ReturnType<typeof getProvider>>, action: string, task: Task | undefined, extraVars: Record<string, string>, ctx: ExecutionContext): Promise<ActionResult> {
   if (action === "open") {
@@ -89,9 +121,16 @@ async function perform(p: PlatformConfig, adapter: NonNullable<ReturnType<typeof
     ...extraVars,
   };
 
-  // A configured action changes something on the site: policy decides whether it waits for you.
-  const decision = await guard({ runId: ctx.runId, messageId: ctx.messageId, provider: p.id, track: ctx.track }, "run_action", `Run "${def.label ?? action}" on ${p.name}?`, extraVars.message?.slice(0, 240) ?? null);
-  if (decision !== "approved") return { ok: false, action, message: decision === "timeout" ? "not approved within 15 minutes" : "you rejected it" };
-
+  // A configured action changes something on the site: policy decides whether it waits for
+  // you. On "ask" the run parks (ApprovalPending propagates to whoever began it); a resume
+  // after approval passes ctx.approved and skips the gate.
+  if (!ctx.approved && ctx.runId) {
+    await guard(
+      { runId: ctx.runId, messageId: ctx.messageId, provider: p.id, track: ctx.track, kind: ctx.runKind ?? "action", checkpoint: { step: "run", inputs: { action, vars: extraVars, task_id: task?.id ?? null, platform: p.id } } },
+      "run_action",
+      `Run "${def.label ?? action}" on ${p.name}?`,
+      extraVars.message?.slice(0, 240) ?? null,
+    );
+  }
   return adapter.runAction(action, vars, ctx);
 }

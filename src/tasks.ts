@@ -1,12 +1,12 @@
 import { ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { getAgentProfile, getTask, listRuns, listTasks, recentStatusesByTask, type TaskWithLastRun } from "./db.js";
+import { getAgentProfile, getRun, getTask, listRuns, listTasks, recentStatusesByTask, type TaskWithLastRun } from "./db.js";
 import { logger } from "./logger.js";
-import { guard } from "./policy.js";
+import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import type { ProviderAdapter, TaskRef } from "./providers/types.js";
-import { beginRun, endRun } from "./runs.js";
+import { beginRun, endRun, RunTracker } from "./runs.js";
 import type { Run, RunTrigger } from "../packages/core/src/index.js";
 
 const log = logger("tasks");
@@ -93,26 +93,58 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
   const { run, track } = await beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user" });
   // Everything this run does logs with its id attached.
   return withLogContext({ run_id: run.id }, async () => {
-  await track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);
+    await track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);
+    try {
+      await guard(
+        { runId: run.id, messageId: opts.messageId ?? null, provider: task.platform, track, kind: "task", checkpoint: { step: "start", inputs: { text: opts.text ?? null, trigger: opts.trigger ?? "user", message_id: opts.messageId ?? null } } },
+        "run_task",
+        `Start "${task.name}" at ${adapter.name}?`,
+        opts.text?.slice(0, 240) ?? null,
+      );
+    } catch (err) {
+      // Parked: the caller gets the run in waiting_approval; the decision resumes or settles it.
+      if (err instanceof ApprovalPending) return (await getRun(run.id))!;
+      throw err;
+    }
+    return performTaskStart(run.id, track, task.id, { text: opts.text, trigger: opts.trigger, messageId: opts.messageId });
+  });
+}
 
-  const decision = await guard({ runId: run.id, messageId: opts.messageId ?? null, provider: task.platform, track }, "run_task", `Start "${task.name}" at ${adapter.name}?`, opts.text?.slice(0, 240) ?? null);
-  if (decision !== "approved") {
-    return (await endRun(run.id, { status: "cancelled", error: decision === "timeout" ? "not approved in time" : "rejected" }))!;
-  }
-
+/** The start segment: everything after the gate. Runs first-pass and on resume after approval. */
+async function performTaskStart(runId: number, track: RunTracker, taskId: number, opts: { text?: string; trigger?: RunTrigger; messageId?: number }): Promise<Run> {
+  const task = (await getTask(taskId))!;
+  const adapter = getProvider(task.platform)!;
+  const agent = task.agent_id ? await getAgentProfile(task.agent_id) : undefined;
   await track.start("start", `Starting at ${adapter.name}`);
-  const reportUrl = config.publicUrl ? `${config.publicUrl}/api/runs/${run.id}` : null;
-  const r = await adapter.runTask(ref, { runId: run.id, track, messageId: opts.messageId, trigger: opts.trigger }, { text: opts.text, run_id: run.id, report_url: reportUrl });
+  const reportUrl = config.publicUrl ? `${config.publicUrl}/api/runs/${runId}` : null;
+  const r = await adapter.runTask(taskRef(task), { runId, track, messageId: opts.messageId, trigger: opts.trigger }, { text: opts.text, run_id: runId, report_url: reportUrl });
   if (!r.ok) {
     await track.fail("start", r.message);
     log.warn(`task ${task.id} (${task.name}) could not be started: ${r.message}`);
-    return (await endRun(run.id, { status: "failed", error: r.message }))!;
+    return (await endRun(runId, { status: "failed", error: r.message }))!;
   }
   await track.done("start", r.message);
   if (r.pending) {
     await track.waiting("report", `Waiting for ${agent?.name ?? task.name} to report back`);
-    return run;
+    return (await getRun(runId))!;
   }
-  return (await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null, external_id: r.external_id ?? null }))!;
-  });
+  return (await endRun(runId, { status: "success", summary: r.message, output_url: r.url ?? null, external_id: r.external_id ?? null }))!;
 }
+
+registerResumer("task", async (run) => {
+  if (!run.task_id) {
+    await endRun(run.id, { status: "failed", error: "the task behind this run is gone" });
+    return;
+  }
+  const checkpoint = (() => {
+    try {
+      return run.checkpoint ? (JSON.parse(run.checkpoint) as { inputs?: { text?: string | null; trigger?: RunTrigger; message_id?: number | null } }) : null;
+    } catch {
+      return null;
+    }
+  })();
+  const inputs = checkpoint?.inputs ?? {};
+  await withLogContext({ run_id: run.id }, () =>
+    performTaskStart(run.id, new RunTracker(run.id, run.message_id), run.task_id!, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined }),
+  );
+});

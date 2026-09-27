@@ -109,17 +109,19 @@ describe("task registry", () => {
     const hook = await receiver(() => ({ status: 200, body: {} }));
     try {
       const t = await db.upsertTask({ platform: "custom", key: "deploy-job", name: "Deploy job", source: "push", delivery: { mode: "webhook", webhook_url: hook.url } });
-      // Deliberately NOT awaited: the start parks on its approval, which the test rejects below.
-      const pending = startTask(t.id);
-      let approval;
-      for (let i = 0; i < 100 && !approval; i++) {
-        await new Promise((r) => setTimeout(r, 30));
-        approval = (await policy.pendingApprovals()).find((a) => /Deploy job/.test(a.summary));
-      }
+      // Under "ask" the start parks durably: the caller gets the run back at once.
+      const run = await startTask(t.id);
+      assert.equal(run.status, "waiting_approval");
+      const approval = (await policy.pendingApprovals()).find((a) => /Deploy job/.test(a.summary))!;
       assert.ok(approval);
       await policy.decide(approval.id, "rejected");
-      const run = await pending;
-      assert.equal(run.status, "cancelled");
+      let settled;
+      for (let i = 0; i < 100 && !settled; i++) {
+        await new Promise((r) => setTimeout(r, 30));
+        const r = (await db.getRun(run.id))!;
+        if (r.status !== "waiting_approval") settled = r;
+      }
+      assert.equal(settled!.status, "cancelled");
       assert.equal(hook.calls.length, 0, "nothing reached the agent");
     } finally {
       hook.close();

@@ -138,6 +138,26 @@ export async function endRun(runId: number, outcome: { status: RunStatus; summar
   return finished;
 }
 
+/**
+ * Settle a parked run (waiting / waiting_approval) that will not continue: rejection, timeout,
+ * expiry. Mirrors endRun for runs that are not "running": final event, message snapshot and
+ * status, guarded transition.
+ */
+export async function finishParked(run: Run, status: RunStatus, outcome: { summary?: string | null; error?: string | null }): Promise<Run | undefined> {
+  const label = status === "cancelled" ? "Stopped" : status === "timed_out" ? "Timed out" : status === "failed" ? "Failed" : "Finished";
+  await addRunEvent(run.id, { type: status === "failed" ? "error" : "result", label, detail: outcome.error ?? outcome.summary ?? null });
+  if (run.message_id) {
+    await updateMessage(run.message_id, {
+      status: status === "cancelled" || status === "timed_out" ? "cancelled" : "failed",
+      error: outcome.error ?? null,
+      steps: foldSteps(await runEvents(run.id)),
+    });
+  }
+  const finished = await transitionRun(run.id, [run.status], status, { error: outcome.error ?? null, summary: outcome.summary ?? null });
+  if (finished?.kind === "task" && finished.message_id) for (const h of afterRunHooks) h(finished.id);
+  return finished;
+}
+
 const afterRunHooks: ((runId: number) => void)[] = [];
 /** Called after any run ends; used by the command layer to settle the message that asked for it. */
 export function onRunEnded(hook: (runId: number) => void) {

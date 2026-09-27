@@ -17,7 +17,7 @@ import { api } from "./routes/api.js";
 import { startEmailPoller } from "./ingest/email.js";
 import { persistEnabled, saveToDatabase, startPersistLoop, stopPersistLoop } from "./persist.js";
 import { initPlatforms } from "./platforms.js";
-import { recoverInterruptedApprovals } from "./policy.js";
+import { recoverInterruptedApprovals, sweepApprovals } from "./policy.js";
 import { UnsupportedOperationError } from "./providers/types.js";
 import { onRunEnded, recoverInterruptedRuns } from "./runs.js";
 import { startScheduler, stopScheduler } from "./sync.js";
@@ -184,6 +184,9 @@ server.listen(config.port, async () => {
   }
   startScheduler();
   startEmailPoller();
+  // Approvals nobody decides expire on a clock (durable timers, not in-memory ones).
+  const sweep = setInterval(() => void sweepApprovals().catch((err) => log.error("approval sweep failed", err)), 60_000);
+  sweep.unref?.();
   if (browser.enabled) {
     // Warm the browser so the VNC screen shows something immediately.
     browser.getContext().catch((err) => log.error("browser failed to launch", err));

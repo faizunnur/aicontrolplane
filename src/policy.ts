@@ -1,8 +1,8 @@
 import { bus } from "./bus.js";
-import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSetting, getSettingCached, listApprovals, setPolicyOverride, setSetting, updateApproval, updateMessage, type ApprovalRow } from "./db.js";
+import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, setPolicyOverride, setSetting, transitionRun, updateApproval, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
-import { endRun, type RunTracker } from "./runs.js";
-import type { PolicyMode } from "../packages/core/src/index.js";
+import { endRun, finishParked, RunTracker } from "./runs.js";
+import type { PolicyMode, Run } from "../packages/core/src/index.js";
 
 const log = logger("policy");
 
@@ -85,57 +85,72 @@ export async function setPolicy(action: string, mode: PolicyMode | null) {
   return await policyFor(action);
 }
 
-/* ---------- the gate ---------- */
+/* ---------- the gate: park and resume, never wait in memory ---------- */
+
+/** Resume data stored on a parked run: which segment continues, with what inputs. */
+export interface Checkpoint {
+  step: string;
+  inputs?: Record<string, unknown>;
+}
 
 export interface GuardScope {
-  runId?: number | null;
+  runId: number;
   messageId?: number | null;
   provider?: string | null;
   /** The run's tracker; the approval appears as its "approve" step. */
   track?: RunTracker | null;
+  /** Which resumer continues this run after approval (defaults to the run's kind). */
+  kind: string;
+  checkpoint: Checkpoint;
 }
-
-const waiters = new Map<number, (d: Decision) => void>();
 
 /**
- * Ask permission for an action. Returns at once under an "auto" policy; otherwise records an
- * approval, shows it in the run's timeline, and waits for a decision or the timeout.
+ * Thrown by guard() when the action needs a human: the run is already parked durably
+ * (waiting_approval + checkpoint). Callers unwind, freeing every resource they hold —
+ * nothing waits in memory, so a restart loses nothing and any instance can resume.
  */
-export async function guard(scope: GuardScope, action: string, summary: string, detail?: string | null, opts: { timeoutMs?: number } = {}): Promise<Decision> {
-  const policy = await policyFor(action);
-  if (policy.mode === "auto") {
-    await addAudit({ actor: "policy", action: `${action}.auto`, target: scope.runId ? `run:${scope.runId}` : null, detail: summary });
-    return "approved";
+export class ApprovalPending extends Error {
+  constructor(
+    readonly approvalId: number,
+    readonly runId: number,
+  ) {
+    super("waiting for approval");
+    this.name = "ApprovalPending";
   }
-  const row = await createApproval({ run_id: scope.runId ?? null, message_id: scope.messageId ?? null, action, provider: scope.provider ?? null, summary, detail: detail ?? null });
-  log.info(`approval #${row.id} requested for ${action} (${policy.mode}): ${summary}`);
-  await scope.track?.waiting("approve", summary, detail ?? null);
-  if (scope.runId) await addRunEvent(scope.runId, { type: "approval", label: `Approval requested: ${summary}`, detail: policy.mode === "always" ? "this action always asks" : null, metadata: { approval_id: row.id } });
-  await addAudit({ actor: "policy", action: `${action}.requested`, target: `approval:${row.id}`, detail: summary });
-  const decision = await waitForDecision(row.id, opts.timeoutMs ?? APPROVAL_TIMEOUT_MS);
-  if (decision === "timeout") {
-    await updateApproval(row.id, { status: "expired", decided_by: "timeout", reason: "no decision in time" });
-    await scope.track?.fail("approve", `no answer in ${Math.round((opts.timeoutMs ?? APPROVAL_TIMEOUT_MS) / 60_000)} minutes`);
-  } else {
-    const after = await getApproval(row.id);
-    if (decision === "approved") await scope.track?.done("approve", `approved by ${after?.decided_by ?? "you"}`);
-    else await scope.track?.fail("approve", after?.reason ? `rejected: ${after.reason}` : "rejected");
-  }
-  if (scope.runId) await addRunEvent(scope.runId, { type: "approval", label: decision === "approved" ? "Approved" : decision === "rejected" ? "Rejected" : "Approval expired", metadata: { approval_id: row.id } });
-  return decision;
 }
 
-function waitForDecision(id: number, timeoutMs: number): Promise<Decision> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => finish("timeout"), timeoutMs);
-    timer.unref?.();
-    const finish = (d: Decision) => {
-      clearTimeout(timer);
-      if (waiters.get(id) === finish) waiters.delete(id);
-      resolve(d);
-    };
-    waiters.set(id, finish);
+/** The segment that continues an approved run, registered per kind by the executing module. */
+export type Resumer = (run: Run, approval: ApprovalRow) => Promise<void>;
+const resumers = new Map<string, Resumer>();
+export function registerResumer(kind: string, fn: Resumer) {
+  resumers.set(kind, fn);
+}
+
+/**
+ * Ask permission for an action. Returns under an "auto" policy; otherwise records the
+ * approval, parks the run with its checkpoint, and throws ApprovalPending. The decision —
+ * on this instance or any other, before or after a restart — resumes or settles the run.
+ */
+export async function guard(scope: GuardScope, action: string, summary: string, detail?: string | null): Promise<"approved"> {
+  const policy = await policyFor(action);
+  if (policy.mode === "auto") {
+    await addAudit({ actor: "policy", action: `${action}.auto`, target: `run:${scope.runId}`, detail: summary });
+    return "approved";
+  }
+  const row = await createApproval({ run_id: scope.runId, message_id: scope.messageId ?? null, action, provider: scope.provider ?? null, summary, detail: detail ?? null });
+  log.info(`approval #${row.id} requested for ${action} (${policy.mode}): ${summary}`);
+  await scope.track?.waiting("approve", summary, detail ?? null);
+  await addRunEvent(scope.runId, { type: "approval", label: `Approval requested: ${summary}`, detail: policy.mode === "always" ? "this action always asks" : null, metadata: { approval_id: row.id } });
+  await addAudit({ actor: "policy", action: `${action}.requested`, target: `approval:${row.id}`, detail: summary });
+  const parked = await transitionRun(scope.runId, ["running"], "waiting_approval", {
+    checkpoint: JSON.stringify({ v: 1, kind: scope.kind, step: scope.checkpoint.step, inputs: scope.checkpoint.inputs ?? {} }),
   });
+  if (!parked) {
+    // The run moved under us (cancelled, most likely). Withdraw the request.
+    await updateApproval(row.id, { status: "expired", decided_by: "system", reason: "the run ended before anyone decided" });
+    throw new ApprovalPending(row.id, scope.runId);
+  }
+  throw new ApprovalPending(row.id, scope.runId);
 }
 
 /** Record a decision. Returns the row, or null when nothing was pending under that id. */
@@ -145,8 +160,74 @@ export async function decide(id: number, decision: "approved" | "rejected", by =
   const row = (await updateApproval(id, { status: decision, decided_by: by, reason }))!;
   await addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
   log.info(`approval #${id} ${decision} by ${by}${reason ? `: ${reason}` : ""}`);
-  waiters.get(id)?.(decision);
+  if (a.run_id) {
+    // Resumption runs on its own; the decision itself is already durable.
+    void settleDecision(a.run_id, row, decision === "approved" ? "approved" : "rejected").catch(async (err) => {
+      log.error(`resuming run #${a.run_id} after approval #${id} failed`, err);
+      const run = await getRun(a.run_id!);
+      if (run && (run.status === "running" || run.status === "waiting_approval")) {
+        await (run.status === "running" ? endRun(run.id, { status: "failed", error: err instanceof Error ? err.message : String(err) }) : finishParked(run, "failed", { error: err instanceof Error ? err.message : String(err) }));
+      }
+    });
+  }
   return row;
+}
+
+/** Continue or settle a parked run once its approval is decided (or timed out). */
+async function settleDecision(runId: number, approval: ApprovalRow, decision: Decision): Promise<void> {
+  const run = await getRun(runId);
+  if (!run || run.status !== "waiting_approval") return; // decided while running (legacy) or already settled
+  const track = new RunTracker(run.id, run.message_id);
+  if (decision !== "approved") {
+    await track.fail("approve", decision === "timeout" ? `no answer in ${Math.round(APPROVAL_TIMEOUT_MS / 60_000)} minutes` : approval.reason ? `rejected: ${approval.reason}` : "rejected");
+    await addRunEvent(run.id, { type: "approval", label: decision === "rejected" ? "Rejected" : "Approval expired", metadata: { approval_id: approval.id } });
+    await finishParked(run, decision === "timeout" ? "timed_out" : "cancelled", {
+      error: decision === "timeout" ? "Nobody approved it within 15 minutes, so it was not done." : "Not done. You rejected it.",
+    });
+    return;
+  }
+  await track.done("approve", `approved by ${approval.decided_by ?? "you"}`);
+  await addRunEvent(run.id, { type: "approval", label: "Approved", metadata: { approval_id: approval.id } });
+  const checkpoint = parseCheckpoint(run.checkpoint);
+  const resumer = checkpoint ? resumers.get(checkpoint.kind ?? run.kind) : undefined;
+  const claimed = await transitionRun(run.id, ["waiting_approval"], "running");
+  if (!claimed) return;
+  if (!resumer) {
+    await endRun(run.id, { status: "needs_attention", error: "Approved, but nothing knows how to continue this run (no resumer registered)." });
+    return;
+  }
+  await resumer(claimed, approval);
+}
+
+function parseCheckpoint(raw: string | null): { v: number; kind: string; step: string; inputs: Record<string, unknown> } | null {
+  try {
+    const c = raw ? JSON.parse(raw) : null;
+    if (c && c.v === 1 && typeof c.step === "string") return c;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Expire approvals nobody decided in time and settle their runs. Runs on a clock (and at
+ * boot); replaces the in-memory 15-minute timers, so a pending approval survives restarts.
+ */
+export async function sweepApprovals(timeoutMs = APPROVAL_TIMEOUT_MS): Promise<number> {
+  const cutoff = new Date(Date.now() - timeoutMs).toISOString();
+  const pending = await listApprovals({ status: "pending", limit: 500 });
+  let expired = 0;
+  for (const a of pending) {
+    if (a.requested_at >= cutoff) continue;
+    const row = await updateApproval(a.id, { status: "expired", decided_by: "timeout", reason: "no decision in time" });
+    if (!row) continue;
+    expired++;
+    if (a.run_id) {
+      await settleDecision(a.run_id, row, "timeout").catch((err) => log.error(`settling run #${a.run_id} after approval timeout failed`, err));
+    }
+    await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval expired undecided", body: a.summary, dedupe_key: `approval_expired:${a.id}` });
+  }
+  return expired;
 }
 
 /** Decide whatever is pending for a message (the thread's Approve / Reject buttons). */
@@ -177,22 +258,24 @@ export async function requestExternalApproval(input: { action: string; summary: 
 
 /* ---------- restart recovery ---------- */
 
-/** Anything that was waiting for you when the server stopped is surfaced, not dropped. */
+/**
+ * Pending approvals are durable now — their runs are parked, not held in memory — so a
+ * restart keeps them waiting instead of interrupting them. The one repair needed at boot:
+ * an approval whose run died with the process (crash between requesting and parking, or a
+ * run the lease recovery just failed) can never be approved into anything, so it is closed.
+ * Overdue ones are expired by the same sweep that runs on the clock.
+ */
 export async function recoverInterruptedApprovals(): Promise<number> {
-  const pending = await listApprovals({ status: "pending", limit: 500 });
-  for (const a of pending) {
-    await updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the server restarted while this was waiting for approval" });
-    const error = "The server restarted while this was waiting for your approval. Nothing was sent; run it again if you still want it.";
-    if (a.run_id) {
-      const run = await getRun(a.run_id);
-      if (run && run.status === "running") {
-        await addRunEvent(run.id, { type: "step", key: "approve", label: a.summary, status: "failed", detail: "interrupted by a restart" });
-        await endRun(run.id, { status: "needs_attention", error });
-      }
-    }
-    if (a.message_id) await updateMessage(a.message_id, { status: "failed", error });
+  let repaired = 0;
+  for (const a of await listApprovals({ status: "pending", limit: 500 })) {
+    if (!a.run_id) continue;
+    const run = await getRun(a.run_id);
+    if (run && run.status === "waiting_approval") continue; // parked and healthy: survives the restart
+    await updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the run ended before anyone decided" });
     await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval was interrupted by a restart", body: a.summary, dedupe_key: `approval_interrupted:${a.id}` });
+    repaired++;
   }
-  if (pending.length) log.warn(`${pending.length} approval(s) were pending across the restart; marked interrupted and surfaced`);
-  return pending.length;
+  const expired = await sweepApprovals();
+  if (repaired || expired) log.warn(`approval recovery: ${repaired} interrupted (run gone), ${expired} expired (overdue)`);
+  return repaired;
 }

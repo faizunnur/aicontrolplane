@@ -68,6 +68,10 @@ export interface ExecutionContext {
   track?: RunTracker;
   /** What started the work, for runs created on the caller's behalf. */
   trigger?: RunTrigger;
+  /** The caller's run kind, so a gate inside this execution parks under the right resumer. */
+  runKind?: string;
+  /** The gate for this execution was already passed (a resume after approval): do not ask again. */
+  approved?: boolean;
 }
 
 export interface ChatResult {
@@ -119,6 +123,8 @@ export interface ActionResult {
   message: string;
   url?: string;
   screenshot?: boolean;
+  /** The action's run parked on an approval; the decision resumes or settles it. */
+  pending?: boolean;
 }
 
 /** What an adapter needs to know about a task to start it at the provider. */

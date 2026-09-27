@@ -1,5 +1,4 @@
 import { browser } from "../../browser/manager.js";
-import { guard } from "../../policy.js";
 import { cleanError, isStall, PageController } from "../../browser/page.js";
 import { setPlatformState } from "../../db.js";
 import { logger } from "../../logger.js";
@@ -83,13 +82,8 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
   await page.waitForTimeout(300);
   await step?.done("type");
 
-  // Policy decides whether sending needs you. Under "ask" the message sits typed in the box,
-  // visible in the live view, until you approve it in the thread.
-  const decision = await guard({ runId: step?.runId, messageId: step?.messageId, provider: p.id, track: step }, "send_message", `Send this to ${p.name}?`, text.slice(0, 240));
-  if (decision !== "approved") {
-    return { ok: false, cancelled: true, error: decision === "timeout" ? `Nobody approved it within 15 minutes, so it was not sent to ${p.name}.` : `Not sent. You rejected it.`, url: page.url() };
-  }
-
+  // Whether sending needed approval was decided BEFORE any browser work (the run parks on
+  // its approval without holding a tab, let alone the whole browser). By here it may send.
   await step?.start("send", "Sending");
   if (p.sendSelector) await page.locator(p.sendSelector).first().click({ timeout: 10_000 });
   else await composer.press("Enter");

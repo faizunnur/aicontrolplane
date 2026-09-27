@@ -24,6 +24,8 @@ const REFRESH_MS = 5_000;
 let cache: Overrides = {};
 let loadedAt = 0;
 let loading: Promise<void> | null = null;
+/** Bumped on every local write; a refresh that started before a write must not clobber it. */
+let generation = 0;
 
 function parseOverrides(raw: string | undefined | null): Overrides {
   try {
@@ -35,22 +37,26 @@ function parseOverrides(raw: string | undefined | null): Overrides {
 }
 
 async function loadFromDb(): Promise<void> {
+  const gen = generation;
+  let next: Overrides;
   const raw = await getSetting(KEY);
   if (raw !== undefined) {
-    cache = parseOverrides(raw);
+    next = parseOverrides(raw);
   } else if (fs.existsSync(config.platformsFile)) {
     // One-time import of the legacy file, then the database is the source.
     try {
-      cache = parseOverrides(fs.readFileSync(config.platformsFile, "utf8"));
-      await setSetting(KEY, JSON.stringify(cache));
+      next = parseOverrides(fs.readFileSync(config.platformsFile, "utf8"));
+      await setSetting(KEY, JSON.stringify(next));
       log.info(`imported platform overrides from ${config.platformsFile} into the database`);
     } catch (err) {
       log.warn("platforms.json unreadable, ignoring", err);
-      cache = {};
+      next = {};
     }
   } else {
-    cache = {};
+    next = {};
   }
+  if (gen !== generation) return; // a write landed while this read was in flight; it wins
+  cache = next;
   loadedAt = Date.now();
 }
 
@@ -98,6 +104,7 @@ export async function savePlatformOverride(id: string, patch: Partial<PlatformCo
     cleaned[k] = v;
   }
   cache = { ...cache, [id]: cleaned as Partial<PlatformConfig> };
+  generation++;
   loadedAt = Date.now();
   await setSetting(KEY, JSON.stringify(cache));
   return getPlatform(id)!;
@@ -107,6 +114,7 @@ export async function deletePlatformOverride(id: string): Promise<void> {
   const next = { ...cache };
   delete next[id];
   cache = next;
+  generation++;
   loadedAt = Date.now();
   await setSetting(KEY, JSON.stringify(cache));
 }

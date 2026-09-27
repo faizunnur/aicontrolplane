@@ -6,9 +6,9 @@ import { withLogContext } from "./context.js";
 import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatform } from "./platforms.js";
-import { guard } from "./policy.js";
+import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
-import { beginRun, endRun } from "./runs.js";
+import { beginRun, endRun, RunTracker } from "./runs.js";
 import type { AgentDelivery, DeliveryMode, Task } from "../packages/core/src/index.js";
 
 const log = logger("deliver");
@@ -69,12 +69,27 @@ export async function deliverToConnection(messageId: number, platformId: string)
   const { run, track } = await beginRun({ kind: "chat", label: `Message to ${p.name}`, provider: p.id, message_id: msg.id, trigger: "user", agent_id: (await ensureProviderAgent(p.id))?.id ?? null });
   // Everything this run does logs with its id attached.
   return withLogContext({ run_id: run.id }, async () => {
-  await updateMessage(msg.id, { platform: p.id, task_id: null, run_id: run.id, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null, steps: [] });
-  await track.set("route", `Sending to ${p.name}`, "done", describeRouting(msg.routing));
+    await updateMessage(msg.id, { platform: p.id, task_id: null, run_id: run.id, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null, steps: null });
+    await track.set("route", `Sending to ${p.name}`, "done", describeRouting(msg.routing));
+    // The gate comes before any browser work: under "ask" the run parks here, holding nothing.
+    try {
+      await guard({ runId: run.id, messageId: msg.id, provider: p.id, track, kind: "chat", checkpoint: { step: "send" } }, "send_message", `Send this to ${p.name}?`, msg.text.slice(0, 240));
+    } catch (err) {
+      if (err instanceof ApprovalPending) return (await getMessage(msg.id))!;
+      throw err;
+    }
+    return performChatSend(run.id, track, msg.id, platformId);
+  });
+}
 
+/** The send segment: everything after the gate. Runs first-pass and on resume after approval. */
+async function performChatSend(runId: number, track: RunTracker, messageId: number, platformId: string): Promise<MessageWithTask> {
+  const msg = (await getMessage(messageId))!;
+  const adapter = getProvider(platformId)!;
+  const p = adapter.config();
   const fail = async (error: string, status: "failed" | "cancelled" = "failed") => {
     await track.failRunning(error);
-    await endRun(run.id, { status, error });
+    await endRun(runId, { status, error });
     return (await updateMessage(msg.id, { status, error }))!;
   };
   try {
@@ -83,7 +98,7 @@ export async function deliverToConnection(messageId: number, platformId: string)
     let status = (await getPlatformState(p.id)).session_status;
     if (status !== "logged_in") {
       await track.start("connect", `Checking ${p.name} is connected`);
-      status = await adapter.checkAuth({ messageId: msg.id, runId: run.id, track });
+      status = await adapter.checkAuth({ messageId: msg.id, runId, track });
       if (status === "logged_in") await track.done("connect", "connected");
       else await track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
     }
@@ -93,7 +108,7 @@ export async function deliverToConnection(messageId: number, platformId: string)
       return fail(error);
     }
     await updateMessage(msg.id, { status: "delivered", delivered_at: new Date().toISOString() });
-    const r = await adapter.sendMessage(msg.text, { messageId: msg.id, runId: run.id, track });
+    const r = await adapter.sendMessage(msg.text, { messageId: msg.id, runId, track });
     if (r.cancelled) return fail(r.error ?? "Stopped.", "cancelled");
     if (!r.ok) {
       log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
@@ -101,15 +116,22 @@ export async function deliverToConnection(messageId: number, platformId: string)
       return fail(r.error ?? "unknown error");
     }
     const response = r.reply ? (r.partial ? r.reply + "\n\n(reply was still being written when I stopped waiting)" : r.reply) : "Sent. No reply text could be read back; open the AI to see it.";
-    await endRun(run.id, { status: "success", summary: response.slice(0, 500), output_url: r.url ?? null });
+    await endRun(runId, { status: "success", summary: response.slice(0, 500), output_url: r.url ?? null });
     return (await updateMessage(msg.id, { status: "done", acked_at: new Date().toISOString(), response, error: null }))!;
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log.error(`delivery of message ${msg.id} crashed`, err);
     return fail(error);
   }
-  });
 }
+
+registerResumer("chat", async (run) => {
+  if (!run.message_id || !run.provider) {
+    await endRun(run.id, { status: "failed", error: "the message behind this run is gone" });
+    return;
+  }
+  await withLogContext({ run_id: run.id }, () => performChatSend(run.id, new RunTracker(run.id, run.message_id), run.message_id!, run.provider!));
+});
 
 /**
  * Hand a message to a registered task's agent: inbox, webhook, browser action, or manual copy.
@@ -136,30 +158,13 @@ export async function deliverMessage(messageId: number): Promise<MessageWithTask
       case "webhook": {
         const d = parseDelivery(task);
         if (!d.webhook_url) throw new Error("task has no webhook_url");
-        const decision = await guard({ runId: run.id, messageId: msg.id, provider: task.platform, track }, "dispatch_webhook", `Send this instruction to ${task.name}?`, msg.text.slice(0, 240));
-        if (decision !== "approved") {
-          await endRun(run.id, { status: "cancelled", error: decision === "timeout" ? "not approved in time" : "rejected" });
-          return (await updateMessage(msg.id, { status: "cancelled", delivery_mode: mode, error: decision === "timeout" ? "Nobody approved it within 15 minutes, so it was not sent." : "Not sent. You rejected it." }))!;
+        try {
+          await guard({ runId: run.id, messageId: msg.id, provider: task.platform, track, kind: "dispatch", checkpoint: { step: "deliver" } }, "dispatch_webhook", `Send this instruction to ${task.name}?`, msg.text.slice(0, 240));
+        } catch (err) {
+          if (err instanceof ApprovalPending) return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode }))!;
+          throw err;
         }
-        await track.start("deliver", `Posting to ${task.name}'s webhook`);
-        const res = await fetch(d.webhook_url, {
-          method: "POST",
-          headers: { "content-type": "application/json", ...(d.webhook_token ? { authorization: `Bearer ${d.webhook_token}` } : {}) },
-          body: JSON.stringify({
-            message_id: msg.id,
-            run_id: run.id,
-            text: msg.text,
-            agent: { key: task.key, name: task.name, platform: task.platform },
-            task: { key: task.key, name: task.name, platform: task.platform },
-            created_at: msg.created_at,
-            ack_url: config.publicUrl ? `${config.publicUrl}/api/inbox/${msg.id}/ack` : null,
-          }),
-          signal: AbortSignal.timeout(20_000),
-        });
-        if (!res.ok) throw new Error(`webhook responded ${res.status}`);
-        await track.done("deliver", `HTTP ${res.status}`);
-        await track.waiting("ack", `Waiting for ${task.name} to report back`);
-        return (await updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null }))!;
+        return performWebhookDeliver(run.id, track, msg.id);
       }
 
       case "browser": {
@@ -169,7 +174,13 @@ export async function deliverMessage(messageId: number): Promise<MessageWithTask
         if (!p.actions?.[actionName]) throw new Error(`provider ${p.name} has no "${actionName}" action; define one in its settings`);
         if ((await getPlatformState(p.id)).session_status === "needs_login") throw new Error(`${p.name} needs login before messages can be sent`);
         await track.start("deliver", `Running "${actionName}" on ${p.name}`);
-        const r = await runAction(p, actionName, task, { message: msg.text }, { messageId: msg.id, runId: run.id, track });
+        let r;
+        try {
+          r = await runAction(p, actionName, task, { message: msg.text }, { messageId: msg.id, runId: run.id, track, runKind: "dispatch" });
+        } catch (err) {
+          if (err instanceof ApprovalPending) return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode }))!;
+          throw err;
+        }
         if (!r.ok) throw new Error(r.message);
         await track.done("deliver", r.message);
         await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null });
@@ -186,3 +197,80 @@ export async function deliverMessage(messageId: number): Promise<MessageWithTask
   }
   return msg;
 }
+
+/** The webhook segment: everything after the gate. Runs first-pass and on resume after approval. */
+async function performWebhookDeliver(runId: number, track: RunTracker, messageId: number): Promise<MessageWithTask> {
+  const msg = (await getMessage(messageId))!;
+  const task = (await getTask(msg.task_id!))!;
+  const d = parseDelivery(task);
+  try {
+    await track.start("deliver", `Posting to ${task.name}'s webhook`);
+    const res = await fetch(d.webhook_url!, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(d.webhook_token ? { authorization: `Bearer ${d.webhook_token}` } : {}) },
+      body: JSON.stringify({
+        message_id: msg.id,
+        run_id: runId,
+        text: msg.text,
+        agent: { key: task.key, name: task.name, platform: task.platform },
+        task: { key: task.key, name: task.name, platform: task.platform },
+        created_at: msg.created_at,
+        ack_url: config.publicUrl ? `${config.publicUrl}/api/inbox/${msg.id}/ack` : null,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) throw new Error(`webhook responded ${res.status}`);
+    await track.done("deliver", `HTTP ${res.status}`);
+    await track.waiting("ack", `Waiting for ${task.name} to report back`);
+    return (await updateMessage(msg.id, { status: "delivered", delivery_mode: "webhook", delivered_at: new Date().toISOString(), error: null }))!;
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    log.warn(`delivery of message ${msg.id} to ${task.name} via webhook failed: ${error}`);
+    await track.failRunning(error);
+    await endRun(runId, { status: "failed", error });
+    await addEvent({ platform: task.platform, kind: "message", title: `Could not deliver instruction to ${task.name}`, body: `${error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
+    return (await updateMessage(msg.id, { status: "failed", delivery_mode: "webhook", error }))!;
+  }
+}
+
+registerResumer("dispatch", async (run) => {
+  if (!run.message_id) {
+    await endRun(run.id, { status: "failed", error: "the message behind this run is gone" });
+    return;
+  }
+  const msg = await getMessage(run.message_id);
+  const task = msg?.task_id ? await getTask(msg.task_id) : undefined;
+  const track = new RunTracker(run.id, run.message_id);
+  if (!msg || !task) {
+    await endRun(run.id, { status: "failed", error: "the message or task behind this run is gone" });
+    return;
+  }
+  const mode = resolveMode(task);
+  await withLogContext({ run_id: run.id }, async () => {
+    if (mode === "webhook") {
+      await performWebhookDeliver(run.id, track, msg.id);
+      return;
+    }
+    if (mode === "browser") {
+      // Re-enter the browser segment with the gate already passed.
+      const p = getPlatform(task.platform);
+      const actionName = parseDelivery(task).action || "send_message";
+      try {
+        if (!p) throw new Error(`unknown provider ${task.platform}`);
+        await track.start("deliver", `Running "${actionName}" on ${p.name}`);
+        const r = await runAction(p, actionName, task, { message: msg.text }, { messageId: msg.id, runId: run.id, track, approved: true });
+        if (!r.ok) throw new Error(r.message);
+        await track.done("deliver", r.message);
+        await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null });
+        await updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: new Date().toISOString(), error: null });
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        await track.failRunning(error);
+        await endRun(run.id, { status: "failed", error });
+        await updateMessage(msg.id, { status: "failed", delivery_mode: mode, error });
+      }
+      return;
+    }
+    await endRun(run.id, { status: "needs_attention", error: `approved, but the task's delivery mode is now "${mode}" and cannot be resumed automatically` });
+  });
+});
