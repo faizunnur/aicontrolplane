@@ -5,6 +5,7 @@ import { bus } from "../bus.js";
 import { config } from "../config.js";
 import { addAudit } from "../db.js";
 import { logger } from "../logger.js";
+import { liveViewers as liveViewersGauge } from "../metrics.js";
 import { browser, type BrowserSnapshot } from "./manager.js";
 import { acquireStream, applyCommand, lastFrame, refreshLevel, releaseStream, LEVEL_ORDER, QUALITY, type Level, type Meta, type Sink } from "./live-stream.js";
 import { LIVE_CTL_CHANNEL, LIVE_FRAME_CHANNEL } from "./live-relay.js";
@@ -85,6 +86,7 @@ function currentSnapshot(): BrowserSnapshot {
 function onConnect(ws: WebSocket) {
   const client: Client = { ws, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null };
   clients.add(client);
+  liveViewersGauge.set(clients.size);
   log.info(`live view connected (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
   sendJson(client, { t: "state", browser: currentSnapshot() });
   void attach(client);
@@ -101,6 +103,7 @@ function onConnect(ws: WebSocket) {
   });
   ws.on("close", () => {
     clients.delete(client);
+    liveViewersGauge.set(clients.size);
     detach(client);
     log.info(`live view left (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
   });

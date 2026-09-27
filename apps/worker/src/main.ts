@@ -6,6 +6,7 @@ import { browser } from "../../../src/browser/manager.js";
 import { config } from "../../../src/config.js";
 import { dbReady } from "../../../src/db.js";
 import { logger } from "../../../src/logger.js";
+import { metricsText } from "../../../src/metrics.js";
 import { saveToDatabase, stopPersistLoop } from "../../../src/persist.js";
 import { initPlatforms } from "../../../src/platforms.js";
 import { scheduleCrons } from "../../../src/jobs.js";
@@ -38,6 +39,10 @@ log.info(`worker up (queue: ${queue.kind}, data: ${config.dataDir})`);
 const health = http.createServer(async (req, res) => {
   if (req.url === "/healthz") {
     res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, role: "worker" }));
+    return;
+  }
+  if (req.url === "/metrics") {
+    res.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(await metricsText());
     return;
   }
   if (req.url === "/readyz") {

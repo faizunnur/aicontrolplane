@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { bus } from "./bus.js";
 import { getMessage, getRun, outboxAfter, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
+import { sseClients } from "./metrics.js";
 import { getPlatform } from "./platforms.js";
 import { connectionCard, expandMessage } from "./view.js";
 
@@ -148,6 +149,7 @@ export function streamHandler(req: Request, res: Response) {
       }
     }
     clients.add(res);
+    sseClients.set(clients.size);
     log.debug(`stream client connected (${clients.size} open)${replay !== null ? ` replayed from #${replay}` : ""}`);
   })();
 
@@ -163,6 +165,7 @@ export function streamHandler(req: Request, res: Response) {
   req.on("close", () => {
     clearInterval(ping);
     clients.delete(res);
+    sseClients.set(clients.size);
     log.debug(`stream client left (${clients.size} open)`);
   });
 }

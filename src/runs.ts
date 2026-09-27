@@ -1,5 +1,6 @@
 import { addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, listStaleRunningRuns, runEvents, setCancelRequested, startRun, transitionRun, updateMessage, type StartRunInput } from "./db.js";
 import { logger } from "./logger.js";
+import { runsSettled } from "./metrics.js";
 import type { Run, RunStatus, Step, StepStatus } from "../packages/core/src/index.js";
 
 const log = logger("runs");
@@ -129,6 +130,7 @@ export async function endRun(runId: number, outcome: { status: RunStatus; summar
   // The one snapshot of the folded steps onto the message row, now that the timeline is final.
   if (run.message_id) await updateMessage(run.message_id, { steps: foldSteps(await runEvents(runId)) });
   const finished = await finishRun(runId, outcome);
+  if (finished) runsSettled.inc({ status: finished.status, kind: finished.kind });
   const summary = (outcome.error ?? outcome.summary ?? "").slice(0, 200);
   const line = `run #${runId} ${outcome.status}${summary ? `: ${summary}` : ""}${run.started_at ? ` (${Math.round((Date.now() - new Date(run.started_at).getTime()) / 1000)}s)` : ""}`;
   if (outcome.status === "failed") log.warn(line);
@@ -154,6 +156,7 @@ export async function finishParked(run: Run, status: RunStatus, outcome: { summa
     });
   }
   const finished = await transitionRun(run.id, [run.status], status, { error: outcome.error ?? null, summary: outcome.summary ?? null });
+  if (finished) runsSettled.inc({ status: finished.status, kind: finished.kind });
   if (finished?.kind === "task" && finished.message_id) for (const h of afterRunHooks) h(finished.id);
   return finished;
 }

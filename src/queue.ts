@@ -11,7 +11,10 @@ const log = logger("queue");
   the roles split. A failed job logs here and settles its own run; the sender never sees it.
 */
 
-const onError = (name: string, err: unknown) => log.error(`job ${name} failed`, err);
+const onError = (name: string, err: unknown) => {
+  log.error(`job ${name} failed`, err);
+  void import("./metrics.js").then((m) => m.jobsFailed.inc({ job: name })).catch(() => undefined);
+};
 
 const engine: Queue = config.role === "all" || config.db.driver !== "pg" ? new InlineQueue(onError) : new BossQueue(config.db.url, onError);
 

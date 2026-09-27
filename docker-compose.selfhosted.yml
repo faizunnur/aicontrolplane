@@ -1,0 +1,110 @@
+# Self-hosted production: the complete Control Plane on your own machine or server.
+#
+#   1. cp .env.example .env    — set at least ACP_ADMIN_TOKEN (or leave it to first-run setup),
+#                                 ACP_MASTER_KEY (openssl rand -hex 32) and PUBLIC_URL.
+#   2. docker compose -f docker-compose.selfhosted.yml up --build -d
+#   3. open http://localhost:8080 (or your PUBLIC_URL)
+#
+# Everything stays on your infrastructure: Postgres holds the data (sealed secrets included),
+# Redis carries events between the services, the browser worker holds the signed-in sessions.
+# No Railway account, no Kubernetes, no external control plane. Scale a service with
+# `--scale worker=2`; the queue shares the work. Full guide: docs/self-hosted.md
+#
+# Prefer one container? The plain `docker compose up` in docker-compose.yml runs the same
+# code as a single all-in-one process instead.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: acp
+    volumes:
+      - acp-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - acp-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "${ACP_PORT:-8080}:8080"
+    environment:
+      ROLE: api
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?}@db:5432/acp
+      REDIS_URL: redis://redis:6379
+      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-}
+      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-}
+      ACP_MASTER_KEY: ${ACP_MASTER_KEY:?set ACP_MASTER_KEY in .env (openssl rand -hex 32)}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      VNC_TARGET: http://browser:6080
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      ROLE: worker
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?}@db:5432/acp
+      REDIS_URL: redis://redis:6379
+      ACP_MASTER_KEY: ${ACP_MASTER_KEY:?}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      EMAIL_POLL_MIN: ${EMAIL_POLL_MIN:-5}
+      IMAP_HOST: ${IMAP_HOST:-}
+      IMAP_USER: ${IMAP_USER:-}
+      IMAP_PASS: ${IMAP_PASS:-}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  browser:
+    build: .
+    environment:
+      ROLE: browser
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?}@db:5432/acp
+      REDIS_URL: redis://redis:6379
+      ACP_MASTER_KEY: ${ACP_MASTER_KEY:?}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      SYNC_INTERVAL_MIN: ${SYNC_INTERVAL_MIN:-20}
+      VNC_BIND: 0.0.0.0
+    volumes:
+      - acp-browser:/data
+    shm_size: "1g"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  acp-pg:
+  acp-redis:
+  acp-browser:

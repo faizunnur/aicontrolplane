@@ -19,6 +19,7 @@ import { saveToDatabase, stopPersistLoop } from "./persist.js";
 import { initPlatforms } from "./platforms.js";
 import { UnsupportedOperationError } from "./providers/types.js";
 import { onRunEnded } from "./runs.js";
+import { metricsMiddleware, metricsText } from "./metrics.js";
 import { queue } from "./queue.js";
 import { startExecutionServices } from "./services.js";
 import { stopScheduler } from "./sync.js";
@@ -88,7 +89,13 @@ app.get("/readyz", async (_req, res) => {
   }
 });
 
-app.use("/api", api);
+app.use("/api", metricsMiddleware, api);
+// Operators scrape this; it is admin-gated because the api faces the internet.
+app.get("/metrics", async (req, res) => {
+  if (!(await isAdmin(req))) return res.status(401).end();
+  res.setHeader("content-type", "text/plain; version=0.0.4");
+  res.end(await metricsText());
+});
 
 /* ---- noVNC: proxied through the app so it shares the single public port and the admin auth ---- */
 const proxy = httpProxy.createProxyServer({ target: config.vnc.target, ws: true, changeOrigin: true });
