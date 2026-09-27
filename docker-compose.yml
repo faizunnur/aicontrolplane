@@ -1,8 +1,18 @@
-# Local run of the same image Railway builds.
+# Two ways to run the same images:
+#
 #   docker compose up --build
+#     The single-container mode (ROLE=all): one process does everything, state on a volume
+#     or in Postgres. What Railway runs today.
+#
+#   docker compose --profile split up --build
+#     The split mode: a slim api that only enqueues and serves, a worker that executes
+#     (jobs, schedulers, the browser), Postgres as the source of truth and job queue, Redis
+#     carrying events between them. The shape that scales horizontally.
+#
 # Dashboard: http://localhost:8080   Browser screen: http://localhost:8080/vnc/
 services:
   acp:
+    profiles: ["all", ""]
     build: .
     ports:
       - "8080:8080"
@@ -22,5 +32,80 @@ services:
     shm_size: "1g"
     restart: unless-stopped
 
+  db:
+    profiles: ["split"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-acp}
+      POSTGRES_DB: acp
+    volumes:
+      - acp-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    profiles: ["split"]
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  api:
+    profiles: ["split"]
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8080:8080"
+    environment:
+      ROLE: api
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
+      REDIS_URL: redis://redis:6379
+      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-change-me-admin}
+      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-change-me-ingest}
+      ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      # The live browser screen lives on the worker in split mode.
+      VNC_TARGET: http://worker:6080
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    profiles: ["split"]
+    build: .
+    environment:
+      ROLE: worker
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
+      REDIS_URL: redis://redis:6379
+      ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      SYNC_INTERVAL_MIN: ${SYNC_INTERVAL_MIN:-20}
+      VNC_BIND: 0.0.0.0
+      IMAP_HOST: ${IMAP_HOST:-}
+      IMAP_USER: ${IMAP_USER:-}
+      IMAP_PASS: ${IMAP_PASS:-}
+    volumes:
+      - acp-worker-data:/data
+    shm_size: "1g"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   acp-data:
+  acp-pg:
+  acp-worker-data:

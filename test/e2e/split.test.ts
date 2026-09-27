@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { MOCK_SELECTORS, startMockProvider } from "../helpers/mock-provider.js";
-import { startServer, startWorker, waitFor } from "../helpers/server.js";
+import { listenSse, startServer, startWorker, waitFor } from "../helpers/server.js";
 
 describe("split roles: api enqueues, a worker executes", { skip: !process.env.TEST_PG_URL && "needs TEST_PG_URL", timeout: 300_000 }, () => {
   it("chat flows through the queue to the worker's browser; approvals park and resume across processes", async () => {
@@ -22,13 +22,15 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
     url.pathname = `/${dbName}`;
     const DATABASE_URL = url.toString();
 
+    const REDIS_URL = process.env.TEST_REDIS_URL || "redis://127.0.0.1:56379";
     const mock = await startMockProvider();
     // The api serves HTTP and must NOT execute; the worker holds the browser.
-    const api = await startServer({ ROLE: "api", DATABASE_URL, BROWSER_ENABLED: "false" });
-    const worker = await startWorker({ DATABASE_URL });
+    const api = await startServer({ ROLE: "api", DATABASE_URL, REDIS_URL, BROWSER_ENABLED: "false" });
+    const worker = await startWorker({ DATABASE_URL, REDIS_URL });
     try {
       await api.api("/connections", { body: { name: "Mock AI", appUrl: mock.url, purpose: "testing" } });
       await api.api("/connections/mock-ai", { method: "PUT", body: { ...MOCK_SELECTORS, chatUrl: mock.url } });
+      const sse = await listenSse(api);
 
       // Auto mode: enqueue on the api, execute on the worker, reply lands back in the thread.
       const r = await api.api("/chat", { body: { text: "Hello across processes", platform: "mock-ai" } });
@@ -39,6 +41,11 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
       assert.ok(done, "the message settles");
       assert.equal(done.status, "done", `worker delivered it (got ${done.status}: ${done.error ?? ""})`);
       assert.ok(done.response, "the reply came back through the shared database");
+      // The worker's execution reached the api's OPEN stream through the redis bridge.
+      sse.stop();
+      assert.ok(sse.events.some((e) => e.ev === "run-event"), "step events crossed instances");
+      assert.ok(sse.events.some((e) => e.ev === "run" && e.data?.status === "success"), "the run's completion crossed instances");
+      assert.ok(sse.events.some((e) => e.ev === "msg" && e.data?.id === r.message.id && e.data?.status === "done"), "the settled message crossed instances");
 
       // Manual mode: the run parks on the worker; the decision on the api resumes it there.
       await api.api("/settings/approval", { method: "PUT", body: { approvalMode: "manual" } });

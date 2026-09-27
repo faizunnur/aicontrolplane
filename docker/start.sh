@@ -15,9 +15,11 @@ if [ "${HEADLESS:-false}" != "true" ]; then
     sleep 0.2
   done
   # No window manager on purpose: Chromium then sits at 0,0 and fills the whole screen.
+  # VNC_BIND=0.0.0.0 lets a separate api container proxy /vnc to this worker (split mode).
+  VNC_BIND="${VNC_BIND:-127.0.0.1}"
   x11vnc -display "$DISPLAY" -forever -shared -nopw -rfbport 5900 -localhost -quiet -noxdamage >/dev/null 2>&1 &
-  websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 >/dev/null 2>&1 &
-  echo "[start] virtual display + noVNC bridge up on 127.0.0.1:6080"
+  websockify --web /usr/share/novnc "$VNC_BIND":6080 127.0.0.1:5900 >/dev/null 2>&1 &
+  echo "[start] virtual display + noVNC bridge up on $VNC_BIND:6080"
 fi
 
 exec node dist/src/bootstrap.js

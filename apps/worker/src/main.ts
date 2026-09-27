@@ -1,5 +1,7 @@
 import http from "node:http";
+import { startRedisBridge } from "../../../packages/realtime/src/index.js";
 import { settleCommandMessage } from "../../../src/answers.js";
+import { bus } from "../../../src/bus.js";
 import { browser } from "../../../src/browser/manager.js";
 import { config } from "../../../src/config.js";
 import { dbReady } from "../../../src/db.js";
@@ -22,6 +24,10 @@ const log = logger("worker");
 onRunEnded(settleCommandMessage);
 
 await initPlatforms();
+if (config.redisUrl) {
+  await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
+  log.info("redis event bridge up");
+}
 await startExecutionServices();
 await queue.start();
 log.info(`worker up (queue: ${queue.kind}, data: ${config.dataDir})`);

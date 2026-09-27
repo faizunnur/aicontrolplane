@@ -21,6 +21,14 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["56379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,8 +55,9 @@ jobs:
         run: npm run test:e2e
         env:
           HEADLESS: "true"
-      - name: E2E (Postgres driver)
+      - name: E2E (Postgres driver, incl. split-role stack)
         run: npm run test:e2e
         env:
           HEADLESS: "true"
           TEST_PG_URL: postgres://postgres:test@localhost:55432/acp_test
+          TEST_REDIS_URL: redis://127.0.0.1:56379

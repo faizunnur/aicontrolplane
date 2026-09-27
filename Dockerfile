@@ -21,6 +21,8 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY tsconfig.json ./
+COPY packages ./packages
+COPY apps ./apps
 COPY src ./src
 COPY public ./public
 COPY docker ./docker
@@ -35,4 +37,6 @@ ENV NODE_ENV=production \
     SCREEN_GEOMETRY=1280x800x24
 
 EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=5 \
+  CMD wget -qO- "http://127.0.0.1:${PORT:-8080}/healthz" >/dev/null 2>&1 || exit 1
 CMD ["bash", "docker/start.sh"]

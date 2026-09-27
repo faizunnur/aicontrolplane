@@ -6,6 +6,8 @@ import express from "express";
 import httpProxy from "http-proxy";
 import { settleCommandMessage } from "./answers.js";
 import { crossOrigin, isAdmin } from "./auth.js";
+import { bus } from "./bus.js";
+import { startRedisBridge } from "../packages/realtime/src/index.js";
 import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
@@ -171,6 +173,11 @@ server.listen(config.port, async () => {
     log.info("Postgres is the database; the data folder only caches the browser profile and screenshots");
   }
   await initPlatforms();
+  if (config.redisUrl) {
+    // Events written by other instances (workers, other apis) reach this one's clients.
+    await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
+    log.info("redis event bridge up");
+  }
   if (config.role === "all") {
     // Single-container mode: this process also executes everything it accepts.
     await startExecutionServices();
