@@ -3,6 +3,7 @@
  * Chromium and a throw-away data folder, and gives tests an authenticated API client.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -31,10 +32,28 @@ async function freePort(): Promise<number> {
   });
 }
 
+/**
+ * Conformance mode: with TEST_PG_URL set, every spawned server runs on Postgres. The database
+ * name derives from the data folder, so a restart test that reuses its folder finds its rows.
+ */
+async function pgDatabaseFor(dataDir: string): Promise<string> {
+  const { default: pg } = await import("pg");
+  const admin = new pg.Client({ connectionString: process.env.TEST_PG_URL });
+  await admin.connect();
+  const name = `acp_e2e_${createHash("sha256").update(dataDir).digest("hex").slice(0, 12)}`;
+  const exists = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", [name]);
+  if (!exists.rowCount) await admin.query(`CREATE DATABASE ${name}`);
+  await admin.end();
+  const url = new URL(process.env.TEST_PG_URL!);
+  url.pathname = `/${name}`;
+  return url.toString();
+}
+
 export async function startServer(env: Record<string, string> = {}, opts: { dataDir?: string } = {}): Promise<TestServer> {
   const port = await freePort();
   const dataDir = opts.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "acp-e2e-"));
   fs.mkdirSync(dataDir, { recursive: true });
+  if (process.env.TEST_PG_URL && env.DATABASE_URL === undefined) env = { ...env, DATABASE_URL: await pgDatabaseFor(dataDir) };
   const base = `http://127.0.0.1:${port}`;
   const child: ChildProcess = spawn(process.execPath, ["--import", "tsx", "src/bootstrap.ts"], {
     cwd: root,

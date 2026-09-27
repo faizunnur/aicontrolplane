@@ -22,7 +22,7 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'needs_assignment', agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL, suggestions TEXT, routing TEXT, delivery_mode TEXT, delivered_at TEXT, acked_at TEXT, response TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 `;
 
-describe("migration from the first-release schema", () => {
+describe("migration from the first-release schema", { skip: !!process.env.TEST_PG_URL && "SQLite-only: replays the historical file-format chain" }, () => {
   it("renames agents to tasks, rebuilds runs, keeps every row, and adds run_events", async () => {
     const file = path.join(testDataDir, "acp.sqlite");
     fs.rmSync(file, { force: true });

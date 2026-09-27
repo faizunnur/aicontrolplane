@@ -21,7 +21,7 @@ describe("sessions", () => {
     const t2 = await auth.createSession(req());
     assert.notEqual(t1, t2, "every login gets its own token");
     assert.equal(await db.countSessions(), 2);
-    assert.ok(!db.db.prepare("SELECT token_hash FROM sessions").all().some((r: any) => r.token_hash === t1), "only the hash is stored");
+    assert.ok(!(await db.rawAll<{ token_hash: string }>("SELECT token_hash FROM sessions")).some((r) => r.token_hash === t1), "only the hash is stored");
     assert.equal(await auth.isAdmin(req({ cookie: `acp_session=${t1}` })), true);
     assert.equal(await auth.isAdmin(req({ cookie: `acp_session=${t1}x` })), false);
     assert.equal(await auth.isAdmin(req({ cookie: "acp_session=" })), false);
@@ -45,7 +45,7 @@ describe("sessions", () => {
 
   it("expired sessions are not accepted", async () => {
     const t = await auth.createSession(req());
-    db.db.prepare("UPDATE sessions SET expires_at = ?").run(new Date(Date.now() - 1000).toISOString());
+    await db.rawRun("UPDATE sessions SET expires_at = ?", [new Date(Date.now() - 1000).toISOString()]);
     assert.equal(await auth.isAdmin(req({ cookie: `acp_session=${t}` })), false);
   });
 

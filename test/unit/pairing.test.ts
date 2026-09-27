@@ -43,7 +43,7 @@ describe("pairing: sign in from your own computer", () => {
 
   it("codes expire, a newer code retires an older one, and cancel ends whatever is open", async () => {
     const first = await pairing.createPairing("chatgpt");
-    db.db.prepare("UPDATE pairings SET expires_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), first.row.id);
+    await db.rawRun("UPDATE pairings SET expires_at = ? WHERE id = ?", [new Date(Date.now() - 1000).toISOString(), first.row.id]);
     assert.equal(await pairing.exchangePairing(first.code, "1.2.3.4"), null, "an expired code is refused");
     assert.equal((await db.getPairing(first.row.id))?.status, "expired");
 

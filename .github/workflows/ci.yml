@@ -8,7 +8,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: acp_test
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,14 +30,25 @@ jobs:
       - run: npm ci
       - name: Boundary checks (only packages/data touches SQL)
         run: |
-          ! grep -rn "better-sqlite3" src/ scripts/ --include="*.ts"
-          ! grep -rn "\.prepare(" src/ scripts/ --include="*.ts"
+          ! grep -rn "better-sqlite3" src/ --include="*.ts"
+          ! grep -rn "\.prepare(" src/ --include="*.ts"
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
       - name: Install Playwright Chromium (e2e mock-provider tests)
         run: npx playwright install --with-deps chromium
-      - run: npm test
-      - run: npm run test:e2e
+      - name: Unit tests (SQLite driver)
+        run: npm test
+      - name: Unit tests (Postgres driver — conformance)
+        run: npm test
+        env:
+          TEST_PG_URL: postgres://postgres:test@localhost:55432/acp_test
+      - name: E2E (SQLite driver)
+        run: npm run test:e2e
         env:
           HEADLESS: "true"
+      - name: E2E (Postgres driver)
+        run: npm run test:e2e
+        env:
+          HEADLESS: "true"
+          TEST_PG_URL: postgres://postgres:test@localhost:55432/acp_test

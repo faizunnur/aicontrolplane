@@ -20,7 +20,10 @@ const log = logger("persist");
   Screenshots are not mirrored; they are regenerated on the next look.
 */
 
-const url = process.env.DATABASE_URL || process.env.PERSIST_DATABASE_URL || "";
+// DATABASE_URL now means "Postgres is the primary database" (config.db.driver = pg), in which
+// case nothing here runs — rows already live in Postgres. The file mirror remains only for
+// SQLite-mode deployments that set PERSIST_DATABASE_URL explicitly.
+const url = config.db.driver === "sqlite" ? process.env.PERSIST_DATABASE_URL || "" : "";
 export const persistEnabled = !!url;
 const FILES = ["acp.sqlite", "platforms.json", "sessions.json"] as const;
 
@@ -114,6 +117,7 @@ async function snapshot(name: string): Promise<Buffer | null> {
   if (!fs.existsSync(local)) return null;
   if (name !== "acp.sqlite") return fs.readFileSync(local);
   const { db } = await import("./db.js");
+  if (!db) return null; // Postgres mode: rows are already in the database
   const tmp = path.join(config.dataDir, `.snapshot-${process.pid}.sqlite`);
   try {
     await db.backup(tmp);

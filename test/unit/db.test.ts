@@ -9,10 +9,14 @@ const { beginRun, endRun, RunTracker, requestCancel, CancelledError } = await im
 describe("schema", () => {
   it("applies every migration to a fresh database", async () => {
     const applied = (await db.schemaVersion()).map((m) => m.id);
-    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6]);
-    const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    for (const t of ["tasks", "runs", "run_events", "agent_profiles", "messages", "conversations", "policies", "approvals", "audit_log", "sessions"]) assert.ok(tables.includes(t), `missing table ${t}`);
-    assert.ok(!tables.includes("agents"), "the agents table is renamed to tasks");
+    // SQLite replays its historical chain; Postgres starts from its own baseline (id 100+).
+    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6]);
+    else assert.ok(applied.includes(100), "postgres baseline applied");
+    if (db.db) {
+      const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+      for (const t of ["tasks", "runs", "run_events", "agent_profiles", "messages", "conversations", "policies", "approvals", "audit_log", "sessions"]) assert.ok(tables.includes(t), `missing table ${t}`);
+      assert.ok(!tables.includes("agents"), "the agents table is renamed to tasks");
+    }
   });
 });
 

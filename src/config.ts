@@ -58,10 +58,25 @@ const adminToken = process.env.ACP_ADMIN_TOKEN || "";
 const ingestToken = process.env.ACP_INGEST_TOKEN || "";
 void randomBytes;
 
+/**
+ * Which engine holds the rows. DATABASE_URL selects Postgres (the source of truth for any
+ * deployment with more than one process); without it, the local SQLite file serves the
+ * single-container mode. DB_DRIVER=sqlite forces the file even when a URL is present
+ * (PERSIST_DATABASE_URL then still enables the legacy whole-file mirror).
+ */
+function dbConfig() {
+  const url = process.env.DATABASE_URL || "";
+  const forced = (process.env.DB_DRIVER || "").toLowerCase();
+  const driver: "sqlite" | "pg" = forced === "sqlite" ? "sqlite" : forced === "pg" ? "pg" : url ? "pg" : "sqlite";
+  if (driver === "pg" && !url) console.warn("[config] DB_DRIVER=pg but DATABASE_URL is not set");
+  return { driver, url };
+}
+
 export const config = {
   isProd,
   port: num(process.env.PORT, 8080),
   dataDir,
+  db: dbConfig(),
   dbPath: path.join(dataDir, "acp.sqlite"),
   profileDir: path.join(dataDir, "profile"),
   screenshotDir: path.join(dataDir, "screenshots"),

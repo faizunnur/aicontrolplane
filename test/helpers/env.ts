@@ -2,6 +2,7 @@
  * Import this first in every unit test. It points the app at a throw-away data folder and
  * turns off everything that would reach outside the process (browser, scheduler, LLM routing).
  */
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,3 +16,21 @@ process.env.NODE_ENV = "test";
 process.env.LOG_LEVEL = process.env.LOG_LEVEL || "error";
 delete process.env.DATABASE_URL;
 delete process.env.RAILWAY_VOLUME_MOUNT_PATH;
+
+/**
+ * Conformance mode: TEST_PG_URL points at a Postgres server, and the whole suite runs against
+ * it instead of SQLite. Each test process gets its own throw-away database, because the files
+ * run in parallel and every one assumes a fresh store.
+ */
+export const testDriver: "sqlite" | "pg" = process.env.TEST_PG_URL ? "pg" : "sqlite";
+if (process.env.TEST_PG_URL) {
+  const { default: pg } = await import("pg");
+  const admin = new pg.Client({ connectionString: process.env.TEST_PG_URL });
+  await admin.connect();
+  const name = `acp_unit_${randomBytes(6).toString("hex")}`;
+  await admin.query(`CREATE DATABASE ${name}`);
+  await admin.end();
+  const url = new URL(process.env.TEST_PG_URL);
+  url.pathname = `/${name}`;
+  process.env.DATABASE_URL = url.toString();
+}
