@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { base, BUILTIN_DEFAULTS } from "./providers/defaults.js";
-import type { PlatformConfig } from "./types.js";
+import type { PlatformConfig } from "../packages/core/src/index.js";
 
 const log = logger("platforms");
 

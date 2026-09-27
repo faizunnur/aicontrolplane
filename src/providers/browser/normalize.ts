@@ -1,4 +1,4 @@
-import type { PlatformConfig, RunStatus } from "../../types.js";
+import type { PlatformConfig, RunStatus } from "../../../packages/core/src/index.js";
 
 /**
  * Structural normaliser. Web apps rename their endpoints, but a scheduled task

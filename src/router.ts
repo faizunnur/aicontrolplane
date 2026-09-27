@@ -7,7 +7,7 @@ import { getPlatformState, listTasks } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatforms, visiblePlatforms } from "./platforms.js";
 import { getProvider } from "./providers/registry.js";
-import type { Task, PlatformConfig, Suggestion } from "./types.js";
+import type { Task, PlatformConfig, Suggestion } from "../packages/core/src/index.js";
 
 const log = logger("router");
 

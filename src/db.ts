@@ -27,7 +27,7 @@ import type {
   StepStatus,
   Task,
   TaskSource,
-} from "./types.js";
+} from "../packages/core/src/index.js";
 
 fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
 export const db = new Database(config.dbPath);

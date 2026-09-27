@@ -1,4 +1,4 @@
-import type { PlatformConfig, SessionStatus } from "../types.js";
+import type { PlatformConfig, SessionStatus } from "../../packages/core/src/index.js";
 import {
   UnsupportedOperationError,
   type ActionResult,

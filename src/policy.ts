@@ -2,7 +2,7 @@ import { bus } from "./bus.js";
 import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSetting, listApprovals, setPolicyOverride, setSetting, updateApproval, updateMessage, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
 import { endRun, type RunTracker } from "./runs.js";
-import type { PolicyMode } from "./types.js";
+import type { PolicyMode } from "../packages/core/src/index.js";
 
 const log = logger("policy");
 

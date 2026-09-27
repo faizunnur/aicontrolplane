@@ -6,7 +6,7 @@ import { getProvider } from "./providers/registry.js";
 import type { ActionResult, ExecutionContext } from "./providers/types.js";
 import { beginRun, endRun } from "./runs.js";
 import { syncProvider } from "./sync.js";
-import type { PlatformConfig, Task } from "./types.js";
+import type { PlatformConfig, Task } from "../packages/core/src/index.js";
 
 export type { ActionResult } from "./providers/types.js";
 

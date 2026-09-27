@@ -2,7 +2,7 @@ import { getAgentProfile, listTasks, updateTask, upsertAgentProfile, type AgentP
 import { logger } from "./logger.js";
 import { getProvider } from "./providers/registry.js";
 import type { ProviderOperation } from "./providers/types.js";
-import type { Task } from "./types.js";
+import type { Task } from "../packages/core/src/index.js";
 
 const log = logger("agents");
 

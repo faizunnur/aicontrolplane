@@ -1,6 +1,6 @@
 import { addRunEvent, finishRun, foldSteps, getMessage, getRun, listRuns, runEvents, startRun, updateMessage, type StartRunInput } from "./db.js";
 import { logger } from "./logger.js";
-import type { Run, RunStatus, Step, StepStatus } from "./types.js";
+import type { Run, RunStatus, Step, StepStatus } from "../packages/core/src/index.js";
 
 const log = logger("runs");
 

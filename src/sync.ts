@@ -8,7 +8,7 @@ import { syncablePlatforms } from "./platforms.js";
 import { getProvider } from "./providers/registry.js";
 import type { ExecutionContext, ProviderAdapter } from "./providers/types.js";
 import { beginRun, endRun } from "./runs.js";
-import type { SessionStatus } from "./types.js";
+import type { SessionStatus } from "../packages/core/src/index.js";
 
 const log = logger("sync");
 

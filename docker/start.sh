@@ -20,4 +20,4 @@ if [ "${HEADLESS:-false}" != "true" ]; then
   echo "[start] virtual display + noVNC bridge up on 127.0.0.1:6080"
 fi
 
-exec node dist/bootstrap.js
+exec node dist/src/bootstrap.js

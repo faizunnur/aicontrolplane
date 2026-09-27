@@ -1,4 +1,4 @@
-import type { PlatformConfig } from "../types.js";
+import type { PlatformConfig } from "../../packages/core/src/index.js";
 
 /*
   Built-in provider configuration. Every field can be overridden per provider in

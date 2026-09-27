@@ -2,7 +2,7 @@ import type { Page } from "playwright";
 import { browser } from "../../browser/manager.js";
 import { cleanError, PageController } from "../../browser/page.js";
 import { logger } from "../../logger.js";
-import type { ActionStep, PlatformConfig } from "../../types.js";
+import type { ActionStep, PlatformConfig } from "../../../packages/core/src/index.js";
 import type { ActionResult, ExecutionContext } from "../types.js";
 
 const log = logger("browser-actions");

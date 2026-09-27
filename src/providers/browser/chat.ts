@@ -4,7 +4,7 @@ import { cleanError, isStall, PageController } from "../../browser/page.js";
 import { setPlatformState } from "../../db.js";
 import { logger } from "../../logger.js";
 import { CancelledError, isCancelled, type RunTracker } from "../../runs.js";
-import type { PlatformConfig, SessionStatus } from "../../types.js";
+import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ChatResult } from "../types.js";
 import { detectLoginState } from "./login.js";
 

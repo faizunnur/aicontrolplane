@@ -7,7 +7,7 @@ import { guard } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import type { ProviderAdapter, TaskRef } from "./providers/types.js";
 import { beginRun, endRun } from "./runs.js";
-import type { Run, RunTrigger } from "./types.js";
+import type { Run, RunTrigger } from "../packages/core/src/index.js";
 
 const log = logger("tasks");
 

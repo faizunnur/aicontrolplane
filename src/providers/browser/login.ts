@@ -1,7 +1,7 @@
 import type { Page } from "playwright";
 import { browser } from "../../browser/manager.js";
 import { compilePatterns } from "../../platforms.js";
-import type { PlatformConfig, SessionStatus } from "../../types.js";
+import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 
 /**
  * Are we signed in on this page? Decided from evidence in this order:

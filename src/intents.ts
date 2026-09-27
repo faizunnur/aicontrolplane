@@ -3,7 +3,7 @@ import { listAgentProfiles, listTasks } from "./db.js";
 import { logger } from "./logger.js";
 import { listProviders } from "./providers/registry.js";
 import { classifyWithClaude, tokenize } from "./router.js";
-import type { Task } from "./types.js";
+import type { Task } from "../packages/core/src/index.js";
 
 const log = logger("intents");
 

@@ -9,7 +9,7 @@ import { getPlatform } from "./platforms.js";
 import { guard } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import { beginRun, endRun } from "./runs.js";
-import type { AgentDelivery, DeliveryMode, Task } from "./types.js";
+import type { AgentDelivery, DeliveryMode, Task } from "../packages/core/src/index.js";
 
 const log = logger("deliver");
 

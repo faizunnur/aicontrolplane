@@ -1,6 +1,6 @@
 import { browser } from "../browser/manager.js";
 import { getPlatformState, getSetting } from "../db.js";
-import type { PlatformConfig, SessionStatus } from "../types.js";
+import type { PlatformConfig, SessionStatus } from "../../packages/core/src/index.js";
 import { runConfiguredAction } from "./browser/actions.js";
 import { checkSignIn, sendThroughBrowser } from "./browser/chat.js";
 import { detectChallenge } from "./browser/login.js";

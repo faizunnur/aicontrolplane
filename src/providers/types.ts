@@ -1,5 +1,5 @@
 import type { RunTracker } from "../runs.js";
-import type { PlatformConfig, RunStatus, RunTrigger, SessionStatus } from "../types.js";
+import type { PlatformConfig, RunStatus, RunTrigger, SessionStatus } from "../../packages/core/src/index.js";
 
 /*
   Providers are execution backends: ChatGPT, Claude, Grok, Gemini, your own agents.

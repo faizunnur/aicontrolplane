@@ -5,7 +5,7 @@ import { config } from "../../config.js";
 import { addCapture, pruneCaptures } from "../../db.js";
 import { logger } from "../../logger.js";
 import { compilePatterns } from "../../platforms.js";
-import type { PlatformConfig, SessionStatus } from "../../types.js";
+import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ExecutionContext, TaskListResult } from "../types.js";
 import { detectLoginState } from "./login.js";
 import { normalizePayloads } from "./normalize.js";

@@ -3,7 +3,7 @@ import { getTask, getPlatformState, listTasks, type MessageWithTask } from "./db
 import { describeMode, resolveMode } from "./deliver.js";
 import { activePairing } from "./pairing.js";
 import { getProvider } from "./providers/registry.js";
-import type { PlatformConfig } from "./types.js";
+import type { PlatformConfig } from "../packages/core/src/index.js";
 
 /* Shapes the UI renders. Shared by the REST routes and the live stream so both agree. */
 
