@@ -624,7 +624,9 @@ export function startRun(input: StartRunInput): Run {
 export function finishRun(id: number, patch: { status: RunStatus; summary?: string | null; error?: string | null; output_url?: string | null; details?: string | null; external_id?: string | null }): Run | undefined {
   const r = getRun(id);
   if (!r) return undefined;
-  db.prepare(`UPDATE runs SET status=?, finished_at=?, summary=?, error=?, output_url=?, details=?, external_id=? WHERE id=?`).run(
+  // Guarded transition: only a running run can be finished. A run that already settled keeps
+  // its outcome, whoever reports later (double finish, late webhook, restart recovery races).
+  const res = db.prepare(`UPDATE runs SET status=?, finished_at=?, summary=?, error=?, output_url=?, details=?, external_id=? WHERE id=? AND status='running'`).run(
     patch.status,
     now(),
     patch.summary === undefined ? r.summary : patch.summary,
@@ -634,6 +636,7 @@ export function finishRun(id: number, patch: { status: RunStatus; summary?: stri
     patch.external_id === undefined ? r.external_id : patch.external_id,
     id,
   );
+  if (res.changes === 0) return r;
   const run = getRun(id)!;
   bus.emit("run", run);
   return run;
@@ -641,6 +644,11 @@ export function finishRun(id: number, patch: { status: RunStatus; summary?: stri
 
 export function getRun(id: number): Run | undefined {
   return db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Run | undefined;
+}
+
+/** Readiness probe: can the database answer a trivial query right now? Throws when it cannot. */
+export function dbReady(): void {
+  db.prepare("SELECT 1").get();
 }
 
 export type RunRow = Run & { task_name: string | null; task_key: string | null; task_native_url: string | null; agent_name: string | null };

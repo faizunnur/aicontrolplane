@@ -102,16 +102,23 @@ export function beginRun(input: StartRunInput): { run: Run; track: RunTracker } 
 
 /** Close a run. Writes the result event, the final status, and clears any cancel flag. */
 export function endRun(runId: number, outcome: { status: RunStatus; summary?: string | null; error?: string | null; output_url?: string | null; external_id?: string | null }): Run | undefined {
+  const run = getRun(runId);
+  if (!run) return undefined;
+  // A settled run never changes its outcome: a late webhook report or a second finish call
+  // must not overwrite what already happened (e.g. flip a failed run to success).
+  if (run.status !== "running") {
+    log.warn(`run #${runId} is already ${run.status}; ignoring late ${outcome.status} finish`);
+    return run;
+  }
   const label = outcome.status === "success" ? "Completed" : outcome.status === "cancelled" ? "Stopped" : outcome.status === "failed" ? "Failed" : outcome.status === "needs_attention" ? "Needs attention" : "Finished";
   // Success closes the timeline with a final step; other outcomes leave their mark on the step that failed and add a result line.
   if (outcome.status === "success") addRunEvent(runId, { type: "step", key: "done", label, status: "done", detail: null });
   else addRunEvent(runId, { type: outcome.status === "failed" ? "error" : "result", label, detail: outcome.error ?? outcome.summary ?? null });
-  const run = getRun(runId);
-  if (run?.message_id && outcome.status === "success") updateMessage(run.message_id, { steps: foldSteps(runEvents(runId)) });
+  if (run.message_id && outcome.status === "success") updateMessage(run.message_id, { steps: foldSteps(runEvents(runId)) });
   clearCancel(runId);
   const finished = finishRun(runId, outcome);
   const summary = (outcome.error ?? outcome.summary ?? "").slice(0, 200);
-  const line = `run #${runId} ${outcome.status}${summary ? `: ${summary}` : ""}${run?.started_at ? ` (${Math.round((Date.now() - new Date(run.started_at).getTime()) / 1000)}s)` : ""}`;
+  const line = `run #${runId} ${outcome.status}${summary ? `: ${summary}` : ""}${run.started_at ? ` (${Math.round((Date.now() - new Date(run.started_at).getTime()) / 1000)}s)` : ""}`;
   if (outcome.status === "failed") log.warn(line);
   else log.info(line);
   // A task run that a chat command started reports back into that message when it ends.

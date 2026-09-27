@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +10,8 @@ import { crossOrigin, isAdmin } from "./auth.js";
 import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
+import { withLogContext } from "./context.js";
+import { dbReady } from "./db.js";
 import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
 import { startEmailPoller } from "./ingest/email.js";
@@ -46,36 +49,41 @@ app.use((req, res, next) => {
   next();
 });
 
+// Every request gets a correlation id, echoed back and stamped onto every log line it causes.
+app.use((req, res, next) => {
+  const fromHeader = req.headers["x-request-id"];
+  const requestId = (typeof fromHeader === "string" && /^[\w.-]{1,64}$/.test(fromHeader) ? fromHeader : "") || randomUUID();
+  (req as express.Request & { requestId?: string }).requestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
+  withLogContext({ request_id: requestId }, () => next());
+});
+
 // Request log: every change and every failure at info or above, reads at debug. Streams and health checks stay quiet.
 app.use((req, res, next) => {
-  if (req.path === "/healthz" || req.path === "/api/stream" || req.path.startsWith("/vnc") || (!req.path.startsWith("/api") && req.method === "GET")) return next();
+  if (req.path === "/healthz" || req.path === "/readyz" || req.path === "/api/stream" || req.path.startsWith("/vnc") || (!req.path.startsWith("/api") && req.method === "GET")) return next();
   const t0 = Date.now();
+  const requestId = (req as express.Request & { requestId?: string }).requestId;
   res.on("finish", () => {
+    // The finish event fires outside the request's async context, so the id travels explicitly.
     const line = `${req.method} ${req.originalUrl.split("?")[0]} → ${res.statusCode} in ${Date.now() - t0}ms`;
-    if (res.statusCode >= 500) log.error(line);
-    else if (res.statusCode >= 400) log.warn(line);
-    else if (req.method === "GET") log.debug(line);
-    else log.info(line);
+    if (res.statusCode >= 500) log.error(line, { request_id: requestId });
+    else if (res.statusCode >= 400) log.warn(line, { request_id: requestId });
+    else if (req.method === "GET") log.debug(line, { request_id: requestId });
+    else log.info(line, { request_id: requestId });
   });
   next();
 });
 
+// Liveness: is the process alive? Never checks dependencies, so a database blip cannot restart the fleet.
 app.get("/healthz", (_req, res) => res.json({ ok: true, browser: browser.isRunning(), at: new Date().toISOString() }));
-
-// When neither PUBLIC_URL nor the host's own domain says where this deployment lives, learn it from
-// the first browser request, so alerts, webhook payloads and the connect command carry a real address.
-// The proxy's forwarded host wins: it is the address the user typed, not the container's internal one.
-app.use((req, _res, next) => {
-  if (!config.publicUrl && !req.path.startsWith("/api/ingest") && !req.path.startsWith("/api/inbox")) {
-    const fwd = req.headers["x-forwarded-host"];
-    const host = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim() || req.headers.host;
-    if (host) {
-      const proto = req.headers["x-forwarded-proto"] === "https" || req.secure ? "https" : "http";
-      config.publicUrl = `${proto}://${host}`;
-      log.info(`public url detected: ${config.publicUrl} (set PUBLIC_URL to pin it)`);
-    }
+// Readiness: can this instance do useful work right now?
+app.get("/readyz", (_req, res) => {
+  try {
+    dbReady();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
-  next();
 });
 
 app.use("/api", api);
@@ -150,7 +158,8 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(config.port, () => {
   log.info(`AI Control Plane listening on :${config.port} (data: ${config.dataDir})`);
-  if (config.publicUrl) log.info(`public url: ${config.publicUrl}`);
+  if (config.publicUrl) log.info(`public url: ${config.publicUrl} (from ${config.publicUrlSource === "env" ? "PUBLIC_URL" : "the host's own domain"})`);
+  else log.warn("PUBLIC_URL is not set: alerts and agent report URLs will have no address, and pairing commands fall back to each request's Host header. Set PUBLIC_URL (or run where RAILWAY_PUBLIC_DOMAIN is provided) to pin it.");
   const st = storageInfo();
   if (st.persistedBy === "none" && st.persistent === false) {
     log.warn(`DATA_DIR ${st.dataDir} is NOT on a mounted volume and no DATABASE_URL is set. Logins, chat history and settings will be lost on redeploy. Attach a volume at ${st.dataDir} or add a Postgres database.`);

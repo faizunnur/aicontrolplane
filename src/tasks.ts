@@ -1,5 +1,6 @@
 import { ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
+import { withLogContext } from "./context.js";
 import { getAgentProfile, getTask, listRuns, listTasks, recentStatusesByTask, type TaskWithLastRun } from "./db.js";
 import { logger } from "./logger.js";
 import { guard } from "./policy.js";
@@ -90,6 +91,8 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
 
   const agent = task.agent_id ? getAgentProfile(task.agent_id) : ensureTaskAgent(task);
   const { run, track } = beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user" });
+  // Everything this run does logs with its id attached.
+  return withLogContext({ run_id: run.id }, async () => {
   track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);
 
   const decision = await guard({ runId: run.id, messageId: opts.messageId ?? null, provider: task.platform, track }, "run_task", `Start "${task.name}" at ${adapter.name}?`, opts.text?.slice(0, 240) ?? null);
@@ -111,4 +114,5 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
     return run;
   }
   return endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null, external_id: r.external_id ?? null })!;
+  });
 }

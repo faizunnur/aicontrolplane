@@ -2,6 +2,7 @@ import { runAction } from "./actions.js";
 import { ensureProviderAgent, ensureTaskAgent } from "./agents.js";
 import { browser } from "./browser/manager.js";
 import { config } from "./config.js";
+import { withLogContext } from "./context.js";
 import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatform } from "./platforms.js";
@@ -66,6 +67,8 @@ export async function deliverToConnection(messageId: number, platformId: string)
   if (!adapter) throw new Error(`unknown provider ${platformId}`);
   const p = adapter.config();
   const { run, track } = beginRun({ kind: "chat", label: `Message to ${p.name}`, provider: p.id, message_id: msg.id, trigger: "user", agent_id: ensureProviderAgent(p.id)?.id ?? null });
+  // Everything this run does logs with its id attached.
+  return withLogContext({ run_id: run.id }, async () => {
   updateMessage(msg.id, { platform: p.id, task_id: null, run_id: run.id, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null, steps: [] });
   track.set("route", `Sending to ${p.name}`, "done", describeRouting(msg.routing));
 
@@ -105,6 +108,7 @@ export async function deliverToConnection(messageId: number, platformId: string)
     log.error(`delivery of message ${msg.id} crashed`, err);
     return fail(error);
   }
+  });
 }
 
 /**

@@ -69,8 +69,12 @@ export const config = {
   adminToken,
   ingestToken,
   publicUrl: fromEnv || fromHost,
-  /** Where that address came from, so the UI can say so and nudge when it is only a guess. */
-  publicUrlSource: (fromEnv ? "env" : fromHost ? "host" : "detected") as "env" | "host" | "detected",
+  /**
+   * Where that address came from, so the UI can say so and nudge when it is missing. It is never
+   * learned from request headers anymore (a spoofed Host on the first request could poison every
+   * alert, webhook and pairing command); "none" means only per-request fallbacks apply.
+   */
+  publicUrlSource: (fromEnv ? "env" : fromHost ? "host" : "none") as "env" | "host" | "none",
 
   browser: {
     enabled: bool(process.env.BROWSER_ENABLED, true),
