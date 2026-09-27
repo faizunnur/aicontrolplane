@@ -1,20 +1,51 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, Response } from "express";
+import { hash as argonHash, verify as argonVerify } from "@node-rs/argon2";
 import { config } from "./config.js";
-import { addAudit, deleteAllSessions, deleteSession, findSession, getSetting, getSettingCached, insertSession, purgeExpiredSessions, setSetting, touchSession } from "./db.js";
+import { withLogContext } from "./context.js";
+import {
+  addAudit,
+  countUsers,
+  createUser,
+  deleteAllSessions,
+  deleteSession,
+  findSession,
+  getSetting,
+  getSettingCached,
+  getUser,
+  getUserByEmail,
+  insertSession,
+  purgeExpiredSessions,
+  setSetting,
+  touchSession,
+  updateUser,
+  type UserRole,
+  type UserRow,
+} from "./db.js";
 
 export const SESSION_COOKIE = "acp_session";
 /** A login lasts this long without use. */
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 
 /*
-  Credentials come from the environment when set (ACP_ADMIN_TOKEN / ACP_INGEST_TOKEN),
-  otherwise from a password the user creates on first visit, stored hashed in the database.
-  A login creates a session: a random token, stored hashed, sent as an HttpOnly cookie, and
-  revocable one by one (logout) or all at once (password change). The ingest token is generated
-  on first run and shown under Settings › Developer.
+  Real accounts. Users live in the users table with argon2id password hashes; a login creates
+  a session (random token, stored hashed, HttpOnly cookie) that knows whose it is. The first
+  user (created at setup, or migrated from the old single admin password) is the owner.
+  Compatibility, deliberately kept:
+    - ACP_ADMIN_TOKEN still works as a bearer credential and as the login password (it acts
+      as the owner), so existing deployments and scripts keep working.
+    - a login without an email works while there is exactly one user — the current UI and
+      every existing test logs in that way.
+    - a migrated "sha256:" hash verifies and upgrades itself to argon2 on the next login.
+  The ingest token is separate and unchanged: agents, not people.
 */
+
+export interface AuthUser {
+  id: number;
+  email: string;
+  role: UserRole;
+}
 
 export function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -29,37 +60,95 @@ function safeEqual(a: string, b: string): boolean {
 const envAdmin = process.env.ACP_ADMIN_TOKEN || "";
 const envIngest = process.env.ACP_INGEST_TOKEN || "";
 
-/** Hash of the admin password, or null when none exists yet (first run). */
-async function adminHash(): Promise<string | null> {
-  if (envAdmin) return tokenHash(envAdmin);
-  return (await getSettingCached("admin_password_hash")) ?? null;
+/** The stand-in owner for ACP_ADMIN_TOKEN logins on deployments with no user rows. */
+const ENV_OWNER: AuthUser = { id: 0, email: "admin@env", role: "owner" };
+
+export async function hashPassword(password: string): Promise<string> {
+  return argonHash(password, { memoryCost: 19_456, timeCost: 2, parallelism: 1 });
 }
+
+/** Verify against an argon2 hash, or a migrated legacy "sha256:" one. */
+export async function verifyPassword(stored: string, password: string): Promise<boolean> {
+  if (stored.startsWith("sha256:")) return safeEqual(tokenHash(password), stored.slice("sha256:".length));
+  try {
+    return await argonVerify(stored, password);
+  } catch {
+    return false;
+  }
+}
+
 export async function setupRequired(): Promise<boolean> {
-  return await adminHash() === null;
+  if (envAdmin) return false;
+  return (await countUsers()) === 0;
 }
 export function adminFromEnv(): boolean {
   return !!envAdmin;
 }
+
+/**
+ * First run: create the owner (and an ingest token). Returns false when users already exist.
+ */
+export async function createAdminPassword(password: string, email = "admin@local"): Promise<boolean> {
+  if (!(await setupRequired())) return false;
+  await createUser({ email, password_hash: await hashPassword(password), role: "owner" });
+  if (!envIngest && !(await getSetting("ingest_token"))) await setSetting("ingest_token", randomBytes(24).toString("hex"));
+  return true;
+}
+
+/**
+ * Who these credentials belong to. Email narrows it; without one, the single existing user
+ * (or the env owner) is meant. A legacy hash that verifies upgrades itself to argon2.
+ */
+export async function verifyUser(password: string, email?: string): Promise<AuthUser | null> {
+  if (envAdmin && safeEqual(password, envAdmin) && (!email || email === ENV_OWNER.email)) return ENV_OWNER;
+  let user: UserRow | undefined;
+  if (email) user = await getUserByEmail(email);
+  else {
+    const n = await countUsers();
+    if (n === 1) user = await getUserByEmail((await (await import("./db.js")).listUsers())[0].email);
+    else if (n > 1) return null; // several accounts: the email says which
+  }
+  if (!user) return null;
+  if (!(await verifyPassword(user.password_hash, password))) return null;
+  if (user.password_hash.startsWith("sha256:")) await updateUser(user.id, { password_hash: await hashPassword(password) });
+  await updateUser(user.id, { last_login_at: new Date().toISOString() });
+  return { id: user.id, email: user.email, role: user.role };
+}
+
+/** Kept for scripts and the bearer path: does this password belong to any account? */
 export async function verifyAdmin(password: string): Promise<boolean> {
-  const h = await adminHash();
-  return h !== null && safeEqual(tokenHash(password), h);
+  if (envAdmin && safeEqual(password, envAdmin)) return true;
+  // Bearer credentials carry no email; accept the password of any user. Argon2 verification
+  // is deliberate work — bearer callers are scripts, not hot paths.
+  const { listUsers } = await import("./db.js");
+  for (const u of await listUsers()) {
+    const row = await getUser(u.id);
+    if (row && (await verifyPassword(row.password_hash, password))) return true;
+  }
+  return false;
 }
-/** First-run only: create the password and an ingest token. Returns false if one already exists. */
-export async function createAdminPassword(password: string): Promise<boolean> {
-  if (!await setupRequired()) return false;
-  await setSetting("admin_password_hash", tokenHash(password));
-  if (!envIngest && !await getSetting("ingest_token")) await setSetting("ingest_token", randomBytes(24).toString("hex"));
-  return true;
-}
-/** Changing the password signs every browser out; the caller issues a fresh session for this one. */
-export async function changeAdminPassword(current: string, next: string): Promise<boolean> {
-  if (envAdmin) return false;
-  if (!await verifyAdmin(current)) return false;
-  await setSetting("admin_password_hash", tokenHash(next));
+
+/** Change the signed-in user's password; every session (all users') stays untouched except theirs. */
+export async function changeAdminPassword(current: string, next: string, user?: AuthUser | null): Promise<boolean> {
+  if (envAdmin && (!user || user.id === 0)) return false;
+  const target = user && user.id !== 0 ? await getUser(user.id) : null;
+  if (target) {
+    if (!(await verifyPassword(target.password_hash, current))) return false;
+    await updateUser(target.id, { password_hash: await hashPassword(next) });
+    const { deleteSessionsForUser } = await import("./db.js");
+    await deleteSessionsForUser(target.id);
+    await addAudit({ actor: target.email, action: "auth.password_changed" });
+    return true;
+  }
+  // No session user resolved (legacy callers): fall back to the single-user behaviour.
+  const who = await verifyUser(current);
+  if (!who || who.id === 0) return false;
+  await updateUser(who.id, { password_hash: await hashPassword(next) });
   await deleteAllSessions();
-  await addAudit({ actor: "you", action: "auth.password_changed" });
+  await addAudit({ actor: who.email, action: "auth.password_changed" });
   return true;
 }
+
 export async function ingestToken(): Promise<string> {
   if (envIngest) return envIngest;
   let t = await getSettingCached("ingest_token");
@@ -106,28 +195,51 @@ export function clientIp(req: IncomingMessage): string {
   return first || req.socket?.remoteAddress || "unknown";
 }
 
-/** Start a session for this browser. Returns the raw token to put in the cookie; only its hash is stored. */
-export async function createSession(req: IncomingMessage): Promise<string> {
+/** Start a session for this user. Returns the raw token to put in the cookie; only its hash is stored. */
+export async function createSession(req: IncomingMessage, user?: AuthUser | null): Promise<string> {
   await purgeExpiredSessions();
   const token = randomBytes(32).toString("base64url");
-  await insertSession({ token_hash: tokenHash(token), expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(), user_agent: String(req.headers["user-agent"] ?? "").slice(0, 300) || null, ip: clientIp(req) });
-  await addAudit({ actor: "you", action: "auth.login", detail: clientIp(req) });
+  await insertSession({
+    token_hash: tokenHash(token),
+    expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
+    user_agent: String(req.headers["user-agent"] ?? "").slice(0, 300) || null,
+    ip: clientIp(req),
+    user_id: user && user.id !== 0 ? user.id : null,
+  });
+  await addAudit({ actor: user?.email ?? "you", action: "auth.login", detail: clientIp(req) });
   return token;
 }
 
 const touched = new Map<number, number>();
-async function sessionFromCookie(req: IncomingMessage) {
+const userCache = new Map<number, { at: number; user: AuthUser | null }>();
+
+async function userById(id: number | null): Promise<AuthUser | null> {
+  if (id === null) {
+    // A session from before accounts existed, or an env-owner login: the first owner.
+    return ENV_OWNER;
+  }
+  const hit = userCache.get(id);
+  if (hit && Date.now() - hit.at < 5_000) return hit.user;
+  const row = await getUser(id);
+  const user = row ? { id: row.id, email: row.email, role: row.role } : null;
+  userCache.set(id, { at: Date.now(), user });
+  return user;
+}
+
+async function sessionFromCookie(req: IncomingMessage): Promise<{ sessionId: number; user: AuthUser } | undefined> {
   const raw = parseCookies(req.headers.cookie)[SESSION_COOKIE];
   if (!raw) return undefined;
   const s = await findSession(tokenHash(raw));
   if (!s) return undefined;
+  const user = await userById(s.user_id);
+  if (!user) return undefined; // the account was deleted; the session dies with it
   // Note activity at most once a minute per session; the row is not worth a write per request.
   const last = touched.get(s.id) ?? 0;
   if (Date.now() - last > 60_000) {
     touched.set(s.id, Date.now());
     await touchSession(s.id);
   }
-  return s;
+  return { sessionId: s.id, user };
 }
 
 /** End this browser's session. */
@@ -139,27 +251,48 @@ export async function revokeSession(req: IncomingMessage): Promise<boolean> {
   return ok;
 }
 
+/** Whoever this request is, or null: a live session, or any account's password as a bearer token. */
+export async function authUser(req: IncomingMessage): Promise<AuthUser | null> {
+  const b = bearer(req);
+  if (b) {
+    if (envAdmin && safeEqual(b, envAdmin)) return ENV_OWNER;
+    if (await verifyAdmin(b)) return ENV_OWNER; // scripts: password, no email — acts as the owner
+  }
+  return (await sessionFromCookie(req))?.user ?? null;
+}
+
 /**
  * Admin access: the password as a bearer token (for scripts), or a live session cookie (the UI).
  * Never a token in the URL: it would land in logs and browser history.
  */
 export async function isAdmin(req: IncomingMessage): Promise<boolean> {
-  const b = bearer(req);
-  if (b && await verifyAdmin(b)) return true;
-  return await sessionFromCookie(req) !== undefined;
+  return (await authUser(req)) !== null;
 }
 
 export async function isIngest(req: IncomingMessage): Promise<boolean> {
   const b = bearer(req);
-  if (b && (safeEqual(b, await ingestToken()) || await verifyAdmin(b))) return true;
+  if (b && (safeEqual(b, await ingestToken()) || (await verifyAdmin(b)))) return true;
   const key = req.headers["x-api-key"];
-  if (typeof key === "string" && (safeEqual(key, await ingestToken()) || await verifyAdmin(key))) return true;
+  if (typeof key === "string" && (safeEqual(key, await ingestToken()) || (await verifyAdmin(key)))) return true;
   return false;
 }
 
 export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  if (await isAdmin(req)) return next();
-  res.status(401).json({ error: "unauthorized", setup: await setupRequired() });
+  const user = await authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized", setup: await setupRequired() });
+  res.locals.user = user;
+  // Every log line and audit row this request causes says who did it.
+  withLogContext({ user: user.email }, () => next());
+}
+
+/** Route gate for role-sensitive endpoints (user management, token rotation, policies). */
+export function requireRole(...roles: UserRole[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const user = res.locals.user as AuthUser | undefined;
+    if (!user) return res.status(401).json({ error: "unauthorized" });
+    if (!roles.includes(user.role)) return res.status(403).json({ error: `this needs one of: ${roles.join(", ")}` });
+    next();
+  };
 }
 
 export async function requireIngest(req: Request, res: Response, next: NextFunction) {

@@ -13,6 +13,14 @@ import {
   addEvent,
   allPlatformStates,
   conversationMessages,
+  countUsers,
+  createUser,
+  deleteSessionsForUser,
+  deleteUser,
+  getUser,
+  getUserByEmail,
+  listUsers,
+  updateUser,
   createConversation,
   createMessage,
   deleteAgentProfile,
@@ -85,8 +93,11 @@ import {
   revokeSession,
   rotateIngestToken,
   sessionCookieHeader,
+  hashPassword,
+  requireRole,
   setupRequired,
-  verifyAdmin,
+  verifyUser,
+  type AuthUser,
 } from "../auth.js";
 import { rateLimit } from "../ratelimit.js";
 import { isSyncRunning, schedulerStatus } from "../sync.js";
@@ -140,19 +151,24 @@ const loginLimit = rateLimit({ name: "login", max: 10, windowMs: 10 * 60_000 });
 api.get("/setup", async (_req, res) => res.json({ setupRequired: await setupRequired(), passwordFromEnv: adminFromEnv() }));
 api.post("/setup", loginLimit, async (req, res) => {
   const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const email = typeof req.body?.email === "string" && req.body.email.includes("@") ? req.body.email.trim().toLowerCase().slice(0, 200) : undefined;
   if (password.length < 8) return bad(res, "Use at least 8 characters.");
-  if (!await createAdminPassword(password)) return bad(res, "A password already exists. Sign in instead.", 409);
-  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req)));
-  res.json({ ok: true });
+  if (!await createAdminPassword(password, email)) return bad(res, "An account already exists. Sign in instead.", 409);
+  const user = await verifyUser(password, email);
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req, user)));
+  res.json({ ok: true, user: user ? { email: user.email, role: user.role } : null });
 });
 api.post("/session", loginLimit, async (req, res) => {
   const token = typeof req.body?.token === "string" ? req.body.token : typeof req.body?.password === "string" ? req.body.password : "";
-  if (!await verifyAdmin(token)) {
-    await addAudit({ actor: clientIp(req), action: "auth.login_failed" });
-    return res.status(401).json({ error: "That password was not accepted.", setup: await setupRequired() });
+  const email = typeof req.body?.email === "string" && req.body.email ? req.body.email.trim().toLowerCase().slice(0, 200) : undefined;
+  const user = await verifyUser(token, email);
+  if (!user) {
+    await addAudit({ actor: clientIp(req), action: "auth.login_failed", detail: email ?? null });
+    const several = (await countUsers()) > 1 && !email;
+    return res.status(401).json({ error: several ? "Several accounts exist here; sign in with your email and password." : "That password was not accepted.", setup: await setupRequired(), needsEmail: several });
   }
-  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req)));
-  res.json({ ok: true });
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req, user)));
+  res.json({ ok: true, user: { email: user.email, role: user.role } });
 });
 api.delete("/session", async (req, res) => {
   await revokeSession(req);
@@ -160,7 +176,8 @@ api.delete("/session", async (req, res) => {
   res.json({ ok: true });
 });
 api.get("/session", requireAdmin, (_req, res) => {
-  res.json({ ok: true, admin: true, publicUrl: config.publicUrl });
+  const user = res.locals.user as AuthUser;
+  res.json({ ok: true, admin: true, publicUrl: config.publicUrl, user: { email: user.email, role: user.role } });
 });
 
 /* ---------- signing in from your own computer ----------
@@ -844,12 +861,46 @@ api.post("/settings/password", async (req, res) => {
   const current = String(req.body?.current ?? "");
   const next = String(req.body?.next ?? "");
   if (next.length < 8) return bad(res, "Use at least 8 characters.");
-  if (adminFromEnv()) return bad(res, "The password is set by ACP_ADMIN_TOKEN on the server; change it there.", 409);
-  if (!await changeAdminPassword(current, next)) return bad(res, "Current password is wrong.", 401);
-  // Every other browser is signed out; this one continues on a fresh session.
-  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req)));
+  if (adminFromEnv() && (res.locals.user as AuthUser).id === 0) return bad(res, "The password is set by ACP_ADMIN_TOKEN on the server; change it there.", 409);
+  if (!await changeAdminPassword(current, next, res.locals.user as AuthUser)) return bad(res, "Current password is wrong.", 401);
+  // Every other browser of THIS account is signed out; this one continues on a fresh session.
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req, res.locals.user as AuthUser)));
   res.json({ ok: true });
 });
+/* ---------- accounts (people who sign in here) ---------- */
+
+api.get("/users", requireRole("owner", "admin"), async (_req, res) => res.json(await listUsers()));
+api.post("/users", requireRole("owner", "admin"), async (req, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase().slice(0, 200) : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const role = req.body?.role === "admin" || req.body?.role === "member" ? req.body.role : "member";
+  if (!email.includes("@")) return bad(res, "A real email address, please.");
+  if (password.length < 8) return bad(res, "Use at least 8 characters.");
+  if (await getUserByEmail(email)) return bad(res, "That email already has an account.", 409);
+  const u = await createUser({ email, password_hash: await hashPassword(password), role });
+  await addAudit({ actor: (res.locals.user as AuthUser).email, action: "user.created", target: email, detail: role });
+  res.json({ ok: true, user: { id: u.id, email: u.email, role: u.role } });
+});
+api.put("/users/:id/role", requireRole("owner"), async (req, res) => {
+  const role = req.body?.role;
+  if (role !== "owner" && role !== "admin" && role !== "member") return bad(res, "role must be owner, admin or member");
+  const u = await getUser(num(req.params.id, 0));
+  if (!u) return bad(res, "not found", 404);
+  await updateUser(u.id, { role });
+  await addAudit({ actor: (res.locals.user as AuthUser).email, action: "user.role_changed", target: u.email, detail: role });
+  res.json({ ok: true });
+});
+api.delete("/users/:id", requireRole("owner"), async (req, res) => {
+  const u = await getUser(num(req.params.id, 0));
+  if (!u) return bad(res, "not found", 404);
+  const me = res.locals.user as AuthUser;
+  if (u.id === me.id) return bad(res, "You cannot delete your own account.", 409);
+  await deleteSessionsForUser(u.id);
+  await deleteUser(u.id);
+  await addAudit({ actor: me.email, action: "user.deleted", target: u.email });
+  res.json({ ok: true });
+});
+
 /** Who did what: logins, approvals, policy changes, exports, live-view control. */
 api.get("/audit", async (req, res) => res.json(await listAudit({ limit: num(req.query.limit, 100), action: typeof req.query.action === "string" ? req.query.action : undefined })));
 /** The server log, from memory: the last lines at any level, for debugging from inside the product. */

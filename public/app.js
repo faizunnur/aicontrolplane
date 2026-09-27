@@ -117,11 +117,17 @@
   $("#gate-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const password = $("#gate-password").value;
+    const email = $("#gate-email").value.trim() || undefined;
     try {
-      if (gateMode === "setup") await api("/setup", { method: "POST", body: { password } });
+      if (gateMode === "setup") await api("/setup", { method: "POST", body: { password, email } });
       else {
-        const res = await fetch("/api/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }) });
-        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "That password was not accepted.");
+        const res = await fetch("/api/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password, email }) });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          // Several accounts exist: show the email field and let them try again with it.
+          if (data.needsEmail) $("#gate-email").hidden = false;
+          throw new Error(data.error || "That password was not accepted.");
+        }
       }
       $("#gate").hidden = true;
       $("#gate-error").hidden = true;

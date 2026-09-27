@@ -1017,6 +1017,61 @@ export async function listAudit(opts: { limit?: number; action?: string } = {}):
   return q.all<AuditEntry>("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", [limit]);
 }
 
+/* ---------- users ---------- */
+
+export type UserRole = "owner" | "admin" | "member";
+export interface UserRow {
+  id: number;
+  email: string;
+  password_hash: string;
+  role: UserRole;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string | null;
+}
+
+export async function createUser(input: { email: string; password_hash: string; role?: UserRole }): Promise<UserRow> {
+  const ts = now();
+  const row = await q.get<{ id: number }>("INSERT INTO users (email, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING id", [
+    input.email.trim().toLowerCase(),
+    input.password_hash,
+    input.role ?? "member",
+    ts,
+    ts,
+  ]);
+  return (await getUser(row!.id))!;
+}
+export async function getUser(id: number): Promise<UserRow | undefined> {
+  return q.get<UserRow>("SELECT * FROM users WHERE id = ?", [id]);
+}
+export async function getUserByEmail(email: string): Promise<UserRow | undefined> {
+  return q.get<UserRow>("SELECT * FROM users WHERE email = ?", [email.trim().toLowerCase()]);
+}
+export async function listUsers(): Promise<Omit<UserRow, "password_hash">[]> {
+  return q.all<Omit<UserRow, "password_hash">>("SELECT id, email, role, created_at, updated_at, last_login_at FROM users ORDER BY id");
+}
+export async function countUsers(): Promise<number> {
+  return (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM users"))!.n;
+}
+export async function updateUser(id: number, patch: { password_hash?: string; role?: UserRole; last_login_at?: string }): Promise<UserRow | undefined> {
+  const u = await getUser(id);
+  if (!u) return undefined;
+  await q.run("UPDATE users SET password_hash = ?, role = ?, last_login_at = ?, updated_at = ? WHERE id = ?", [
+    patch.password_hash ?? u.password_hash,
+    patch.role ?? u.role,
+    patch.last_login_at ?? u.last_login_at,
+    now(),
+    id,
+  ]);
+  return getUser(id);
+}
+export async function deleteUser(id: number): Promise<boolean> {
+  return (await q.run("DELETE FROM users WHERE id = ?", [id])).changes > 0;
+}
+export async function deleteSessionsForUser(userId: number): Promise<number> {
+  return (await q.run("DELETE FROM sessions WHERE user_id = ?", [userId])).changes;
+}
+
 /* ---------- login sessions ---------- */
 
 export interface SessionRow {
@@ -1027,17 +1082,19 @@ export interface SessionRow {
   expires_at: string;
   user_agent: string | null;
   ip: string | null;
+  user_id: number | null;
 }
 
-export async function insertSession(input: { token_hash: string; expires_at: string; user_agent?: string | null; ip?: string | null }): Promise<SessionRow> {
+export async function insertSession(input: { token_hash: string; expires_at: string; user_agent?: string | null; ip?: string | null; user_id?: number | null }): Promise<SessionRow> {
   const ts = now();
-  const row = await q.get<{ id: number }>("INSERT INTO sessions (token_hash, created_at, last_seen_at, expires_at, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?) RETURNING id", [
+  const row = await q.get<{ id: number }>("INSERT INTO sessions (token_hash, created_at, last_seen_at, expires_at, user_agent, ip, user_id) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", [
     input.token_hash,
     ts,
     ts,
     input.expires_at,
     input.user_agent ?? null,
     input.ip ?? null,
+    input.user_id ?? null,
   ]);
   return (await q.get<SessionRow>("SELECT * FROM sessions WHERE id = ?", [row!.id]))!;
 }
