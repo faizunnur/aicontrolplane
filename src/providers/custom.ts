@@ -1,3 +1,5 @@
+import { openMaybe } from "../secrets.js";
+import { egressFetch } from "../egress.js";
 import type { PlatformConfig, SessionStatus } from "../../packages/core/src/index.js";
 import {
   UnsupportedOperationError,
@@ -113,9 +115,10 @@ export class CustomProviderAdapter implements ProviderAdapter {
     const hook = this.webhook(task);
     if (!hook) return { ok: false, message: this.canRunTask(task).reason ?? "no webhook" };
     try {
-      const res = await fetch(hook.url, {
+      const token = await openMaybe(hook.token);
+      const res = await egressFetch(hook.url, {
         method: "POST",
-        headers: { "content-type": "application/json", ...(hook.token ? { authorization: `Bearer ${hook.token}` } : {}) },
+        headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify({ type: "run_task", run_id: input.run_id ?? null, task: { key: task.key, name: task.name, platform: this.id }, text: input.text ?? null, report_url: input.report_url ?? null }),
         signal: AbortSignal.timeout(20_000),
       });

@@ -40,13 +40,27 @@ import { openPg } from "./pg.js";
       conformance for that is the unit suite executed against both drivers in CI.
 */
 
-/** How the data layer announces a change (topic, payload). Wired in initData. */
-export type Notify = (topic: string, payload: unknown) => void;
+/** How the data layer announces a change (topic, payload, outbox id when logged). Wired in initData. */
+export type Notify = (topic: string, payload: unknown, outboxId?: number) => void;
 
 let q: SqlDriver;
 /** The raw SQLite handle — only in sqlite mode, only for the legacy file-mirror backup. */
 export let db: Database.Database | undefined;
 let _notify: Notify = () => {};
+let _seal: ((value: string) => Promise<string>) | null = null;
+
+/** Keys inside task configuration/delivery whose values are credentials, sealed at rest. */
+const SECRET_TASK_KEYS = new Set(["fire_token", "webhook_token"]);
+async function sealSecretsIn<T extends Record<string, unknown> | null | undefined>(obj: T): Promise<T> {
+  if (!obj || !_seal) return obj;
+  const out: Record<string, unknown> = { ...obj };
+  for (const k of Object.keys(out)) {
+    const v = out[k];
+    if (SECRET_TASK_KEYS.has(k) && typeof v === "string" && v && !v.startsWith("enc1:")) out[k] = await _seal(v);
+    else if (v && typeof v === "object" && !Array.isArray(v)) out[k] = await sealSecretsIn(v as Record<string, unknown>);
+  }
+  return out as T;
+}
 /**
  * Every announced change is first appended to the outbox — the durable, ordered event log
  * with a monotonic id (the replay cursor for reconnecting clients, and what a relay tails
@@ -54,22 +68,26 @@ let _notify: Notify = () => {};
  * bus today). A log append failing must never break the write it describes.
  */
 const notify: Notify = (topic, payload) => {
-  void appendOutbox(topic, payload).catch(() => undefined);
-  try {
-    _notify(topic, payload);
-  } catch {
-    /* an announcement failing must never break the write it announces */
-  }
+  void appendOutbox(topic, payload)
+    .catch(() => undefined)
+    .then((id) => {
+      try {
+        _notify(topic, payload, id ?? undefined);
+      } catch {
+        /* an announcement failing must never break the write it announces */
+      }
+    });
 };
 
-async function appendOutbox(topic: string, payload: unknown): Promise<void> {
+async function appendOutbox(topic: string, payload: unknown): Promise<number | undefined> {
   let body: string | null = null;
   try {
     body = payload === undefined ? null : JSON.stringify(payload);
   } catch {
     body = null;
   }
-  await q.run("INSERT INTO outbox (topic, payload, created_at, published_at) VALUES (?, ?, ?, ?)", [topic, body, now(), now()]);
+  const row = await q.get<{ id: number }>("INSERT INTO outbox (topic, payload, created_at, published_at) VALUES (?, ?, ?, ?) RETURNING id", [topic, body, now(), now()]);
+  return row?.id;
 }
 
 /** Outbox entries after a cursor, oldest first — the replay path for reconnecting consumers. */
@@ -94,12 +112,15 @@ export interface InitDataOptions {
   /** Force an engine regardless of databaseUrl. */
   driver?: "sqlite" | "pg";
   notify?: Notify;
+  /** Seals a secret value for storage (envelope encryption). Without it, secrets stay as given. */
+  sealSecret?: (value: string) => Promise<string>;
 }
 
 /** Open the database, apply the schema, and wire the change announcer. Idempotent. */
 export async function initData(opts: InitDataOptions): Promise<void> {
   if (q) {
     if (opts.notify) _notify = opts.notify;
+    if (opts.sealSecret) _seal = opts.sealSecret;
     return;
   }
   const engine = opts.driver ?? (opts.databaseUrl ? "pg" : "sqlite");
@@ -112,6 +133,7 @@ export async function initData(opts: InitDataOptions): Promise<void> {
     db = opened.raw;
   }
   if (opts.notify) _notify = opts.notify;
+  if (opts.sealSecret) _seal = opts.sealSecret;
 }
 
 export async function closeData(): Promise<void> {
@@ -198,7 +220,8 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
   const existing = await findTask(input.platform, input.key);
   const ts = now();
   const meta = input.meta === undefined ? undefined : JSON.stringify(input.meta);
-  const conf = input.configuration === undefined ? undefined : input.configuration === null ? null : JSON.stringify(input.configuration);
+  const conf = input.configuration === undefined ? undefined : input.configuration === null ? null : JSON.stringify(await sealSecretsIn(input.configuration));
+  const sealedDelivery = input.delivery === undefined || input.delivery === null ? input.delivery : await sealSecretsIn(input.delivery as unknown as Record<string, unknown>);
   if (existing) {
     await q.run(
       `UPDATE tasks SET
@@ -228,7 +251,7 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
         input.enabled === undefined ? null : input.enabled ? 1 : 0,
         meta ?? null,
         input.keywords ?? null,
-        input.delivery === undefined || input.delivery === null ? null : JSON.stringify(input.delivery),
+        sealedDelivery === undefined || sealedDelivery === null ? null : JSON.stringify(sealedDelivery),
         input.agent_id ?? null,
         input.prompt ?? null,
         input.next_run ?? null,
@@ -256,7 +279,7 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
       input.enabled === false ? 0 : 1,
       meta ?? null,
       input.keywords ?? null,
-      input.delivery ? JSON.stringify(input.delivery) : null,
+      sealedDelivery ? JSON.stringify(sealedDelivery) : null,
       input.agent_id ?? null,
       input.prompt ?? null,
       input.next_run ?? null,
@@ -286,11 +309,11 @@ export async function updateTask(id: number, patch: Partial<TaskInput>): Promise
       patch.platform ?? t.platform,
       patch.key ?? t.key,
       patch.keywords === undefined ? t.keywords : patch.keywords,
-      patch.delivery === undefined ? t.delivery : patch.delivery === null ? null : JSON.stringify(patch.delivery),
+      patch.delivery === undefined ? t.delivery : patch.delivery === null ? null : JSON.stringify(await sealSecretsIn(patch.delivery as unknown as Record<string, unknown>)),
       patch.agent_id === undefined ? t.agent_id : patch.agent_id,
       patch.prompt === undefined ? t.prompt : patch.prompt,
       patch.next_run === undefined ? t.next_run : patch.next_run,
-      patch.configuration === undefined ? t.configuration : patch.configuration === null ? null : JSON.stringify(patch.configuration),
+      patch.configuration === undefined ? t.configuration : patch.configuration === null ? null : JSON.stringify(await sealSecretsIn(patch.configuration)),
       now(),
       id,
     ],

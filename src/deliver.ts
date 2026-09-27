@@ -3,8 +3,10 @@ import { ensureProviderAgent, ensureTaskAgent } from "./agents.js";
 
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
+import { egressFetch } from "./egress.js";
 import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
+import { openMaybe } from "./secrets.js";
 import { getPlatform, refreshPlatformsNow } from "./platforms.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
@@ -44,6 +46,11 @@ export function describeMode(mode: DeliveryMode): string {
     browser: "typed into the provider through the cloud browser",
     manual: "copy it and paste it into the provider yourself",
   }[mode];
+}
+
+async function webhookAuthHeader(token: string | null | undefined): Promise<Record<string, string>> {
+  const t = await openMaybe(token ?? null);
+  return t ? { authorization: `Bearer ${t}` } : {};
 }
 
 function describeRouting(routing: string | null): string {
@@ -210,9 +217,9 @@ async function performWebhookDeliver(runId: number, track: RunTracker, messageId
   const d = parseDelivery(task);
   try {
     await track.start("deliver", `Posting to ${task.name}'s webhook`);
-    const res = await fetch(d.webhook_url!, {
+    const res = await egressFetch(d.webhook_url!, {
       method: "POST",
-      headers: { "content-type": "application/json", ...(d.webhook_token ? { authorization: `Bearer ${d.webhook_token}` } : {}) },
+      headers: { "content-type": "application/json", ...(await webhookAuthHeader(d.webhook_token)) },
       body: JSON.stringify({
         message_id: msg.id,
         run_id: runId,

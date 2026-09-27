@@ -93,8 +93,11 @@ import {
   revokeSession,
   rotateIngestToken,
   sessionCookieHeader,
+  crossOrigin,
   hashPassword,
+  parseCookies,
   requireRole,
+  SESSION_COOKIE,
   setupRequired,
   verifyUser,
   type AuthUser,
@@ -108,6 +111,21 @@ import { getProvider, listProviders, providerView, requireProvider } from "../pr
 import { connectedPlatforms, routeToConnection } from "../router.js";
 
 export const api = Router();
+
+// CSRF: a state-changing request that rides the session COOKIE must come from this app's own
+// pages. Bearer-authenticated calls (agents, scripts, the pairing helper) carry no cookie and
+// pass untouched; SameSite=Lax already blocks most vectors — this closes the rest.
+api.use((req, res, next) => {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+  const hasCookie = !!parseCookies(req.headers.cookie)[SESSION_COOKIE];
+  if (!hasCookie) return next();
+  const site = req.headers["sec-fetch-site"];
+  if (typeof site === "string" && site !== "" && site !== "same-origin" && site !== "none") {
+    return res.status(403).json({ error: "cross-site requests cannot use the session cookie" });
+  }
+  if (crossOrigin(req)) return res.status(403).json({ error: "cross-origin requests cannot use the session cookie" });
+  next();
+});
 
 const RUN_STATUS = z.enum(["success", "failed", "running", "needs_attention", "unknown"]);
 const DELIVERY = z

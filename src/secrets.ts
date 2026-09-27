@@ -18,4 +18,9 @@ function get(): Envelope {
 
 export const seal = (plaintext: string): Promise<string> => get().seal(plaintext);
 export const open = (sealed: string): Promise<string> => get().open(sealed);
+/** Unseal when sealed; pass anything else through (values written before sealing existed). */
+export const openMaybe = async (value: string | null | undefined): Promise<string | null> => {
+  if (!value) return value ?? null;
+  return isSealed(value) ? get().open(value) : value;
+};
 export { isSealed };

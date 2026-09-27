@@ -1,6 +1,7 @@
 import { bus } from "./bus.js";
 import { config } from "./config.js";
 import { initData } from "../packages/data/src/index.js";
+import { seal } from "./secrets.js";
 
 /*
   The app's face of the data layer (packages/data): importing this module opens the database
@@ -9,6 +10,6 @@ import { initData } from "../packages/data/src/index.js";
   only the wiring lives here.
 */
 
-await initData({ dbPath: config.dbPath, databaseUrl: config.db.url || undefined, driver: config.db.driver, notify: (topic, payload) => bus.emit(topic, payload) });
+await initData({ dbPath: config.dbPath, databaseUrl: config.db.url || undefined, driver: config.db.driver, notify: (topic, payload, outboxId) => bus.emit(topic, payload, outboxId), sealSecret: (v) => seal(v) });
 
 export * from "../packages/data/src/index.js";

@@ -1,3 +1,5 @@
+import { openMaybe } from "../secrets.js";
+import { egressFetch } from "../egress.js";
 import { BrowserProviderAdapter } from "./browser-adapter.js";
 import type { CapabilityNotes, ExecutionContext, ProviderCapabilities, RunTaskInput, RunTaskResult, TaskRef } from "./types.js";
 
@@ -47,9 +49,9 @@ export class ClaudeAdapter extends BrowserProviderAdapter {
     const can = this.canRunTask(task);
     if (!can.ok) return { ok: false, message: can.reason ?? "not configured" };
     const url = String(task.configuration.fire_url);
-    const token = String(task.configuration.fire_token);
+    const token = String((await openMaybe(String(task.configuration.fire_token))) ?? "");
     try {
-      const res = await fetch(url, {
+      const res = await egressFetch(url, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "anthropic-beta": CLAUDE_ROUTINE_BETA, "anthropic-version": "2023-06-01", "content-type": "application/json" },
         body: JSON.stringify(input.text ? { text: input.text } : {}),

@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { egressFetch } from "./egress.js";
 import { logger } from "./logger.js";
 
 const log = logger("alerts");
@@ -31,7 +32,7 @@ export async function sendAlert(a: AlertInput): Promise<boolean> {
 
   if (config.alerts.webhookUrl) {
     try {
-      const res = await fetch(config.alerts.webhookUrl, {
+      const res = await egressFetch(config.alerts.webhookUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ key: a.key, title: a.title, body: a.body ?? "", link, text, at: new Date().toISOString() }),
