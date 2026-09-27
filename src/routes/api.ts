@@ -12,7 +12,6 @@ import {
   addAudit,
   addEvent,
   allPlatformStates,
-  db,
   conversationMessages,
   createConversation,
   createMessage,
@@ -51,6 +50,7 @@ import {
   recordRun,
   runStats,
   schemaVersion,
+  setRunExternalId,
   setSetting,
   updateAgentProfile,
   updateTask,
@@ -118,10 +118,7 @@ function bad(res: Response, msg: string, code = 400) {
 /** Attach the provider's own id to a run an agent opened, so a later report with the same id updates it. */
 function finishRunExternalId(runId: number, externalId: string) {
   const run = getRun(runId);
-  if (run) finishRunExternal(run.id, externalId);
-}
-function finishRunExternal(runId: number, externalId: string) {
-  db.prepare("UPDATE runs SET external_id = ? WHERE id = ?").run(externalId, runId);
+  if (run) setRunExternalId(run.id, externalId);
 }
 function num(v: unknown, def: number) {
   const n = Number(v);

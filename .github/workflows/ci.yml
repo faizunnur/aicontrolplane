@@ -16,6 +16,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Boundary checks (only packages/data touches SQL)
+        run: |
+          ! grep -rn "better-sqlite3" src/ scripts/ --include="*.ts"
+          ! grep -rn "\.prepare(" src/ scripts/ --include="*.ts"
       - run: npm run typecheck
       - run: npm run build
       - name: Install Playwright Chromium (e2e mock-provider tests)
