@@ -150,8 +150,8 @@ export async function startServer(env: Record<string, string> = {}, opts: { data
   };
 }
 
-/** A worker process (ROLE=worker) sharing the api's database. Health-checked, no login. */
-export async function startWorker(env: Record<string, string>, opts: { dataDir?: string } = {}): Promise<{ port: number; dataDir: string; stop(): Promise<void>; kill(): void }> {
+/** A worker process (ROLE=worker or browser) sharing the api's database. Health-checked, no login. */
+export async function startWorker(env: Record<string, string>, opts: { dataDir?: string; role?: "worker" | "browser" } = {}): Promise<{ port: number; dataDir: string; stop(): Promise<void>; kill(): void }> {
   const port = await freePort();
   const dataDir = opts.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "acp-worker-"));
   fs.mkdirSync(dataDir, { recursive: true });
@@ -159,7 +159,7 @@ export async function startWorker(env: Record<string, string>, opts: { dataDir?:
     cwd: root,
     env: {
       ...process.env,
-      ROLE: "worker",
+      ROLE: opts.role ?? "worker",
       PORT: String(port),
       DATA_DIR: dataDir,
       HEADLESS: "true",

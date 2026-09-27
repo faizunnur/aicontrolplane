@@ -498,6 +498,20 @@ export async function findRunByIdempotencyKey(key: string): Promise<Run | undefi
   return q.get<Run>("SELECT * FROM runs WHERE idempotency_key = ?", [key]);
 }
 
+/**
+ * Running runs with no sign of life since the cutoff: no timeline event and no start after
+ * it. What the reaper fails — a crashed executor's leftovers, never a live run elsewhere.
+ */
+export async function listStaleRunningRuns(cutoffIso: string, limit = 100): Promise<Run[]> {
+  return q.all<Run>(
+    `SELECT r.* FROM runs r
+     WHERE r.status = 'running' AND r.kind != 'external'
+       AND COALESCE((SELECT MAX(e.at) FROM run_events e WHERE e.run_id = r.id), r.started_at, r.created_at) < ?
+     LIMIT ?`,
+    [cutoffIso, limit],
+  );
+}
+
 /** Attach the provider's own id to a run, so a later report with the same id updates it. */
 export async function setRunExternalId(id: number, externalId: string): Promise<void> {
   await q.run("UPDATE runs SET external_id = ? WHERE id = ?", [externalId, id]);

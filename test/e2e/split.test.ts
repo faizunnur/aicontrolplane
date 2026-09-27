@@ -10,7 +10,7 @@ import { MOCK_SELECTORS, startMockProvider } from "../helpers/mock-provider.js";
 import { listenSse, startServer, startWorker, waitFor } from "../helpers/server.js";
 
 describe("split roles: api enqueues, a worker executes", { skip: !process.env.TEST_PG_URL && "needs TEST_PG_URL", timeout: 300_000 }, () => {
-  it("chat flows through the queue to the worker's browser; approvals park and resume across processes", async () => {
+  it("chat lands on the browser worker only; approvals park there and resume across processes", async () => {
     // One database for both processes; the helper derives it from a shared name.
     const pg = await import("pg");
     const admin = new pg.default.Client({ connectionString: process.env.TEST_PG_URL });
@@ -26,7 +26,10 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
     const mock = await startMockProvider();
     // The api serves HTTP and must NOT execute; the worker holds the browser.
     const api = await startServer({ ROLE: "api", DATABASE_URL, REDIS_URL, BROWSER_ENABLED: "false" });
-    const worker = await startWorker({ DATABASE_URL, REDIS_URL });
+    // A core worker with no browser at all, and a browser worker holding Chrome: the browser.*
+    // queues must land only on the latter.
+    const worker = await startWorker({ DATABASE_URL, REDIS_URL, BROWSER_ENABLED: "false" });
+    const browserWorker = await startWorker({ DATABASE_URL, REDIS_URL }, { role: "browser" });
     try {
       await api.api("/connections", { body: { name: "Mock AI", appUrl: mock.url, purpose: "testing" } });
       await api.api("/connections/mock-ai", { method: "PUT", body: { ...MOCK_SELECTORS, chatUrl: mock.url } });
@@ -59,6 +62,7 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
       }, 120_000);
       assert.equal(resumed?.status, "done", `the resume executed on the worker (got ${resumed?.status}: ${resumed?.error ?? ""})`);
     } finally {
+      await browserWorker.stop();
       await worker.stop();
       await api.stop();
       await mock.close();

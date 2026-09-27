@@ -2,7 +2,7 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { BossQueue, InlineQueue, type Queue } from "../packages/queue/src/index.js";
 
-export { JOB, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "../packages/queue/src/index.js";
+export { JOB, resumeJobFor, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "../packages/queue/src/index.js";
 
 const log = logger("queue");
 
@@ -26,7 +26,7 @@ let handlersLoaded = false;
 async function ensureInlineHandlers(): Promise<void> {
   if (handlersLoaded || engine.kind !== "inline") return;
   handlersLoaded = true;
-  (await import("./jobs.js")).registerJobHandlers();
+  (await import("./jobs.js")).registerJobHandlers("all");
 }
 
 export const queue: Queue = {

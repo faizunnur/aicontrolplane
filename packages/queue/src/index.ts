@@ -52,12 +52,24 @@ export interface RunResumeJob {
   decision: "approved" | "rejected" | "timeout";
 }
 
+/**
+ * Job names. The `browser.` prefix marks work that may drive Chrome: those queues are claimed
+ * only by browser-capable processes (ROLE=browser, or ROLE=all), so plain workers scale
+ * without carrying a browser. Everything else is claimed by core workers.
+ */
 export const JOB = {
-  chatDeliver: "chat.deliver",
+  chatDeliver: "browser.chat.deliver",
   dispatchDeliver: "dispatch.deliver",
+  browserDispatchDeliver: "browser.dispatch.deliver",
   taskStart: "task.start",
   runResume: "run.resume",
+  browserRunResume: "browser.run.resume",
 } as const;
+
+/** Which resume queue continues a parked run, by its kind. */
+export function resumeJobFor(kind: string): string {
+  return kind === "task" || kind === "external" ? JOB.runResume : JOB.browserRunResume;
+}
 
 /* ---------- inline engine ---------- */
 

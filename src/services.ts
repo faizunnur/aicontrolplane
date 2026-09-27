@@ -2,11 +2,11 @@ import { backfillAgents } from "./agents.js";
 import { browser } from "./browser/manager.js";
 import { pruneOutbox } from "./db.js";
 import { startEmailPoller } from "./ingest/email.js";
-import { registerJobHandlers } from "./jobs.js";
+import { registerJobHandlers, type HandlerScope } from "./jobs.js";
 import { logger } from "./logger.js";
 import { persistEnabled, startPersistLoop } from "./persist.js";
 import { recoverInterruptedApprovals, sweepApprovals } from "./policy.js";
-import { recoverInterruptedRuns } from "./runs.js";
+import { reapStaleRuns } from "./runs.js";
 import { startScheduler } from "./sync.js";
 
 const log = logger("services");
@@ -17,29 +17,35 @@ const log = logger("services");
   The api role runs none of it — it only enqueues and serves.
 */
 
-export async function startExecutionServices(): Promise<void> {
-  registerJobHandlers();
+export async function startExecutionServices(scope: HandlerScope): Promise<void> {
+  registerJobHandlers(scope);
   if (persistEnabled) startPersistLoop();
-  try {
-    await backfillAgents();
-    // Work that was in flight when the last process stopped is surfaced, never left hanging.
-    const approvals = await recoverInterruptedApprovals();
-    const runs = await recoverInterruptedRuns();
-    if (approvals || runs) log.warn(`recovered after restart: ${approvals} orphaned approval(s) closed, ${runs} interrupted run(s) failed`);
-  } catch (err) {
-    log.error("startup recovery failed", err);
+  if (scope === "core" || scope === "all") {
+    try {
+      await backfillAgents();
+      // Approvals whose run died are closed; parked ones keep waiting. Runs are reaped by
+      // silence, not by boot — another executor may be mid-flight.
+      const approvals = await recoverInterruptedApprovals();
+      if (approvals) log.warn(`recovered after restart: ${approvals} orphaned approval(s) closed`);
+    } catch (err) {
+      log.error("startup recovery failed", err);
+    }
+    startEmailPoller();
+    // Approvals nobody decides expire on a clock (durable timers, not in-memory ones), the
+    // outbox event log keeps a bounded replay window, and silent runs are declared dead.
+    const sweep = setInterval(() => {
+      void sweepApprovals().catch((err) => log.error("approval sweep failed", err));
+      void pruneOutbox().catch((err) => log.error("outbox prune failed", err));
+      void reapStaleRuns().catch((err) => log.error("stale run reap failed", err));
+    }, 60_000);
+    sweep.unref?.();
   }
-  startScheduler();
-  startEmailPoller();
-  // Approvals nobody decides expire on a clock (durable timers, not in-memory ones), and the
-  // outbox event log keeps a bounded replay window.
-  const sweep = setInterval(() => {
-    void sweepApprovals().catch((err) => log.error("approval sweep failed", err));
-    void pruneOutbox().catch((err) => log.error("outbox prune failed", err));
-  }, 60_000);
-  sweep.unref?.();
-  if (browser.enabled) {
-    // Warm the browser so the VNC screen shows something immediately.
-    browser.getContext().catch((err) => log.error("browser failed to launch", err));
+  if (scope === "browser" || scope === "all") {
+    // The sync scheduler drives the browser, so it lives with it (a queue cron later).
+    startScheduler();
+    if (browser.enabled) {
+      // Warm the browser so the VNC screen shows something immediately.
+      browser.getContext().catch((err) => log.error("browser failed to launch", err));
+    }
   }
 }

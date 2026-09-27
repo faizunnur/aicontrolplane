@@ -90,6 +90,7 @@ import {
 } from "../auth.js";
 import { rateLimit } from "../ratelimit.js";
 import { isSyncRunning, schedulerStatus, syncAll, syncProvider } from "../sync.js";
+import { resolveMode } from "../deliver.js";
 import { JOB, queue, type ChatDeliverJob, type DispatchDeliverJob } from "../queue.js";
 import { getProvider, listProviders, providerView, requireProvider } from "../providers/registry.js";
 import { connectedPlatforms, routeToConnection } from "../router.js";
@@ -109,8 +110,10 @@ const DELIVERY = z
 async function assignAndDeliver(messageId: number, agentId: number) {
   await updateMessage(messageId, { task_id: agentId, status: "assigned", error: null, delivered_at: null, acked_at: null });
   // Delivery is a job: inline it completes before this returns; split it lands on a worker
-  // and the thread follows over the stream.
-  await queue.send<DispatchDeliverJob>(JOB.dispatchDeliver, { messageId });
+  // and the thread follows over the stream. A browser-mode delivery goes to a browser-capable process.
+  const task = await getTask(agentId);
+  const jobName = task && resolveMode(task) === "browser" ? JOB.browserDispatchDeliver : JOB.dispatchDeliver;
+  await queue.send<DispatchDeliverJob>(jobName, { messageId });
   return await expandMessage((await getMessage(messageId))!);
 }
 

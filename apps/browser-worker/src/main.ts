@@ -13,7 +13,7 @@ import { onRunEnded } from "../../../src/runs.js";
 import { startExecutionServices } from "../../../src/services.js";
 import { stopScheduler } from "../../../src/sync.js";
 
-const log = logger("worker");
+const log = logger("browser-worker");
 
 /*
   The worker process: claims jobs from the shared queue and runs everything long-lived —
@@ -28,14 +28,14 @@ if (config.redisUrl) {
   await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
   log.info("redis event bridge up");
 }
-await startExecutionServices("core");
+await startExecutionServices("browser");
 await queue.start();
-log.info(`worker up (queue: ${queue.kind}, data: ${config.dataDir})`);
+log.info(`browser worker up (queue: ${queue.kind}, data: ${config.dataDir})`);
 
 // Health probes for the orchestrator: liveness = process; readiness = database reachable.
 const health = http.createServer(async (req, res) => {
   if (req.url === "/healthz") {
-    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, role: "worker" }));
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, role: "browser" }));
     return;
   }
   if (req.url === "/readyz") {
@@ -49,7 +49,7 @@ const health = http.createServer(async (req, res) => {
   }
   res.writeHead(404).end();
 });
-health.listen(config.port, () => log.info(`worker health on :${config.port}`));
+health.listen(config.port, () => log.info(`browser worker health on :${config.port}`));
 
 async function shutdown(signal: string) {
   log.info(`${signal} received, shutting down`);

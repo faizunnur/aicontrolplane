@@ -1,7 +1,7 @@
 import { bus } from "./bus.js";
 import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, setPolicyOverride, setSetting, transitionRun, updateApproval, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
-import { JOB, queue, type RunResumeJob } from "./queue.js";
+import { queue, resumeJobFor, type RunResumeJob } from "./queue.js";
 import { endRun, finishParked, RunTracker } from "./runs.js";
 import type { PolicyMode, Run } from "../packages/core/src/index.js";
 
@@ -162,8 +162,10 @@ export async function decide(id: number, decision: "approved" | "rejected", by =
   await addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
   log.info(`approval #${id} ${decision} by ${by}${reason ? `: ${reason}` : ""}`);
   if (a.run_id) {
-    // Resumption is a job: durable in split mode, immediate inline. The decision itself is already recorded.
-    await queue.send<RunResumeJob>(JOB.runResume, { runId: a.run_id, approvalId: id, decision: decision === "approved" ? "approved" : "rejected" }, { singletonKey: `resume:${id}` });
+    // Resumption is a job: durable in split mode, immediate inline, routed to a browser-capable
+    // process when continuing means driving Chrome. The decision itself is already recorded.
+    const run = await getRun(a.run_id);
+    await queue.send<RunResumeJob>(resumeJobFor(run?.kind ?? "task"), { runId: a.run_id, approvalId: id, decision: decision === "approved" ? "approved" : "rejected" }, { singletonKey: `resume:${id}` });
   }
   return row;
 }
@@ -226,7 +228,8 @@ export async function sweepApprovals(timeoutMs = APPROVAL_TIMEOUT_MS): Promise<n
     if (!row) continue;
     expired++;
     if (a.run_id) {
-      await queue.send<RunResumeJob>(JOB.runResume, { runId: a.run_id, approvalId: a.id, decision: "timeout" }, { singletonKey: `resume:${a.id}` });
+      const run = await getRun(a.run_id);
+      await queue.send<RunResumeJob>(resumeJobFor(run?.kind ?? "task"), { runId: a.run_id, approvalId: a.id, decision: "timeout" }, { singletonKey: `resume:${a.id}` });
     }
     await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval expired undecided", body: a.summary, dedupe_key: `approval_expired:${a.id}` });
   }

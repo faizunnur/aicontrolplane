@@ -180,7 +180,7 @@ server.listen(config.port, async () => {
   }
   if (config.role === "all") {
     // Single-container mode: this process also executes everything it accepts.
-    await startExecutionServices();
+    await startExecutionServices("all");
     await queue.start();
   } else {
     // ROLE=api: enqueue and serve only; workers execute. Connect the shared queue for sends.

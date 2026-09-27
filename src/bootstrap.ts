@@ -14,4 +14,5 @@ try {
 }
 
 if (config.role === "worker") await import("../apps/worker/src/main.js");
+else if (config.role === "browser") await import("../apps/browser-worker/src/main.js");
 else await import("./server.js");

@@ -72,8 +72,8 @@ services:
       ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-change-me-ingest}
       ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
-      # The live browser screen lives on the worker in split mode.
-      VNC_TARGET: http://worker:6080
+      # The live browser screen lives on the browser worker in split mode.
+      VNC_TARGET: http://browser:6080
     depends_on:
       db:
         condition: service_healthy
@@ -83,18 +83,36 @@ services:
 
   worker:
     profiles: ["split"]
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.api
     environment:
       ROLE: worker
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
       REDIS_URL: redis://redis:6379
       ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
-      SYNC_INTERVAL_MIN: ${SYNC_INTERVAL_MIN:-20}
-      VNC_BIND: 0.0.0.0
       IMAP_HOST: ${IMAP_HOST:-}
       IMAP_USER: ${IMAP_USER:-}
       IMAP_PASS: ${IMAP_PASS:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  browser:
+    profiles: ["split"]
+    build: .
+    environment:
+      ROLE: browser
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
+      REDIS_URL: redis://redis:6379
+      ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      SYNC_INTERVAL_MIN: ${SYNC_INTERVAL_MIN:-20}
+      VNC_BIND: 0.0.0.0
     volumes:
       - acp-worker-data:/data
     shm_size: "1g"

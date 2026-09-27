@@ -1,6 +1,6 @@
-import { addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, listRuns, runEvents, setCancelRequested, startRun, transitionRun, updateMessage, type StartRunInput } from "./db.js";
+import { addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, listStaleRunningRuns, runEvents, setCancelRequested, startRun, transitionRun, updateMessage, type StartRunInput } from "./db.js";
 import { logger } from "./logger.js";
-import { ACTIVE_RUN_STATUSES, type Run, type RunStatus, type Step, type StepStatus } from "../packages/core/src/index.js";
+import type { Run, RunStatus, Step, StepStatus } from "../packages/core/src/index.js";
 
 const log = logger("runs");
 
@@ -171,26 +171,27 @@ export async function runForMessage(messageId: number): Promise<Run | undefined>
 }
 
 /**
- * Runs still marked active from before a restart. Work the control plane executes in-process
- * cannot survive its process, so it is failed honestly; runs that live elsewhere (an external
- * agent reporting through the API) are left alone — their callbacks still arrive.
+ * Fail running runs that show no sign of life. With several executors, no process may fail
+ * everything "running" at its own boot — another worker may be mid-chat. Instead, a run whose
+ * timeline has been silent past the threshold (far beyond any legitimate quiet stretch, like
+ * the two-minute reply wait) is declared dead, wherever its executor went. External runs are
+ * never touched: their agents report in on their own schedule.
  */
-export async function recoverInterruptedRuns(): Promise<number> {
-  let recovered = 0;
-  for (const status of ACTIVE_RUN_STATUSES) {
-    const stuck = await listRuns({ status, limit: 500 });
-    for (const run of stuck) {
-      if (run.kind === "external") continue; // executing remotely; the report closes it
-      if (run.status === "waiting" || run.status === "waiting_approval") continue; // parked, durable, resumable
-      const error = "Interrupted by a server restart.";
-      await addRunEvent(run.id, { type: "error", label: "Interrupted", detail: error });
-      await transitionRun(run.id, [run.status], "failed", { error });
-      if (run.message_id) {
-        const m = await getMessage(run.message_id);
-        if (m && (m.status === "assigned" || m.status === "delivered")) await updateMessage(m.id, { status: "failed", error });
-      }
-      recovered++;
+export const STALE_RUN_MS = 30 * 60_000;
+export async function reapStaleRuns(staleMs = STALE_RUN_MS): Promise<number> {
+  const cutoff = new Date(Date.now() - staleMs).toISOString();
+  let reaped = 0;
+  for (const run of await listStaleRunningRuns(cutoff)) {
+    const error = "Its process stopped answering; the run was abandoned.";
+    const failed = await transitionRun(run.id, ["running"], "failed", { error });
+    if (!failed) continue; // it moved on its own — alive after all
+    await addRunEvent(run.id, { type: "error", label: "Abandoned", detail: error });
+    if (run.message_id) {
+      const m = await getMessage(run.message_id);
+      if (m && (m.status === "assigned" || m.status === "delivered")) await updateMessage(m.id, { status: "failed", error });
     }
+    reaped++;
   }
-  return recovered;
+  if (reaped) log.warn(`reaped ${reaped} stale run(s)`);
+  return reaped;
 }
