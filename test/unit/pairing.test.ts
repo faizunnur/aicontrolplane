@@ -12,53 +12,53 @@ const { GROK_DEFAULTS, CHATGPT_DEFAULTS } = await import("../../src/providers/de
 const req = (headers: Record<string, string> = {}, url = "/") => ({ headers, url, socket: { remoteAddress: "127.0.0.1" } }) as unknown as import("node:http").IncomingMessage;
 
 describe("pairing: sign in from your own computer", () => {
-  it("a code becomes a scoped token once, then dies with the import", () => {
-    const { row, code } = pairing.createPairing("grok");
+  it("a code becomes a scoped token once, then dies with the import", async () => {
+    const { row, code } = await pairing.createPairing("grok");
     assert.match(code, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/, "unambiguous characters, shown in two groups");
     assert.equal(row.status, "waiting");
-    assert.equal(pairing.activePairing("grok")?.status, "waiting");
-    assert.equal(pairing.exchangePairing("nope", "1.2.3.4"), null);
+    assert.equal((await pairing.activePairing("grok"))?.status, "waiting");
+    assert.equal(await pairing.exchangePairing("nope", "1.2.3.4"), null);
 
-    const ex = pairing.exchangePairing(code.toLowerCase().replace("-", " "), "1.2.3.4");
+    const ex = await pairing.exchangePairing(code.toLowerCase().replace("-", " "), "1.2.3.4");
     assert.ok(ex, "spacing and case do not matter");
     assert.ok(ex!.token.startsWith("acp_pair_"));
     assert.equal(ex!.row.status, "paired");
-    assert.equal(pairing.exchangePairing(code, "1.2.3.4"), null, "a code is single use");
+    assert.equal(await pairing.exchangePairing(code, "1.2.3.4"), null, "a code is single use");
 
-    const found = pairing.pairingFromRequest(req({ authorization: `Bearer ${ex!.token}` }));
+    const found = await pairing.pairingFromRequest(req({ authorization: `Bearer ${ex!.token}` }));
     assert.equal(found?.id, row.id);
-    assert.equal(pairing.pairingFromRequest(req({}, `/x?token=${ex!.token}`)), undefined, "never from the query string");
-    assert.equal(auth.isAdmin(req({ authorization: `Bearer ${ex!.token}` })), false, "the token is not an admin credential");
-    assert.equal(auth.isIngest(req({ authorization: `Bearer ${ex!.token}` })), false, "nor an ingest one");
+    assert.equal(await pairing.pairingFromRequest(req({}, `/x?token=${ex!.token}`)), undefined, "never from the query string");
+    assert.equal(await auth.isAdmin(req({ authorization: `Bearer ${ex!.token}` })), false, "the token is not an admin credential");
+    assert.equal(await auth.isIngest(req({ authorization: `Bearer ${ex!.token}` })), false, "nor an ingest one");
 
-    pairing.markImporting(row.id);
-    assert.equal(pairing.activePairing("grok")?.status, "importing");
-    const done = pairing.finishPairing(row.id, "done", "Grok connected");
+    await pairing.markImporting(row.id);
+    assert.equal((await pairing.activePairing("grok"))?.status, "importing");
+    const done = await pairing.finishPairing(row.id, "done", "Grok connected");
     assert.equal(done?.token_hash, null, "the token is gone once the import completed");
-    assert.equal(pairing.pairingFromRequest(req({ authorization: `Bearer ${ex!.token}` })), undefined);
-    assert.equal(pairing.activePairing("grok")?.status, "done", "a just-finished pairing stays visible briefly");
-    const actions = db.listAudit({ limit: 20 }).map((a) => a.action);
+    assert.equal(await pairing.pairingFromRequest(req({ authorization: `Bearer ${ex!.token}` })), undefined);
+    assert.equal((await pairing.activePairing("grok"))?.status, "done", "a just-finished pairing stays visible briefly");
+    const actions = (await db.listAudit({ limit: 20 })).map((a) => a.action);
     assert.ok(actions.includes("signin.pairing_created") && actions.includes("signin.pairing_exchanged"));
   });
 
-  it("codes expire, a newer code retires an older one, and cancel ends whatever is open", () => {
-    const first = pairing.createPairing("chatgpt");
+  it("codes expire, a newer code retires an older one, and cancel ends whatever is open", async () => {
+    const first = await pairing.createPairing("chatgpt");
     db.db.prepare("UPDATE pairings SET expires_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), first.row.id);
-    assert.equal(pairing.exchangePairing(first.code, "1.2.3.4"), null, "an expired code is refused");
-    assert.equal(db.getPairing(first.row.id)?.status, "expired");
+    assert.equal(await pairing.exchangePairing(first.code, "1.2.3.4"), null, "an expired code is refused");
+    assert.equal((await db.getPairing(first.row.id))?.status, "expired");
 
-    const a = pairing.createPairing("chatgpt");
-    const b = pairing.createPairing("chatgpt");
-    assert.equal(db.getPairing(a.row.id)?.status, "replaced");
-    assert.equal(pairing.exchangePairing(a.code, "1.2.3.4"), null, "the replaced code no longer works");
-    assert.ok(pairing.exchangePairing(b.code, "1.2.3.4"));
-    assert.equal(pairing.cancelPairing("chatgpt"), true);
-    assert.equal(db.getPairing(b.row.id)?.status, "cancelled");
-    assert.equal(db.getPairing(b.row.id)?.token_hash, null);
-    assert.equal(pairing.cancelPairing("chatgpt"), false, "nothing left to cancel");
-    const failed = pairing.createPairing("chatgpt");
-    pairing.finishPairing(failed.row.id, "failed", "still signed out");
-    assert.ok(db.listAudit({ action: "signin.pairing_failed" }).length >= 1);
+    const a = await pairing.createPairing("chatgpt");
+    const b = await pairing.createPairing("chatgpt");
+    assert.equal((await db.getPairing(a.row.id))?.status, "replaced");
+    assert.equal(await pairing.exchangePairing(a.code, "1.2.3.4"), null, "the replaced code no longer works");
+    assert.ok(await pairing.exchangePairing(b.code, "1.2.3.4"));
+    assert.equal(await pairing.cancelPairing("chatgpt"), true);
+    assert.equal((await db.getPairing(b.row.id))?.status, "cancelled");
+    assert.equal((await db.getPairing(b.row.id))?.token_hash, null);
+    assert.equal(await pairing.cancelPairing("chatgpt"), false, "nothing left to cancel");
+    const failed = await pairing.createPairing("chatgpt");
+    await pairing.finishPairing(failed.row.id, "failed", "still signed out");
+    assert.ok((await db.listAudit({ action: "signin.pairing_failed" })).length >= 1);
   });
 
   it("takes the deployment's address the way people write it", () => {

@@ -51,8 +51,8 @@ const ago = (iso: string | null | undefined) => {
   const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
   return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : s < 86400 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
 };
-const stepOf = (r: RunRow) => {
-  const steps = foldSteps(runEvents(r.id));
+const stepOf = async (r: RunRow) => {
+  const steps = foldSteps(await runEvents(r.id));
   const live = [...steps].reverse().find((s) => s.status === "running" || s.status === "waiting");
   return live?.label ?? steps.at(-1)?.label ?? "";
 };
@@ -61,21 +61,22 @@ const stepOf = (r: RunRow) => {
  * What is true right now, in a few hundred words. Deterministic: the same rows the views read.
  * Only this, plus the answer the control plane computed, is what the reply may be built from.
  */
-export function briefing(): string {
-  const providers = listProviders().map((a) => {
-    const s = a.connectionStatus();
-    return `${a.name} (${a.id}): ${providerLabel(s.status, a.kind)}${s.lastError ? `, last error: ${short(s.lastError, 80)}` : ""}`;
-  });
-  const running = listRuns({ status: "running", limit: 10 });
+export async function briefing(): Promise<string> {
+  const providers = [];
+  for (const a of listProviders()) {
+    const s = await a.connectionStatus();
+    providers.push(`${a.name} (${a.id}): ${providerLabel(s.status, a.kind)}${s.lastError ? `, last error: ${short(s.lastError, 80)}` : ""}`);
+  }
+  const running = await listRuns({ status: "running", limit: 10 });
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const recent = listRuns({ since: today.toISOString(), limit: 40 });
+  const recent = await listRuns({ since: today.toISOString(), limit: 40 });
   const failed = recent.filter((r) => r.status === "failed" || r.status === "needs_attention");
   const done = recent.filter((r) => r.status === "success");
-  const approvals = pendingApprovals();
-  const tasks = listTasks({ includeDisabled: true });
-  const agents = listAgentProfiles();
-  const events = listEvents({ limit: 5 });
+  const approvals = await pendingApprovals();
+  const tasks = await listTasks({ includeDisabled: true });
+  const agents = await listAgentProfiles();
+  const events = await listEvents({ limit: 5 });
 
   const out = [
     `Now: ${new Date().toISOString()}`,
@@ -92,9 +93,9 @@ export function briefing(): string {
 }
 
 /** The last few turns of this thread, so "and yesterday?" means something. */
-function history(conversationId: number | null): string {
+async function history(conversationId: number | null): Promise<string> {
   if (!conversationId) return "";
-  const turns = conversationMessages(conversationId)
+  const turns = (await conversationMessages(conversationId))
     .slice(-HISTORY_TURNS - 1, -1)
     .map((m) => `User: ${short(m.text, 300)}${m.response ? `\nControl plane: ${short(m.response, 300)}` : ""}`);
   return turns.length ? `Earlier in this conversation:\n${turns.join("\n")}` : "";
@@ -133,9 +134,9 @@ export async function speak(input: SpeakInput, ask: Ask = askJson): Promise<{ te
     input.answer.text,
     "",
     "Briefing (the only other facts you may use):",
-    briefing(),
+    await briefing(),
     "",
-    history(input.conversationId),
+    await history(input.conversationId),
     "",
     "The user's message:",
     input.text,

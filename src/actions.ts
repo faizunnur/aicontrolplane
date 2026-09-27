@@ -52,10 +52,10 @@ export async function runAction(p: PlatformConfig, action: string, task?: Task, 
   // Every other action is a run of its own unless the caller already has one (a dispatch).
   const label = p.actions?.[action]?.label ?? BUILTIN_ACTIONS[action]?.label ?? action;
   const own = !ctx.runId;
-  const scope = own ? beginRun({ kind: "action", label: `${label} on ${p.name}`, provider: p.id, task_id: task?.id ?? null, trigger: ctx.trigger ?? "user", agent_id: ensureSystemAgent().id }) : null;
+  const scope = own ? await beginRun({ kind: "action", label: `${label} on ${p.name}`, provider: p.id, task_id: task?.id ?? null, trigger: ctx.trigger ?? "user", agent_id: (await ensureSystemAgent()).id }) : null;
   const c: ExecutionContext = own ? { ...ctx, runId: scope!.run.id, track: scope!.track } : ctx;
   const result = await perform(adapter.config(), adapter, action, task, extraVars, c);
-  if (scope) endRun(scope.run.id, { status: result.ok ? "success" : "failed", summary: result.message, error: result.ok ? null : result.message, output_url: result.url ?? null });
+  if (scope) await endRun(scope.run.id, { status: result.ok ? "success" : "failed", summary: result.message, error: result.ok ? null : result.message, output_url: result.url ?? null });
   return result;
 }
 
@@ -63,16 +63,16 @@ async function perform(p: PlatformConfig, adapter: NonNullable<ReturnType<typeof
   if (action === "open") {
     const url = task?.native_url || p.tasksUrl || p.appUrl;
     if (!url) return { ok: false, action, message: "no URL to open" };
-    ctx.track?.start("open", `Opening ${url}`);
+    await ctx.track?.start("open", `Opening ${url}`);
     await browser.withLock(() => browser.consolePage(p.id, url), { label: `Opening ${p.name}`, platform: p.id, messageId: ctx.messageId ?? null });
-    ctx.track?.done("open");
+    await ctx.track?.done("open");
     return { ok: true, action, message: `console tab is on ${url}. Watch it in the live view.`, url };
   }
   if (action === "screenshot") {
-    ctx.track?.start("screenshot", `Taking a screenshot of ${p.name}`);
+    await ctx.track?.start("screenshot", `Taking a screenshot of ${p.name}`);
     const file = await screenshotProvider(p);
-    if (file) ctx.track?.done("screenshot");
-    else ctx.track?.fail("screenshot", "screenshot failed");
+    if (file) await ctx.track?.done("screenshot");
+    else await ctx.track?.fail("screenshot", "screenshot failed");
     return { ok: !!file, action, message: file ? "screenshot refreshed" : "screenshot failed", screenshot: !!file };
   }
 

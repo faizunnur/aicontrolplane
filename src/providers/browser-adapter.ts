@@ -113,8 +113,8 @@ export class BrowserProviderAdapter implements ProviderAdapter {
     if (!this.supports(op)) throw this.unsupported(op);
   }
 
-  connectionStatus(): ConnectionStatus {
-    const s = getPlatformState(this.id);
+  async connectionStatus(): Promise<ConnectionStatus> {
+    const s = await getPlatformState(this.id);
     return { status: this.cfg().appUrl ? s.session_status : "none", lastCheckedAt: s.last_sync_at, lastError: s.last_error };
   }
 
@@ -126,15 +126,15 @@ export class BrowserProviderAdapter implements ProviderAdapter {
         const page = await browser.consolePage(c.id, c.appUrl);
         await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
         await page.waitForTimeout(1_500); // a bot check renders after load
-        return detectChallenge(page);
+        return await detectChallenge(page);
       },
       { label: `Opening ${c.name}`, platform: c.id },
     );
   }
 
   /** What worked last time wins; otherwise what the provider is known to need; otherwise the live view. */
-  preferredSignIn(): SignInMode {
-    const remembered = getSetting(`signin_mode:${this.id}`);
+  async preferredSignIn(): Promise<SignInMode> {
+    const remembered = await getSetting(`signin_mode:${this.id}`);
     if (remembered && (SIGN_IN_MODES as readonly string[]).includes(remembered)) return remembered as SignInMode;
     return this.defaultSignIn();
   }
@@ -144,17 +144,17 @@ export class BrowserProviderAdapter implements ProviderAdapter {
 
   async checkAuth(): Promise<SessionStatus> {
     this.require("checkAuth");
-    return checkSignIn(this.cfg());
+    return await checkSignIn(this.cfg());
   }
 
   async sendMessage(text: string, ctx: ExecutionContext): Promise<ChatResult> {
     this.require("chat");
-    return sendThroughBrowser(this.cfg(), text, ctx.track);
+    return await sendThroughBrowser(this.cfg(), text, ctx.track);
   }
 
   async listTasks(ctx: ExecutionContext): Promise<TaskListResult> {
     this.require("listTasks");
-    return collectTasks(this.cfg(), (raw) => this.outputUrlFor(raw), ctx);
+    return await collectTasks(this.cfg(), (raw) => this.outputUrlFor(raw), ctx);
   }
 
   async runTask(_task: TaskRef, _ctx: ExecutionContext, _input?: RunTaskInput): Promise<RunTaskResult> {
@@ -167,7 +167,7 @@ export class BrowserProviderAdapter implements ProviderAdapter {
 
   async runAction(action: string, vars: Record<string, string>, ctx: ExecutionContext): Promise<ActionResult> {
     this.require("runAction");
-    return runConfiguredAction(this.cfg(), action, vars, ctx);
+    return await runConfiguredAction(this.cfg(), action, vars, ctx);
   }
 
   outputUrlFor(_raw: Record<string, unknown>): string | null {

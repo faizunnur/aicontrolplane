@@ -75,7 +75,7 @@ export async function startServer(env: Record<string, string> = {}, opts: { data
     await new Promise((r) => setTimeout(r, 300));
   }
   if (!up) {
-    stopChild(child);
+    await stopChild(child);
     throw new Error(`server did not come up on ${base}\n${logs.join("")}`);
   }
 
@@ -111,7 +111,7 @@ export async function startServer(env: Record<string, string> = {}, opts: { data
     api,
     raw,
     stop: async (o: { keepData?: boolean } = {}) => {
-      stopChild(child);
+      await stopChild(child);
       if (o.keepData) {
         await new Promise((r) => setTimeout(r, 800));
         return;

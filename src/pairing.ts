@@ -55,85 +55,85 @@ function announce(row: PairingRow) {
   bus.emit("platform:row", row.platform);
 }
 
-export function createPairing(platform: string): { row: PairingRow; code: string } {
-  expirePairings();
+export async function createPairing(platform: string): Promise<{ row: PairingRow; code: string }> {
+  await expirePairings();
   let code = "";
   for (let i = 0; i < 8; i++) code += ALPHABET[randomInt(ALPHABET.length)];
-  const row = insertPairing({ platform, code_hash: tokenHash(code), expires_at: new Date(Date.now() + CODE_TTL_MS).toISOString() });
-  const replaced = replaceWaitingPairings(platform, row.id);
-  addAudit({ actor: "you", action: "signin.pairing_created", target: platform, detail: replaced ? `pairing #${row.id}; replaces ${replaced} earlier code(s)` : `pairing #${row.id}` });
+  const row = await insertPairing({ platform, code_hash: tokenHash(code), expires_at: new Date(Date.now() + CODE_TTL_MS).toISOString() });
+  const replaced = await replaceWaitingPairings(platform, row.id);
+  await addAudit({ actor: "you", action: "signin.pairing_created", target: platform, detail: replaced ? `pairing #${row.id}; replaces ${replaced} earlier code(s)` : `pairing #${row.id}` });
   log.info(`pairing #${row.id} created for ${platform}; the code is good for ${CODE_TTL_MS / 60_000} minutes`);
   announce(row);
   return { row, code: formatCode(code) };
 }
 
 /** The helper trades the code for a token. Anything but a live, unused code answers null. */
-export function exchangePairing(code: string, ip: string): { token: string; row: PairingRow } | null {
-  expirePairings();
+export async function exchangePairing(code: string, ip: string): Promise<{ token: string; row: PairingRow } | null> {
+  await expirePairings();
   const c = normaliseCode(code);
   if (c.length !== 8) return null;
-  const row = findPairingByCodeHash(tokenHash(c));
+  const row = await findPairingByCodeHash(tokenHash(c));
   if (!row) return null;
   const token = TOKEN_PREFIX + randomBytes(32).toString("base64url");
-  const updated = updatePairing(row.id, { status: "paired", token_hash: tokenHash(token), expires_at: new Date(Date.now() + TOKEN_TTL_MS).toISOString(), paired_at: new Date().toISOString(), ip })!;
-  addAudit({ actor: ip, action: "signin.pairing_exchanged", target: row.platform, detail: `pairing #${row.id}` });
+  const updated = (await updatePairing(row.id, { status: "paired", token_hash: tokenHash(token), expires_at: new Date(Date.now() + TOKEN_TTL_MS).toISOString(), paired_at: new Date().toISOString(), ip }))!;
+  await addAudit({ actor: ip, action: "signin.pairing_exchanged", target: row.platform, detail: `pairing #${row.id}` });
   log.info(`pairing #${row.id} for ${row.platform}: a computer at ${ip} paired; waiting for the sign-in`);
   announce(updated);
   return { token, row: updated };
 }
 
 /** The pairing behind a request's bearer token, if it is a live pairing token. */
-export function pairingFromRequest(req: IncomingMessage): PairingRow | undefined {
+export async function pairingFromRequest(req: IncomingMessage): Promise<PairingRow | undefined> {
   const b = bearer(req);
   if (!b || !b.startsWith(TOKEN_PREFIX)) return undefined;
-  expirePairings();
-  return findPairingByTokenHash(tokenHash(b));
+  await expirePairings();
+  return await findPairingByTokenHash(tokenHash(b));
 }
 
-export function markImporting(id: number) {
-  const row = updatePairing(id, { status: "importing" });
+export async function markImporting(id: number) {
+  const row = await updatePairing(id, { status: "importing" });
   if (row) announce(row);
 }
 
 /** Any completed attempt ends the pairing; its token is gone whatever the outcome. */
-export function finishPairing(id: number, status: "done" | "failed", detail: string | null = null): PairingRow | undefined {
-  const row = updatePairing(id, { status, detail, token_hash: null, finished_at: new Date().toISOString() });
+export async function finishPairing(id: number, status: "done" | "failed", detail: string | null = null): Promise<PairingRow | undefined> {
+  const row = await updatePairing(id, { status, detail, token_hash: null, finished_at: new Date().toISOString() });
   if (!row) return undefined;
-  if (status === "failed") addAudit({ actor: "system", action: "signin.pairing_failed", target: row.platform, detail: detail ?? `pairing #${id}` });
+  if (status === "failed") await addAudit({ actor: "system", action: "signin.pairing_failed", target: row.platform, detail: detail ?? `pairing #${id}` });
   log.info(`pairing #${id} for ${row.platform} ${status}${detail ? `: ${detail}` : ""}`);
   announce(row);
   return row;
 }
 
-export function cancelPairing(platform: string): boolean {
-  expirePairings();
-  const latest = latestPairing(platform);
+export async function cancelPairing(platform: string): Promise<boolean> {
+  await expirePairings();
+  const latest = await latestPairing(platform);
   if (!latest || !["waiting", "paired", "importing"].includes(latest.status)) return false;
-  const row = updatePairing(latest.id, { status: "cancelled", token_hash: null, finished_at: new Date().toISOString() })!;
-  addAudit({ actor: "you", action: "signin.pairing_cancelled", target: platform, detail: `pairing #${row.id}` });
+  const row = (await updatePairing(latest.id, { status: "cancelled", token_hash: null, finished_at: new Date().toISOString() }))!;
+  await addAudit({ actor: "you", action: "signin.pairing_cancelled", target: platform, detail: `pairing #${row.id}` });
   announce(row);
   return true;
 }
 
 /** The pairing a provider's card should show: one in progress, or one that just finished. */
-export function activePairing(platform: string): PairingView | null {
-  expirePairings();
-  const latest = latestPairing(platform);
+export async function activePairing(platform: string): Promise<PairingView | null> {
+  await expirePairings();
+  const latest = await latestPairing(platform);
   if (!latest) return null;
   if (["waiting", "paired", "importing"].includes(latest.status)) return view(latest);
   if ((latest.status === "done" || latest.status === "failed") && latest.finished_at && Date.now() - new Date(latest.finished_at).getTime() < OUTCOME_VISIBLE_MS) return view(latest);
   return null;
 }
 
-export function pairingById(id: number): PairingView | null {
-  const row = getPairing(id);
+export async function pairingById(id: number): Promise<PairingView | null> {
+  const row = await getPairing(id);
   return row ? view(row) : null;
 }
 
 /** The import route: a pairing token made for this very provider, or the admin. */
-export function requirePairingFor(req: Request, res: Response, next: NextFunction) {
-  if (isAdmin(req)) return next();
-  const row = pairingFromRequest(req);
+export async function requirePairingFor(req: Request, res: Response, next: NextFunction) {
+  if (await isAdmin(req)) return next();
+  const row = await pairingFromRequest(req);
   if (!row) return res.status(401).json({ error: "unauthorized: this needs a live pairing token from the app (make a new code there)" });
   if (row.platform !== req.params.id) return res.status(403).json({ error: `that code was made for ${row.platform}, not ${req.params.id}` });
   res.locals.pairing = row;

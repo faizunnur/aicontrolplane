@@ -77,9 +77,9 @@ app.use((req, res, next) => {
 // Liveness: is the process alive? Never checks dependencies, so a database blip cannot restart the fleet.
 app.get("/healthz", (_req, res) => res.json({ ok: true, browser: browser.isRunning(), at: new Date().toISOString() }));
 // Readiness: can this instance do useful work right now?
-app.get("/readyz", (_req, res) => {
+app.get("/readyz", async (_req, res) => {
   try {
-    dbReady();
+    await dbReady();
     res.json({ ok: true });
   } catch (err) {
     res.status(503).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -97,8 +97,8 @@ proxy.on("error", (err, _req, res) => {
     res.end("The browser screen is not available. Is the service running with HEADLESS=false inside the Docker image?");
   }
 });
-app.use("/vnc", (req, res) => {
-  if (!isAdmin(req)) {
+app.use("/vnc", async (req, res) => {
+  if (!await isAdmin(req)) {
     res.status(401).type("html").send(`<p>Unauthorized. Sign in on the <a href="/">dashboard</a> first.</p>`);
     return;
   }
@@ -124,7 +124,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 });
 
 const server = http.createServer(app);
-server.on("upgrade", (req, socket, head) => {
+server.on("upgrade", async (req, socket, head) => {
   const isLive = req.url === "/live" || req.url?.startsWith("/live?");
   if (!isLive && !req.url?.startsWith("/vnc/")) {
     socket.destroy();
@@ -136,7 +136,7 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (!isAdmin(req)) {
+  if (!await isAdmin(req)) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
@@ -156,7 +156,7 @@ server.on("upgrade", (req, socket, head) => {
   proxy.ws(req, socket, head);
 });
 
-server.listen(config.port, () => {
+server.listen(config.port, async () => {
   log.info(`AI Control Plane listening on :${config.port} (data: ${config.dataDir})`);
   if (config.publicUrl) log.info(`public url: ${config.publicUrl} (from ${config.publicUrlSource === "env" ? "PUBLIC_URL" : "the host's own domain"})`);
   else log.warn("PUBLIC_URL is not set: alerts and agent report URLs will have no address, and pairing commands fall back to each request's Host header. Set PUBLIC_URL (or run where RAILWAY_PUBLIC_DOMAIN is provided) to pin it.");
@@ -170,10 +170,10 @@ server.listen(config.port, () => {
   }
   if (persistEnabled) startPersistLoop();
   try {
-    backfillAgents();
+    await backfillAgents();
     // Work that was in flight when the last process stopped is surfaced, never left hanging.
-    const approvals = recoverInterruptedApprovals();
-    const runs = recoverInterruptedRuns();
+    const approvals = await recoverInterruptedApprovals();
+    const runs = await recoverInterruptedRuns();
     if (approvals || runs) log.warn(`recovered after restart: ${approvals} pending approval(s), ${runs} running run(s) marked interrupted`);
   } catch (err) {
     log.error("startup recovery failed", err);

@@ -14,7 +14,7 @@ interface Bucket {
 const buckets = new Map<string, Bucket>();
 
 export function rateLimit(opts: { name: string; max: number; windowMs: number }) {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const key = `${opts.name}:${clientIp(req)}`;
     const now = Date.now();
     let b = buckets.get(key);
@@ -24,7 +24,7 @@ export function rateLimit(opts: { name: string; max: number; windowMs: number })
     }
     b.count++;
     if (b.count > opts.max) {
-      if (b.count === opts.max + 1) addAudit({ actor: clientIp(req), action: `ratelimit.${opts.name}`, detail: `${opts.max} attempts in ${Math.round(opts.windowMs / 60_000)} min` });
+      if (b.count === opts.max + 1) await addAudit({ actor: clientIp(req), action: `ratelimit.${opts.name}`, detail: `${opts.max} attempts in ${Math.round(opts.windowMs / 60_000)} min` });
       res.setHeader("Retry-After", String(Math.ceil((b.resetAt - now) / 1000)));
       return res.status(429).json({ error: "Too many attempts. Try again later." });
     }

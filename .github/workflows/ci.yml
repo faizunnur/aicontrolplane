@@ -21,6 +21,7 @@ jobs:
           ! grep -rn "better-sqlite3" src/ scripts/ --include="*.ts"
           ! grep -rn "\.prepare(" src/ scripts/ --include="*.ts"
       - run: npm run typecheck
+      - run: npm run lint
       - run: npm run build
       - name: Install Playwright Chromium (e2e mock-provider tests)
         run: npx playwright install --with-deps chromium

@@ -38,10 +38,10 @@ describe("migration from the first-release schema", () => {
     old.close();
 
     const db = await import("../../src/db.js");
-    assert.deepEqual(db.schemaVersion().map((m) => m.id), [1, 2, 3, 4, 5, 6]);
-    const tasks = db.listTasks({ includeDisabled: true });
+    assert.deepEqual((await db.schemaVersion()).map((m) => m.id), [1, 2, 3, 4, 5, 6]);
+    const tasks = await db.listTasks({ includeDisabled: true });
     assert.deepEqual(tasks.map((t) => [t.platform, t.key, t.name]), [["chatgpt", "t1", "Daily briefing"], ["custom", "audit", "Nightly audit"]]);
-    const runs = db.listRuns({ limit: 10 });
+    const runs = await db.listRuns({ limit: 10 });
     assert.equal(runs.length, 2);
     const r1 = runs.find((r) => r.external_id === "r1")!;
     assert.equal(r1.task_id, 1);
@@ -52,16 +52,16 @@ describe("migration from the first-release schema", () => {
     const e9 = runs.find((r) => r.external_id === "e9")!;
     assert.equal(e9.kind, "external");
     assert.equal(e9.status, "failed");
-    const m = db.listMessages({ limit: 1 })[0];
+    const m = (await db.listMessages({ limit: 1 }))[0];
     assert.equal(m.task_id, 2);
     assert.equal(m.task_name, "Nightly audit");
     assert.equal(m.run_id, null);
-    assert.equal(db.getSetting("admin_password_hash"), "x");
-    assert.equal(db.runEvents(r1.id).length, 0);
+    assert.equal(await db.getSetting("admin_password_hash"), "x");
+    assert.equal((await db.runEvents(r1.id)).length, 0);
     // The old, task-bound unique index is gone and the new one dedupes the same way.
-    const again = db.recordRun({ task_id: 1, external_id: "r1", status: "success", source: "collector" });
+    const again = await db.recordRun({ task_id: 1, external_id: "r1", status: "success", source: "collector" });
     assert.equal(again.created, false);
     // Running the migrations again is a no-op.
-    assert.deepEqual(db.schemaVersion().map((x) => x.id), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual((await db.schemaVersion()).map((x) => x.id), [1, 2, 3, 4, 5, 6]);
   });
 });

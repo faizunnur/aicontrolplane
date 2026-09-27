@@ -31,8 +31,10 @@ export interface ConnectionRouting {
 }
 
 /** AIs that are ready to take an instruction right now. */
-export function connectedPlatforms(): PlatformConfig[] {
-  return visiblePlatforms().filter((p) => p.composerSelector && getPlatformState(p.id).session_status === "logged_in");
+export async function connectedPlatforms(): Promise<PlatformConfig[]> {
+  const out: PlatformConfig[] = [];
+  for (const p of visiblePlatforms()) if (p.composerSelector && (await getPlatformState(p.id)).session_status === "logged_in") out.push(p);
+  return out;
 }
 
 function mentioned(text: string, p: PlatformConfig): boolean {
@@ -43,7 +45,7 @@ function mentioned(text: string, p: PlatformConfig): boolean {
 }
 
 export async function routeToConnection(text: string): Promise<ConnectionRouting> {
-  const connected = connectedPlatforms();
+  const connected = await connectedPlatforms();
   const all = visiblePlatforms().filter((p) => p.composerSelector);
   const choice = (p: PlatformConfig, confidence: number, reason: string): ConnectionChoice => ({ platform: p.id, name: p.name, confidence, reason });
 
@@ -225,7 +227,7 @@ function registryText(agents: Task[]): string {
 }
 
 export async function routeMessage(text: string): Promise<RoutingResult> {
-  const agents = listTasks().filter((a) => a.enabled);
+  const agents = (await listTasks()).filter((a) => a.enabled);
   if (agents.length === 0) return { method: "none", suggestions: [], top: null, confidence: 0, reason: "No agents registered yet.", new_agent: null };
   const kw = keywordRoute(text, agents);
   if (kw.mention) {

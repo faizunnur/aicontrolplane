@@ -48,41 +48,41 @@ export type ApprovalPreset = "auto" | "manual";
 export type Decision = "approved" | "rejected" | "timeout";
 export const APPROVAL_TIMEOUT_MS = 15 * 60_000;
 
-export function approvalMode(): ApprovalPreset {
-  return getSetting("approval_mode") === "manual" ? "manual" : "auto";
+export async function approvalMode(): Promise<ApprovalPreset> {
+  return await getSetting("approval_mode") === "manual" ? "manual" : "auto";
 }
-export function setApprovalMode(mode: ApprovalPreset) {
-  setSetting("approval_mode", mode);
-  addAudit({ actor: "you", action: "policy.preset", detail: mode });
+export async function setApprovalMode(mode: ApprovalPreset) {
+  await setSetting("approval_mode", mode);
+  await addAudit({ actor: "you", action: "policy.preset", detail: mode });
   bus.emit("settings", { approvalMode: mode });
-  bus.emit("policy", listPolicies());
+  bus.emit("policy", await listPolicies());
 }
 
 /** The effective mode for an action: an explicit override, else the preset's value, never below the floor. Unknown actions ask. */
-export function policyFor(action: string): { action: string; mode: PolicyMode; source: "override" | "preset" | "default"; definition: PolicyDefinition } {
+export async function policyFor(action: string): Promise<{ action: string; mode: PolicyMode; source: "override" | "preset" | "default"; definition: PolicyDefinition }> {
   const def = ACTIONS[action] ?? { label: action, description: "Declared by an agent; not built in.", auto: "ask", manual: "ask", floor: "ask" };
-  const override = getPolicyOverrides()[action];
-  const preset = approvalMode();
+  const override = (await getPolicyOverrides())[action];
+  const preset = await approvalMode();
   let mode: PolicyMode = override ?? (preset === "manual" ? def.manual : def.auto);
   if (RANK[mode] < RANK[def.floor]) mode = def.floor;
   return { action, mode, source: override ? "override" : ACTIONS[action] ? "preset" : "default", definition: def };
 }
 
-export function listPolicies() {
-  const overrides = getPolicyOverrides();
-  const known = Object.keys(ACTIONS).map((a) => ({ ...policyFor(a), override: overrides[a] ?? null }));
-  const extra = Object.keys(overrides).filter((a) => !ACTIONS[a]).map((a) => ({ ...policyFor(a), override: overrides[a] }));
-  return { preset: approvalMode(), policies: [...known, ...extra] };
+export async function listPolicies() {
+  const overrides = await getPolicyOverrides();
+  const known = await Promise.all(Object.keys(ACTIONS).map(async (a) => ({ ...(await policyFor(a)), override: overrides[a] ?? null })));
+  const extra = await Promise.all(Object.keys(overrides).filter((a) => !ACTIONS[a]).map(async (a) => ({ ...(await policyFor(a)), override: overrides[a] })));
+  return { preset: await approvalMode(), policies: [...known, ...extra] };
 }
 
 /** Set one action's mode. Cannot go below the action's floor. null restores the preset behaviour. */
-export function setPolicy(action: string, mode: PolicyMode | null) {
+export async function setPolicy(action: string, mode: PolicyMode | null) {
   const def = ACTIONS[action];
   if (mode && def && RANK[mode] < RANK[def.floor]) throw Object.assign(new Error(`${def.label} cannot be set below "${def.floor}"`), { status: 400 });
-  setPolicyOverride(action, mode);
-  addAudit({ actor: "you", action: "policy.set", target: action, detail: mode ?? "preset" });
-  bus.emit("policy", listPolicies());
-  return policyFor(action);
+  await setPolicyOverride(action, mode);
+  await addAudit({ actor: "you", action: "policy.set", target: action, detail: mode ?? "preset" });
+  bus.emit("policy", await listPolicies());
+  return await policyFor(action);
 }
 
 /* ---------- the gate ---------- */
@@ -102,26 +102,26 @@ const waiters = new Map<number, (d: Decision) => void>();
  * approval, shows it in the run's timeline, and waits for a decision or the timeout.
  */
 export async function guard(scope: GuardScope, action: string, summary: string, detail?: string | null, opts: { timeoutMs?: number } = {}): Promise<Decision> {
-  const policy = policyFor(action);
+  const policy = await policyFor(action);
   if (policy.mode === "auto") {
-    addAudit({ actor: "policy", action: `${action}.auto`, target: scope.runId ? `run:${scope.runId}` : null, detail: summary });
+    await addAudit({ actor: "policy", action: `${action}.auto`, target: scope.runId ? `run:${scope.runId}` : null, detail: summary });
     return "approved";
   }
-  const row = createApproval({ run_id: scope.runId ?? null, message_id: scope.messageId ?? null, action, provider: scope.provider ?? null, summary, detail: detail ?? null });
+  const row = await createApproval({ run_id: scope.runId ?? null, message_id: scope.messageId ?? null, action, provider: scope.provider ?? null, summary, detail: detail ?? null });
   log.info(`approval #${row.id} requested for ${action} (${policy.mode}): ${summary}`);
-  scope.track?.waiting("approve", summary, detail ?? null);
-  if (scope.runId) addRunEvent(scope.runId, { type: "approval", label: `Approval requested: ${summary}`, detail: policy.mode === "always" ? "this action always asks" : null, metadata: { approval_id: row.id } });
-  addAudit({ actor: "policy", action: `${action}.requested`, target: `approval:${row.id}`, detail: summary });
+  await scope.track?.waiting("approve", summary, detail ?? null);
+  if (scope.runId) await addRunEvent(scope.runId, { type: "approval", label: `Approval requested: ${summary}`, detail: policy.mode === "always" ? "this action always asks" : null, metadata: { approval_id: row.id } });
+  await addAudit({ actor: "policy", action: `${action}.requested`, target: `approval:${row.id}`, detail: summary });
   const decision = await waitForDecision(row.id, opts.timeoutMs ?? APPROVAL_TIMEOUT_MS);
   if (decision === "timeout") {
-    updateApproval(row.id, { status: "expired", decided_by: "timeout", reason: "no decision in time" });
-    scope.track?.fail("approve", `no answer in ${Math.round((opts.timeoutMs ?? APPROVAL_TIMEOUT_MS) / 60_000)} minutes`);
+    await updateApproval(row.id, { status: "expired", decided_by: "timeout", reason: "no decision in time" });
+    await scope.track?.fail("approve", `no answer in ${Math.round((opts.timeoutMs ?? APPROVAL_TIMEOUT_MS) / 60_000)} minutes`);
   } else {
-    const after = getApproval(row.id);
-    if (decision === "approved") scope.track?.done("approve", `approved by ${after?.decided_by ?? "you"}`);
-    else scope.track?.fail("approve", after?.reason ? `rejected: ${after.reason}` : "rejected");
+    const after = await getApproval(row.id);
+    if (decision === "approved") await scope.track?.done("approve", `approved by ${after?.decided_by ?? "you"}`);
+    else await scope.track?.fail("approve", after?.reason ? `rejected: ${after.reason}` : "rejected");
   }
-  if (scope.runId) addRunEvent(scope.runId, { type: "approval", label: decision === "approved" ? "Approved" : decision === "rejected" ? "Rejected" : "Approval expired", metadata: { approval_id: row.id } });
+  if (scope.runId) await addRunEvent(scope.runId, { type: "approval", label: decision === "approved" ? "Approved" : decision === "rejected" ? "Rejected" : "Approval expired", metadata: { approval_id: row.id } });
   return decision;
 }
 
@@ -139,59 +139,59 @@ function waitForDecision(id: number, timeoutMs: number): Promise<Decision> {
 }
 
 /** Record a decision. Returns the row, or null when nothing was pending under that id. */
-export function decide(id: number, decision: "approved" | "rejected", by = "you", reason: string | null = null): ApprovalRow | null {
-  const a = getApproval(id);
+export async function decide(id: number, decision: "approved" | "rejected", by = "you", reason: string | null = null): Promise<ApprovalRow | null> {
+  const a = await getApproval(id);
   if (!a || a.status !== "pending") return null;
-  const row = updateApproval(id, { status: decision, decided_by: by, reason })!;
-  addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
+  const row = (await updateApproval(id, { status: decision, decided_by: by, reason }))!;
+  await addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
   log.info(`approval #${id} ${decision} by ${by}${reason ? `: ${reason}` : ""}`);
   waiters.get(id)?.(decision);
   return row;
 }
 
 /** Decide whatever is pending for a message (the thread's Approve / Reject buttons). */
-export function decideForMessage(messageId: number, decision: "approved" | "rejected", by = "you"): ApprovalRow | null {
-  const pending = listApprovals({ status: "pending", message_id: messageId, limit: 1 })[0];
-  return pending ? decide(pending.id, decision, by) : null;
+export async function decideForMessage(messageId: number, decision: "approved" | "rejected", by = "you"): Promise<ApprovalRow | null> {
+  const pending = (await listApprovals({ status: "pending", message_id: messageId, limit: 1 }))[0];
+  return pending ? await decide(pending.id, decision, by) : null;
 }
 
-export function pendingApprovals(): ApprovalRow[] {
-  return listApprovals({ status: "pending", limit: 200 });
+export async function pendingApprovals(): Promise<ApprovalRow[]> {
+  return await listApprovals({ status: "pending", limit: 200 });
 }
 
 /**
  * A custom agent asks for permission through the API and polls for the answer. No waiter: the
  * decision lands in the row, and the agent reads it back.
  */
-export function requestExternalApproval(input: { action: string; summary: string; detail?: string | null; provider?: string | null; run_id?: number | null }): { approval: ApprovalRow; decision: Decision | "pending" } {
-  const policy = policyFor(input.action);
+export async function requestExternalApproval(input: { action: string; summary: string; detail?: string | null; provider?: string | null; run_id?: number | null }): Promise<{ approval: ApprovalRow; decision: Decision | "pending" }> {
+  const policy = await policyFor(input.action);
   if (policy.mode === "auto") {
-    const approval = createApproval({ ...input, run_id: input.run_id ?? null });
-    updateApproval(approval.id, { status: "approved", decided_by: "policy", reason: "auto" });
-    return { approval: getApproval(approval.id)!, decision: "approved" };
+    const approval = await createApproval({ ...input, run_id: input.run_id ?? null });
+    await updateApproval(approval.id, { status: "approved", decided_by: "policy", reason: "auto" });
+    return { approval: (await getApproval(approval.id))!, decision: "approved" };
   }
-  const approval = createApproval({ ...input, run_id: input.run_id ?? null });
-  addAudit({ actor: "agent", action: `${input.action}.requested`, target: `approval:${approval.id}`, detail: input.summary });
+  const approval = await createApproval({ ...input, run_id: input.run_id ?? null });
+  await addAudit({ actor: "agent", action: `${input.action}.requested`, target: `approval:${approval.id}`, detail: input.summary });
   return { approval, decision: "pending" };
 }
 
 /* ---------- restart recovery ---------- */
 
 /** Anything that was waiting for you when the server stopped is surfaced, not dropped. */
-export function recoverInterruptedApprovals(): number {
-  const pending = listApprovals({ status: "pending", limit: 500 });
+export async function recoverInterruptedApprovals(): Promise<number> {
+  const pending = await listApprovals({ status: "pending", limit: 500 });
   for (const a of pending) {
-    updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the server restarted while this was waiting for approval" });
+    await updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the server restarted while this was waiting for approval" });
     const error = "The server restarted while this was waiting for your approval. Nothing was sent; run it again if you still want it.";
     if (a.run_id) {
-      const run = getRun(a.run_id);
+      const run = await getRun(a.run_id);
       if (run && run.status === "running") {
-        addRunEvent(run.id, { type: "step", key: "approve", label: a.summary, status: "failed", detail: "interrupted by a restart" });
-        endRun(run.id, { status: "needs_attention", error });
+        await addRunEvent(run.id, { type: "step", key: "approve", label: a.summary, status: "failed", detail: "interrupted by a restart" });
+        await endRun(run.id, { status: "needs_attention", error });
       }
     }
-    if (a.message_id) updateMessage(a.message_id, { status: "failed", error });
-    addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval was interrupted by a restart", body: a.summary, dedupe_key: `approval_interrupted:${a.id}` });
+    if (a.message_id) await updateMessage(a.message_id, { status: "failed", error });
+    await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval was interrupted by a restart", body: a.summary, dedupe_key: `approval_interrupted:${a.id}` });
   }
   if (pending.length) log.warn(`${pending.length} approval(s) were pending across the restart; marked interrupted and surfaced`);
   return pending.length;

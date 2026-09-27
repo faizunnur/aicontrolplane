@@ -63,7 +63,7 @@ export function chattableProviders(): ProviderAdapter[] {
 }
 
 /** What the API returns for a provider. */
-export function providerView(a: ProviderAdapter) {
+export async function providerView(a: ProviderAdapter) {
   const c = a.config();
   const caps = a.capabilities();
   const notes = a.capabilityNotes();
@@ -79,6 +79,6 @@ export function providerView(a: ProviderAdapter) {
     notes: c.notes,
     capabilities: caps,
     unsupported: (Object.keys(caps) as (keyof typeof caps)[]).filter((op) => caps[op] === null).map((op) => ({ operation: op, reason: notes[op] ?? "" })),
-    connection: a.connectionStatus(),
+    connection: await a.connectionStatus(),
   };
 }

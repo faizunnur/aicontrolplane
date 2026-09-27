@@ -61,48 +61,48 @@ function describeRouting(routing: string | null): string {
  * (with the reply), failed, or cancelled.
  */
 export async function deliverToConnection(messageId: number, platformId: string): Promise<MessageWithTask> {
-  const msg = getMessage(messageId);
+  const msg = await getMessage(messageId);
   if (!msg) throw new Error("message not found");
   const adapter = getProvider(platformId);
   if (!adapter) throw new Error(`unknown provider ${platformId}`);
   const p = adapter.config();
-  const { run, track } = beginRun({ kind: "chat", label: `Message to ${p.name}`, provider: p.id, message_id: msg.id, trigger: "user", agent_id: ensureProviderAgent(p.id)?.id ?? null });
+  const { run, track } = await beginRun({ kind: "chat", label: `Message to ${p.name}`, provider: p.id, message_id: msg.id, trigger: "user", agent_id: (await ensureProviderAgent(p.id))?.id ?? null });
   // Everything this run does logs with its id attached.
   return withLogContext({ run_id: run.id }, async () => {
-  updateMessage(msg.id, { platform: p.id, task_id: null, run_id: run.id, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null, steps: [] });
-  track.set("route", `Sending to ${p.name}`, "done", describeRouting(msg.routing));
+  await updateMessage(msg.id, { platform: p.id, task_id: null, run_id: run.id, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null, steps: [] });
+  await track.set("route", `Sending to ${p.name}`, "done", describeRouting(msg.routing));
 
-  const fail = (error: string, status: "failed" | "cancelled" = "failed") => {
-    track.failRunning(error);
-    endRun(run.id, { status, error });
-    return updateMessage(msg.id, { status, error })!;
+  const fail = async (error: string, status: "failed" | "cancelled" = "failed") => {
+    await track.failRunning(error);
+    await endRun(run.id, { status, error });
+    return (await updateMessage(msg.id, { status, error }))!;
   };
   try {
     if (!adapter.supports("chat")) return fail(adapter.unsupported("chat").reason);
     // Never sit on a two-minute chat attempt against an AI that is not signed in: look first.
-    let status = getPlatformState(p.id).session_status;
+    let status = (await getPlatformState(p.id)).session_status;
     if (status !== "logged_in") {
-      track.start("connect", `Checking ${p.name} is connected`);
+      await track.start("connect", `Checking ${p.name} is connected`);
       status = await adapter.checkAuth({ messageId: msg.id, runId: run.id, track });
-      if (status === "logged_in") track.done("connect", "connected");
-      else track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
+      if (status === "logged_in") await track.done("connect", "connected");
+      else await track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
     }
     if (status !== "logged_in") {
       const error = status === "needs_login" ? `${p.name} needs you to sign in again.` : `${p.name} is not connected yet. Sign in first.`;
-      addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
+      await addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
       return fail(error);
     }
-    updateMessage(msg.id, { status: "delivered", delivered_at: new Date().toISOString() });
+    await updateMessage(msg.id, { status: "delivered", delivered_at: new Date().toISOString() });
     const r = await adapter.sendMessage(msg.text, { messageId: msg.id, runId: run.id, track });
     if (r.cancelled) return fail(r.error ?? "Stopped.", "cancelled");
     if (!r.ok) {
       log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
-      addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: `${r.error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
+      await addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: `${r.error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
       return fail(r.error ?? "unknown error");
     }
     const response = r.reply ? (r.partial ? r.reply + "\n\n(reply was still being written when I stopped waiting)" : r.reply) : "Sent. No reply text could be read back; open the AI to see it.";
-    endRun(run.id, { status: "success", summary: response.slice(0, 500), output_url: r.url ?? null });
-    return updateMessage(msg.id, { status: "done", acked_at: new Date().toISOString(), response, error: null })!;
+    await endRun(run.id, { status: "success", summary: response.slice(0, 500), output_url: r.url ?? null });
+    return (await updateMessage(msg.id, { status: "done", acked_at: new Date().toISOString(), response, error: null }))!;
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log.error(`delivery of message ${msg.id} crashed`, err);
@@ -116,32 +116,32 @@ export async function deliverToConnection(messageId: number, platformId: string)
  * A dispatch run carries it; inbox and webhook runs stay open until the agent acknowledges.
  */
 export async function deliverMessage(messageId: number): Promise<MessageWithTask> {
-  const msg = getMessage(messageId);
+  const msg = await getMessage(messageId);
   if (!msg) throw new Error("message not found");
   if (!msg.task_id) throw new Error("message has no task");
-  const task = getTask(msg.task_id);
+  const task = await getTask(msg.task_id);
   if (!task) throw new Error("task not found");
   const mode = resolveMode(task);
   const nowIso = new Date().toISOString();
-  const { run, track } = beginRun({ kind: "dispatch", label: `Instruction to ${task.name}`, provider: task.platform, task_id: task.id, message_id: msg.id, trigger: "user", agent_id: task.agent_id ?? ensureTaskAgent(task)?.id ?? null });
-  updateMessage(msg.id, { run_id: run.id, steps: [] });
+  const { run, track } = await beginRun({ kind: "dispatch", label: `Instruction to ${task.name}`, provider: task.platform, task_id: task.id, message_id: msg.id, trigger: "user", agent_id: task.agent_id ?? (await ensureTaskAgent(task))?.id ?? null });
+  await updateMessage(msg.id, { run_id: run.id, steps: [] });
 
   try {
     switch (mode) {
       case "inbox":
       case "manual":
-        track.waiting("deliver", mode === "inbox" ? `Waiting for ${task.name} to pick it up` : `Copy it into ${task.name} yourself`);
-        return updateMessage(msg.id, { status: "assigned", delivery_mode: mode, error: null })!;
+        await track.waiting("deliver", mode === "inbox" ? `Waiting for ${task.name} to pick it up` : `Copy it into ${task.name} yourself`);
+        return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode, error: null }))!;
 
       case "webhook": {
         const d = parseDelivery(task);
         if (!d.webhook_url) throw new Error("task has no webhook_url");
         const decision = await guard({ runId: run.id, messageId: msg.id, provider: task.platform, track }, "dispatch_webhook", `Send this instruction to ${task.name}?`, msg.text.slice(0, 240));
         if (decision !== "approved") {
-          endRun(run.id, { status: "cancelled", error: decision === "timeout" ? "not approved in time" : "rejected" });
-          return updateMessage(msg.id, { status: "cancelled", delivery_mode: mode, error: decision === "timeout" ? "Nobody approved it within 15 minutes, so it was not sent." : "Not sent. You rejected it." })!;
+          await endRun(run.id, { status: "cancelled", error: decision === "timeout" ? "not approved in time" : "rejected" });
+          return (await updateMessage(msg.id, { status: "cancelled", delivery_mode: mode, error: decision === "timeout" ? "Nobody approved it within 15 minutes, so it was not sent." : "Not sent. You rejected it." }))!;
         }
-        track.start("deliver", `Posting to ${task.name}'s webhook`);
+        await track.start("deliver", `Posting to ${task.name}'s webhook`);
         const res = await fetch(d.webhook_url, {
           method: "POST",
           headers: { "content-type": "application/json", ...(d.webhook_token ? { authorization: `Bearer ${d.webhook_token}` } : {}) },
@@ -157,9 +157,9 @@ export async function deliverMessage(messageId: number): Promise<MessageWithTask
           signal: AbortSignal.timeout(20_000),
         });
         if (!res.ok) throw new Error(`webhook responded ${res.status}`);
-        track.done("deliver", `HTTP ${res.status}`);
-        track.waiting("ack", `Waiting for ${task.name} to report back`);
-        return updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null })!;
+        await track.done("deliver", `HTTP ${res.status}`);
+        await track.waiting("ack", `Waiting for ${task.name} to report back`);
+        return (await updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null }))!;
       }
 
       case "browser": {
@@ -167,22 +167,22 @@ export async function deliverMessage(messageId: number): Promise<MessageWithTask
         if (!p) throw new Error(`unknown provider ${task.platform}`);
         const actionName = parseDelivery(task).action || "send_message";
         if (!p.actions?.[actionName]) throw new Error(`provider ${p.name} has no "${actionName}" action; define one in its settings`);
-        if (getPlatformState(p.id).session_status === "needs_login") throw new Error(`${p.name} needs login before messages can be sent`);
-        track.start("deliver", `Running "${actionName}" on ${p.name}`);
+        if ((await getPlatformState(p.id)).session_status === "needs_login") throw new Error(`${p.name} needs login before messages can be sent`);
+        await track.start("deliver", `Running "${actionName}" on ${p.name}`);
         const r = await runAction(p, actionName, task, { message: msg.text }, { messageId: msg.id, runId: run.id, track });
         if (!r.ok) throw new Error(r.message);
-        track.done("deliver", r.message);
-        endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null });
-        return updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null })!;
+        await track.done("deliver", r.message);
+        await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null });
+        return (await updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null }))!;
       }
     }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log.warn(`delivery of message ${msg.id} to ${task.name} via ${mode} failed: ${error}`);
-    track.failRunning(error);
-    endRun(run.id, { status: "failed", error });
-    addEvent({ platform: task.platform, kind: "message", title: `Could not deliver instruction to ${task.name}`, body: `${error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
-    return updateMessage(msg.id, { status: "failed", delivery_mode: mode, error })!;
+    await track.failRunning(error);
+    await endRun(run.id, { status: "failed", error });
+    await addEvent({ platform: task.platform, kind: "message", title: `Could not deliver instruction to ${task.name}`, body: `${error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
+    return (await updateMessage(msg.id, { status: "failed", delivery_mode: mode, error }))!;
   }
   return msg;
 }

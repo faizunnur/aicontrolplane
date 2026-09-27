@@ -38,68 +38,71 @@ const since = (tf: Timeframe): string | undefined => {
   return d.toISOString();
 };
 const tfLabel = (tf: Timeframe) => ({ today: "today", yesterday: "yesterday", week: "this week", all: "" }[tf]);
-const currentStep = (r: RunRow) => {
-  const steps = foldSteps(runEvents(r.id));
+const currentStep = async (r: RunRow) => {
+  const steps = foldSteps(await runEvents(r.id));
   const live = [...steps].reverse().find((s) => s.status === "running" || s.status === "waiting");
   return live ? live.label : steps.at(-1)?.label ?? "";
 };
 const runLine = (r: RunRow) => `• ${r.label ?? r.task_name ?? r.kind} on ${providerName(r.provider)}${r.agent_name ? ` (${r.agent_name})` : ""}`;
 
-export function answerQuestion(intent: Extract<Intent, { kind: "question" }>): Answer {
+export async function answerQuestion(intent: Extract<Intent, { kind: "question" }>): Promise<Answer> {
   const { topic, provider, timeframe } = intent;
   switch (topic) {
     case "running":
     case "agents":
-      return running(provider, topic === "agents");
+      return await running(provider, topic === "agents");
     case "failed":
-      return failed(provider, timeframe);
+      return await failed(provider, timeframe);
     case "completed":
-      return completed(provider, timeframe);
+      return await completed(provider, timeframe);
     case "scheduled":
-      return scheduled(provider);
+      return await scheduled(provider);
     case "approvals":
-      return approvals();
+      return await approvals();
     case "attention":
-      return attention();
+      return await attention();
     case "summary":
-      return summary(provider, timeframe === "all" ? "today" : timeframe);
+      return await summary(provider, timeframe === "all" ? "today" : timeframe);
     case "status":
-      return status();
+      return await status();
   }
 }
 
-function running(provider: string | null, byAgent: boolean): Answer {
-  const runs = listRuns({ status: "running", platform: provider ?? undefined, limit: 50 });
+async function running(provider: string | null, byAgent: boolean): Promise<Answer> {
+  const runs = await listRuns({ status: "running", platform: provider ?? undefined, limit: 50 });
+  const stepOf = new Map<number, string>();
+  for (const r of runs) stepOf.set(r.id, await currentStep(r));
   if (byAgent) {
-    const agents = listAgentProfiles();
+    const agents = await listAgentProfiles();
     const lines = agents.map((a) => {
       const mine = runs.filter((r) => r.agent_id === a.id);
-      if (mine.length) return `• ${a.name}: ${mine.map((r) => `${r.label ?? r.kind} (${currentStep(r) || "working"}, ${elapsed(r.started_at)})`).join("; ")}`;
+      if (mine.length) return `• ${a.name}: ${mine.map((r) => `${r.label ?? r.kind} (${stepOf.get(r.id) || "working"}, ${elapsed(r.started_at)})`).join("; ")}`;
       return `• ${a.name}: idle${a.last_run_at ? `, last ran ${when(a.last_run_at)}` : ""}`;
     });
     return { text: lines.length ? `Your agents right now:\n${lines.join("\n")}` : "No agents yet. Sign in to an AI or register one of your own.", data: { runs, agents } };
   }
   if (!runs.length) return { text: provider ? `Nothing is running on ${providerName(provider)} right now.` : "Nothing is running right now.", data: { runs } };
-  return { text: `${runs.length} running${provider ? ` on ${providerName(provider)}` : ""}:\n${runs.map((r) => `${runLine(r)}: ${currentStep(r) || "working"} · ${elapsed(r.started_at)}`).join("\n")}`, data: { runs } };
+  return { text: `${runs.length} running${provider ? ` on ${providerName(provider)}` : ""}:\n${runs.map((r) => `${runLine(r)}: ${stepOf.get(r.id) || "working"} · ${elapsed(r.started_at)}`).join("\n")}`, data: { runs } };
 }
 
-function failed(provider: string | null, tf: Timeframe): Answer {
-  const runs = listRuns({ status: ["failed", "needs_attention"], platform: provider ?? undefined, since: since(tf === "all" ? "today" : tf), limit: 50 });
-  const signedOut = listProviders().filter((a) => (!provider || a.id === provider) && a.connectionStatus().status === "needs_login");
+async function failed(provider: string | null, tf: Timeframe): Promise<Answer> {
+  const runs = await listRuns({ status: ["failed", "needs_attention"], platform: provider ?? undefined, since: since(tf === "all" ? "today" : tf), limit: 50 });
+  const signedOut = [];
+  for (const a of listProviders()) if ((!provider || a.id === provider) && (await a.connectionStatus()).status === "needs_login") signedOut.push(a);
   const lines = [...runs.map((r) => `${runLine(r)}: ${r.error ?? r.summary ?? r.status} (${when(r.finished_at ?? r.started_at)})`), ...signedOut.map((a) => `• ${a.name} signed you out; sign in again from the sidebar.`)];
   const label = tfLabel(tf === "all" ? "today" : tf);
   return { text: lines.length ? `${runs.length} failed${signedOut.length ? ` and ${signedOut.length} signed out` : ""} ${label}:\n${lines.join("\n")}` : `Nothing failed ${label}${provider ? ` on ${providerName(provider)}` : ""}.`, data: { runs, signedOut: signedOut.map((a) => a.id) } };
 }
 
-function completed(provider: string | null, tf: Timeframe): Answer {
-  const runs = listRuns({ status: "success", platform: provider ?? undefined, since: since(tf === "all" ? "today" : tf), limit: 50 });
+async function completed(provider: string | null, tf: Timeframe): Promise<Answer> {
+  const runs = await listRuns({ status: "success", platform: provider ?? undefined, since: since(tf === "all" ? "today" : tf), limit: 50 });
   const label = tfLabel(tf === "all" ? "today" : tf);
   if (!runs.length) return { text: `Nothing completed ${label}${provider ? ` on ${providerName(provider)}` : ""}.`, data: { runs } };
   return { text: `${runs.length} completed ${label}${provider ? ` on ${providerName(provider)}` : ""}:\n${runs.map((r) => `${runLine(r)}: ${r.summary ? r.summary.slice(0, 140) : "done"} (${when(r.finished_at)})`).join("\n")}`, data: { runs } };
 }
 
-function scheduled(provider: string | null): Answer {
-  const tasks = listTasks({ platform: provider ?? undefined }).filter((t) => t.schedule || t.next_run);
+async function scheduled(provider: string | null): Promise<Answer> {
+  const tasks = (await listTasks({ platform: provider ?? undefined })).filter((t) => t.schedule || t.next_run);
   if (!tasks.length) return { text: provider ? `No scheduled tasks known on ${providerName(provider)}. The control plane learns them when it looks at the provider's tasks page.` : "No scheduled tasks known yet. They appear after the control plane looks at each provider's tasks page, or when your agents register them.", data: { tasks } };
   const byProvider = new Map<string, typeof tasks>();
   for (const t of tasks) byProvider.set(t.platform, [...(byProvider.get(t.platform) ?? []), t]);
@@ -107,17 +110,18 @@ function scheduled(provider: string | null): Answer {
   return { text: `${tasks.length} scheduled:\n${blocks.join("\n")}`, data: { tasks } };
 }
 
-function approvals(): Answer {
-  const pending = pendingApprovals();
+async function approvals(): Promise<Answer> {
+  const pending = await pendingApprovals();
   if (!pending.length) return { text: "Nothing is waiting for your approval.", data: { pending } };
   return { text: `${pending.length} waiting for you:\n${pending.map((a) => `• #${a.id} ${a.summary}${a.run_label ? ` (${a.run_label})` : ""} · asked ${when(a.requested_at)}`).join("\n")}\nSay "approve #id" or "reject #id", or use the buttons in the thread.`, data: { pending }, status: "done" };
 }
 
-function attention(): Answer {
-  const pending = pendingApprovals();
-  const signedOut = listProviders().filter((a) => a.connectionStatus().status === "needs_login");
-  const failedRuns = listRuns({ status: ["failed", "needs_attention"], since: since("today"), limit: 20 });
-  const unread = listEvents({ unread: true, limit: 20 });
+async function attention(): Promise<Answer> {
+  const pending = await pendingApprovals();
+  const signedOut = [];
+  for (const a of listProviders()) if ((await a.connectionStatus()).status === "needs_login") signedOut.push(a);
+  const failedRuns = await listRuns({ status: ["failed", "needs_attention"], since: since("today"), limit: 20 });
+  const unread = await listEvents({ unread: true, limit: 20 });
   const lines = [
     ...pending.map((a) => `• Approval #${a.id}: ${a.summary}`),
     ...signedOut.map((a) => `• ${a.name} needs you to sign in again`),
@@ -127,27 +131,31 @@ function attention(): Answer {
   return { text: lines.length ? `Needs you:\n${[...new Set(lines)].join("\n")}` : "Nothing needs you right now.", data: { pending, signedOut: signedOut.map((a) => a.id), failedRuns, unread } };
 }
 
-function summary(provider: string | null, tf: Timeframe): Answer {
+async function summary(provider: string | null, tf: Timeframe): Promise<Answer> {
   const from = since(tf);
-  const runs = listRuns({ platform: provider ?? undefined, since: from, limit: 200 });
+  const runs = await listRuns({ platform: provider ?? undefined, since: from, limit: 200 });
   const count = (s: string) => runs.filter((r) => r.status === s).length;
-  const pending = pendingApprovals();
+  const pending = await pendingApprovals();
   const head = `${tfLabel(tf)[0].toUpperCase()}${tfLabel(tf).slice(1)}${provider ? ` on ${providerName(provider)}` : ""}: ${runs.length} runs · ${count("success")} completed · ${count("failed") + count("needs_attention")} failed · ${count("running")} running · ${pending.length} awaiting approval.`;
   const done = runs.filter((r) => r.status === "success").slice(0, 8).map((r) => `${runLine(r)}: ${r.summary ? r.summary.slice(0, 120) : "done"}`);
   const bad = runs.filter((r) => r.status === "failed" || r.status === "needs_attention").slice(0, 8).map((r) => `${runLine(r)}: ${r.error ?? r.summary ?? r.status}`);
   return { text: [head, done.length ? `Completed:\n${done.join("\n")}` : "", bad.length ? `Failed:\n${bad.join("\n")}` : ""].filter(Boolean).join("\n"), data: { runs, pending } };
 }
 
-function status(): Answer {
-  const agents = listAgentProfiles();
-  const running = listRuns({ status: "running", limit: 100 });
-  const pending = pendingApprovals();
-  const todayRuns = listRuns({ since: since("today"), limit: 500 });
+async function status(): Promise<Answer> {
+  const agents = await listAgentProfiles();
+  const running = await listRuns({ status: "running", limit: 100 });
+  const pending = await pendingApprovals();
+  const todayRuns = await listRuns({ since: since("today"), limit: 500 });
   const failedToday = todayRuns.filter((r) => r.status === "failed" || r.status === "needs_attention").length;
   const doneToday = todayRuns.filter((r) => r.status === "success").length;
-  const providers = listProviders().map((a) => `${a.name}: ${a.connectionStatus().status === "logged_in" ? "connected" : a.connectionStatus().status === "needs_login" ? "signed out" : a.kind === "custom" ? "via API" : "not connected"}`);
+  const providers = [];
+  for (const a of listProviders()) {
+    const st = (await a.connectionStatus()).status;
+    providers.push(`${a.name}: ${st === "logged_in" ? "connected" : st === "needs_login" ? "signed out" : a.kind === "custom" ? "via API" : "not connected"}`);
+  }
   return {
-    text: `${agents.filter((a) => a.status === "active").length} agents · ${listTasks().length} tasks · ${running.length} running · ${pending.length} awaiting approval · ${failedToday} failed today · ${doneToday} completed today.\nProviders: ${providers.join(" · ")}`,
+    text: `${agents.filter((a) => a.status === "active").length} agents · ${(await listTasks()).length} tasks · ${running.length} running · ${pending.length} awaiting approval · ${failedToday} failed today · ${doneToday} completed today.\nProviders: ${providers.join(" · ")}`,
     data: { agents, running, pending, failedToday, doneToday },
   };
 }
@@ -155,10 +163,11 @@ function status(): Answer {
 /* ---------- said to the control plane itself ---------- */
 
 /** A greeting or "what can you do?". The facts are the same state everything else reads. */
-function answerAssistant(intent: Extract<Intent, { kind: "assistant" }>): Answer {
-  const state = status();
+async function answerAssistant(intent: Extract<Intent, { kind: "assistant" }>): Promise<Answer> {
+  const state = await status();
   if (intent.topic === "greeting") return { text: `Hello. ${state.text}`, data: state.data };
-  const providers = listProviders().filter((a) => a.connectionStatus().status === "logged_in").map((a) => a.name);
+  const providers = [];
+  for (const a of listProviders()) if ((await a.connectionStatus()).status === "logged_in") providers.push(a.name);
   return {
     text: [
       "I am your control plane. I keep every AI agent you use in one place: what they are doing now, what they have done, what is scheduled, and what needs your approval before it happens.",
@@ -176,19 +185,19 @@ export async function executeCommand(intent: Extract<Intent, { kind: "command" }
     case "approve":
     case "reject": {
       const idMatch = /(\d+)/.exec(intent.target);
-      const pending = pendingApprovals();
+      const pending = await pendingApprovals();
       const target = idMatch ? pending.find((a) => a.id === Number(idMatch[1])) : pending[0];
       if (!target) return { text: idMatch ? `Approval #${idMatch[1]} is not pending.` : "Nothing is waiting for your approval.", data: null };
       const decision: Decision = intent.action === "approve" ? "approved" : "rejected";
-      decide(target.id, decision, "you");
+      await decide(target.id, decision, "you");
       return { text: `${decision === "approved" ? "Approved" : "Rejected"}: ${target.summary}`, data: { approval: target.id, decision } };
     }
     case "stop": {
       const all = /^(everything|all|all runs)$/.test(intent.target);
       const wait = /^(waiting|the wait|it|that|this|the run)$/.test(intent.target);
-      let runs = listRuns({ status: "running", limit: 50 });
+      let runs = await listRuns({ status: "running", limit: 50 });
       if (!all && !wait) {
-        const t = resolveTarget(intent.target);
+        const t = await resolveTarget(intent.target);
         runs = runs.filter((r) => (t.task ? r.task_id === t.task.id : t.agentId ? r.agent_id === t.agentId : t.provider ? r.provider === t.provider : false));
       } else if (wait) runs = runs.slice(0, 1);
       if (!runs.length) return { text: all ? "Nothing is running." : `I found nothing running that matches "${intent.target}".`, data: null };
@@ -197,18 +206,18 @@ export async function executeCommand(intent: Extract<Intent, { kind: "command" }
     }
     case "pause":
     case "resume": {
-      const t = resolveTarget(intent.target);
-      if (!t.task) return notFound(intent.target, t.candidates);
+      const t = await resolveTarget(intent.target);
+      if (!t.task) return await notFound(intent.target, t.candidates);
       const enable = intent.action === "resume";
-      updateTask(t.task.id, { enabled: enable });
+      await updateTask(t.task.id, { enabled: enable });
       const adapter = getProvider(t.task.platform);
       const note = adapter && !adapter.supports("cancelTask") ? ` ${adapter.capabilityNotes().cancelTask ?? ""}`.trimEnd() : "";
       return { text: `${enable ? "Resumed" : "Paused"} ${t.task.name} here: the control plane ${enable ? "tracks it again" : "stops tracking it and will not start it"}.${note ? "\n" + note : ""}`, data: { task: t.task.id, enabled: enable } };
     }
     case "run":
     case "continue": {
-      const t = resolveTarget(intent.target);
-      if (!t.task) return notFound(intent.target, t.candidates);
+      const t = await resolveTarget(intent.target);
+      if (!t.task) return await notFound(intent.target, t.candidates);
       try {
         const run = await startTask(t.task.id, { messageId: ctx.messageId, trigger: "user", text: intent.action === "continue" ? "Continue where you left off." : undefined });
         if (run.status === "running") return { text: `Started ${t.task.name} at ${providerName(t.task.platform)}. Its agent will report back here.`, data: { run: run.id }, status: "delivered" };
@@ -227,8 +236,8 @@ export async function executeCommand(intent: Extract<Intent, { kind: "command" }
   }
 }
 
-function notFound(target: string, candidates: { id: number; name: string; platform: string }[]): Answer {
-  const known = listTasks().slice(0, 12).map((t) => `${t.name} (${providerName(t.platform)})`);
+async function notFound(target: string, candidates: { id: number; name: string; platform: string }[]): Promise<Answer> {
+  const known = (await listTasks()).slice(0, 12).map((t) => `${t.name} (${providerName(t.platform)})`);
   const hint = candidates.length ? `Did you mean: ${candidates.map((c) => `${c.name} (${providerName(c.platform)})`).join(", ")}?` : known.length ? `Tasks I know: ${known.join(", ")}.` : "I know no tasks yet.";
   return { text: `I could not find a task called "${target}". ${hint}`, data: { candidates } };
 }
@@ -236,40 +245,40 @@ function notFound(target: string, candidates: { id: number; name: string; platfo
 /** Run a control-plane intent for a message and record the outcome on the message. */
 export async function handleControl(intent: Exclude<Intent, { kind: "chat" }>, messageId: number): Promise<Answer> {
   const reason = intent.kind === "question" ? `Answered from the control plane (${intent.topic}).` : intent.kind === "command" ? `Control-plane command: ${intent.action}.` : "Said to the control plane.";
-  updateMessage(messageId, { routing: { method: "control", confidence: 1, reason, intent }, status: "delivered", delivered_at: new Date().toISOString() });
+  await updateMessage(messageId, { routing: { method: "control", confidence: 1, reason, intent }, status: "delivered", delivered_at: new Date().toISOString() });
   let answer: Answer;
   try {
-    answer = intent.kind === "question" ? answerQuestion(intent) : intent.kind === "assistant" ? answerAssistant(intent) : await executeCommand(intent, { messageId });
+    answer = intent.kind === "question" ? await answerQuestion(intent) : intent.kind === "assistant" ? await answerAssistant(intent) : await executeCommand(intent, { messageId });
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    updateMessage(messageId, { status: "failed", error });
+    await updateMessage(messageId, { status: "failed", error });
     return { text: error, data: null, status: "failed" };
   }
-  const m = getMessage(messageId);
+  const m = await getMessage(messageId);
   // The control plane has decided and acted; Claude, when configured, only says it in better words.
   const spoken = await speak({ text: m?.text ?? "", intent, answer, conversationId: m?.conversation_id ?? null });
   answer = { ...answer, text: spoken.text };
   const status = answer.status ?? "done";
-  updateMessage(messageId, {
-    status,
-    response: answer.text,
-    routing: { method: "control", confidence: 1, reason: spoken.source === "claude" ? `${reason} Worded by Claude.` : reason, intent },
-    acked_at: status === "done" ? new Date().toISOString() : null,
-    error: status === "failed" ? answer.text : null,
-    run_id: m?.run_id ?? null,
-  });
+  await updateMessage(messageId, {
+        status,
+        response: answer.text,
+        routing: { method: "control", confidence: 1, reason: spoken.source === "claude" ? `${reason} Worded by Claude.` : reason, intent },
+        acked_at: status === "done" ? new Date().toISOString() : null,
+        error: status === "failed" ? answer.text : null,
+        run_id: m?.run_id ?? null,
+      });
   return answer;
 }
 
 /** When a task run started by a command finishes later, the message that asked for it follows. */
-export function settleCommandMessage(runId: number) {
-  const run = getRun(runId);
+export async function settleCommandMessage(runId: number) {
+  const run = await getRun(runId);
   if (!run || run.kind !== "task" || !run.message_id) return;
-  const m = getMessage(run.message_id);
+  const m = await getMessage(run.message_id);
   if (!m || m.status !== "delivered") return;
-  const task = run.task_id ? getTask(run.task_id) : null;
+  const task = run.task_id ? await getTask(run.task_id) : null;
   const text = run.status === "success" ? `${task?.name ?? run.label ?? "The task"} finished: ${run.summary ?? "done"}${run.output_url ? `\n${run.output_url}` : ""}` : `${task?.name ?? run.label ?? "The task"} ${run.status === "cancelled" ? "was stopped" : "failed"}: ${run.error ?? run.summary ?? ""}`;
-  updateMessage(m.id, { status: run.status === "success" ? "done" : run.status === "cancelled" ? "cancelled" : "failed", response: run.status === "success" ? text : m.response, error: run.status === "success" ? null : text, acked_at: new Date().toISOString() });
+  await updateMessage(m.id, { status: run.status === "success" ? "done" : run.status === "cancelled" ? "cancelled" : "failed", response: run.status === "success" ? text : m.response, error: run.status === "success" ? null : text, acked_at: new Date().toISOString() });
 }
 
 export type { QuestionTopic };

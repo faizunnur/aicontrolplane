@@ -24,16 +24,16 @@ export async function runConfiguredAction(cfg: PlatformConfig, action: string, v
       try {
         for (const step of def.steps ?? []) {
           stepNo++;
-          ctx.track?.start(`step-${stepNo}`, describeStep(step, sub));
+          await ctx.track?.start(`step-${stepNo}`, describeStep(step, sub));
           await runStep(page, step, sub);
-          ctx.track?.done(`step-${stepNo}`);
+          await ctx.track?.done(`step-${stepNo}`);
         }
         await pc.screenshot(page);
         return { ok: true, action, message: `ran ${stepNo} step(s)`, url: page.url(), screenshot: true };
       } catch (err) {
         const msg = cleanError(err);
         log.warn(`action ${cfg.id}/${action} failed at step ${stepNo}: ${msg}`);
-        ctx.track?.fail(`step-${stepNo}`, msg);
+        await ctx.track?.fail(`step-${stepNo}`, msg);
         await pc.screenshot(page);
         return { ok: false, action, message: `step ${stepNo} failed: ${msg}`, url: page.url(), screenshot: true };
       }

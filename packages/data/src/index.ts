@@ -398,7 +398,7 @@ function migrate() {
 }
 
 /** Applied schema migrations, newest last. */
-export function schemaVersion() {
+export async function schemaVersion() {
   return prep("SELECT id, name, applied_at FROM schema_migrations ORDER BY id").all() as { id: number; name: string; applied_at: string }[];
 }
 
@@ -426,7 +426,7 @@ export interface TaskInput {
 
 export type TaskWithLastRun = Task & { last_run?: Run | null };
 
-export function listTasks(opts: { platform?: string; agent_id?: number; includeDisabled?: boolean; limit?: number } = {}): TaskWithLastRun[] {
+export async function listTasks(opts: { platform?: string; agent_id?: number; includeDisabled?: boolean; limit?: number } = {}): Promise<TaskWithLastRun[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.platform) {
@@ -445,17 +445,17 @@ export function listTasks(opts: { platform?: string; agent_id?: number; includeD
   return tasks.map((t) => ({ ...t, last_run: (lastRun.get(t.id) as Run | undefined) ?? null }));
 }
 
-export function getTask(id: number): Task | undefined {
+export async function getTask(id: number): Promise<Task | undefined> {
   return prep("SELECT * FROM tasks WHERE id = ?").get(id) as Task | undefined;
 }
 
-export function findTask(platform: string, key: string): Task | undefined {
+export async function findTask(platform: string, key: string): Promise<Task | undefined> {
   return prep("SELECT * FROM tasks WHERE platform = ? AND key = ?").get(platform, key) as Task | undefined;
 }
 
 /** Insert or update by (platform, key). Fields that are undefined are left untouched on update. */
-export function upsertTask(input: TaskInput): Task {
-  const existing = findTask(input.platform, input.key);
+export async function upsertTask(input: TaskInput): Promise<Task> {
+  const existing = await findTask(input.platform, input.key);
   const ts = now();
   const meta = input.meta === undefined ? undefined : JSON.stringify(input.meta);
   const conf = input.configuration === undefined ? undefined : input.configuration === null ? null : JSON.stringify(input.configuration);
@@ -496,7 +496,7 @@ export function upsertTask(input: TaskInput): Task {
       ts,
       existing.id,
     );
-    const t = getTask(existing.id)!;
+    const t = (await getTask(existing.id))!;
     notify("task", t);
     return t;
   }
@@ -525,13 +525,13 @@ export function upsertTask(input: TaskInput): Task {
       ts,
       ts,
     );
-  const t = getTask(Number(res.lastInsertRowid))!;
+  const t = (await getTask(Number(res.lastInsertRowid)))!;
   notify("task", t);
   return t;
 }
 
-export function updateTask(id: number, patch: Partial<TaskInput>): Task | undefined {
-  const t = getTask(id);
+export async function updateTask(id: number, patch: Partial<TaskInput>): Promise<Task | undefined> {
+  const t = await getTask(id);
   if (!t) return undefined;
   prep(
     `UPDATE tasks SET name=?, purpose=?, schedule=?, native_url=?, status=?, enabled=?, meta=?, platform=?, key=?, keywords=?, delivery=?, agent_id=?, prompt=?, next_run=?, configuration=?, updated_at=? WHERE id=?`,
@@ -554,12 +554,12 @@ export function updateTask(id: number, patch: Partial<TaskInput>): Task | undefi
     now(),
     id,
   );
-  const next = getTask(id);
+  const next = await getTask(id);
   if (next) notify("task", next);
   return next;
 }
 
-export function deleteTask(id: number): boolean {
+export async function deleteTask(id: number): Promise<boolean> {
   const ok = prep("DELETE FROM tasks WHERE id = ?").run(id).changes > 0;
   if (ok) notify("task:deleted", { id });
   return ok;
@@ -590,9 +590,9 @@ export interface RecordRunInput {
  * Record a run reported from outside (pushed by an agent, captured from a provider, read from
  * email). If external_id already exists for the task, the row is updated instead.
  */
-export function recordRun(input: RecordRunInput): { run: Run; created: boolean } {
+export async function recordRun(input: RecordRunInput): Promise<{ run: Run; created: boolean }> {
   const raw = input.raw === undefined ? null : typeof input.raw === "string" ? input.raw : JSON.stringify(input.raw);
-  const task = input.task_id ? getTask(input.task_id) : undefined;
+  const task = input.task_id ? await getTask(input.task_id) : undefined;
   const provider = input.provider ?? task?.platform ?? null;
   const label = input.label ?? task?.name ?? null;
   if (input.external_id && input.task_id) {
@@ -603,7 +603,7 @@ export function recordRun(input: RecordRunInput): { run: Run; created: boolean }
          summary=COALESCE(?, summary), details=COALESCE(?, details), output_url=COALESCE(?, output_url), error=COALESCE(?, error), raw=COALESCE(?, raw)
          WHERE id=?`,
       ).run(input.status, input.started_at ?? null, input.finished_at ?? null, input.summary ?? null, input.details ?? null, input.output_url ?? null, input.error ?? null, raw, existing.id);
-      const run = getRun(existing.id)!;
+      const run = (await getRun(existing.id))!;
       notify("run", run);
       return { run, created: false };
     }
@@ -632,7 +632,7 @@ export function recordRun(input: RecordRunInput): { run: Run; created: boolean }
       raw,
       now(),
     );
-  const run = getRun(Number(res.lastInsertRowid))!;
+  const run = (await getRun(Number(res.lastInsertRowid)))!;
   notify("run", run);
   return { run, created: true };
 }
@@ -649,23 +649,23 @@ export interface StartRunInput {
 }
 
 /** Begin a run the control plane executes itself. It is "running" until finishRun. */
-export function startRun(input: StartRunInput): Run {
+export async function startRun(input: StartRunInput): Promise<Run> {
   const ts = now();
-  const task = input.task_id ? getTask(input.task_id) : undefined;
+  const task = input.task_id ? await getTask(input.task_id) : undefined;
   const res = db
     .prepare(
       `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'running', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?)`,
     )
     .run(input.task_id ?? null, input.agent_id ?? task?.agent_id ?? null, input.provider ?? task?.platform ?? null, input.kind, input.trigger ?? "user", input.message_id ?? null, input.label, ts, input.source ?? "control-plane", ts);
-  const run = getRun(Number(res.lastInsertRowid))!;
+  const run = (await getRun(Number(res.lastInsertRowid)))!;
   if (input.message_id) prep("UPDATE messages SET run_id = ? WHERE id = ?").run(run.id, input.message_id);
   notify("run", run);
   return run;
 }
 
-export function finishRun(id: number, patch: { status: RunStatus; summary?: string | null; error?: string | null; output_url?: string | null; details?: string | null; external_id?: string | null }): Run | undefined {
-  const r = getRun(id);
+export async function finishRun(id: number, patch: { status: RunStatus; summary?: string | null; error?: string | null; output_url?: string | null; details?: string | null; external_id?: string | null }): Promise<Run | undefined> {
+  const r = await getRun(id);
   if (!r) return undefined;
   // Guarded transition: only a running run can be finished. A run that already settled keeps
   // its outcome, whoever reports later (double finish, late webhook, restart recovery races).
@@ -680,22 +680,22 @@ export function finishRun(id: number, patch: { status: RunStatus; summary?: stri
     id,
   );
   if (res.changes === 0) return r;
-  const run = getRun(id)!;
+  const run = (await getRun(id))!;
   notify("run", run);
   return run;
 }
 
-export function getRun(id: number): Run | undefined {
+export async function getRun(id: number): Promise<Run | undefined> {
   return prep("SELECT * FROM runs WHERE id = ?").get(id) as Run | undefined;
 }
 
 /** Attach the provider's own id to a run, so a later report with the same id updates it. */
-export function setRunExternalId(id: number, externalId: string): void {
+export async function setRunExternalId(id: number, externalId: string): Promise<void> {
   prep("UPDATE runs SET external_id = ? WHERE id = ?").run(externalId, id);
 }
 
 /** Readiness probe: can the database answer a trivial query right now? Throws when it cannot. */
-export function dbReady(): void {
+export async function dbReady(): Promise<void> {
   prep("SELECT 1").get();
 }
 
@@ -704,7 +704,7 @@ export type RunRow = Run & { task_name: string | null; task_key: string | null; 
 const RUN_SELECT = `SELECT r.*, t.name AS task_name, t.key AS task_key, t.native_url AS task_native_url, a.name AS agent_name
   FROM runs r LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN agent_profiles a ON a.id = r.agent_id`;
 
-export function listRuns(opts: { limit?: number; task_id?: number; status?: string | string[]; platform?: string; kind?: string; agent_id?: number; since?: string; message_id?: number } = {}): RunRow[] {
+export async function listRuns(opts: { limit?: number; task_id?: number; status?: string | string[]; platform?: string; kind?: string; agent_id?: number; since?: string; message_id?: number } = {}): Promise<RunRow[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.task_id) {
@@ -754,7 +754,7 @@ export interface RunEventInput {
   at?: string;
 }
 
-export function addRunEvent(runId: number, input: RunEventInput): RunEvent {
+export async function addRunEvent(runId: number, input: RunEventInput): Promise<RunEvent> {
   const res = db
     .prepare(`INSERT INTO run_events (run_id, at, type, key, label, status, detail, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(runId, input.at ?? now(), input.type, input.key ?? null, input.label, input.status ?? null, input.detail ?? null, input.metadata === undefined ? null : JSON.stringify(input.metadata));
@@ -763,14 +763,14 @@ export function addRunEvent(runId: number, input: RunEventInput): RunEvent {
   return ev;
 }
 
-export function runEvents(runId: number): RunEvent[] {
+export async function runEvents(runId: number): Promise<RunEvent[]> {
   return prep("SELECT * FROM run_events WHERE run_id = ? ORDER BY id").all(runId) as RunEvent[];
 }
 
 export type ActivityRow = RunEvent & { run_label: string | null; run_kind: RunKind; provider: string | null; agent_id: number | null; agent_name: string | null; task_id: number | null; run_status: RunStatus };
 
 /** The newest timeline lines across every run: the unified activity feed. */
-export function recentRunEvents(opts: { limit?: number; since?: string; provider?: string; agent_id?: number; run_id?: number } = {}): ActivityRow[] {
+export async function recentRunEvents(opts: { limit?: number; since?: string; provider?: string; agent_id?: number; run_id?: number } = {}): Promise<ActivityRow[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.since) {
@@ -800,8 +800,8 @@ export function recentRunEvents(opts: { limit?: number; since?: string; provider
 }
 
 /** The step a running run is on right now, for lists that show many runs at once. */
-export function currentStepOf(runId: number): { label: string; status: StepStatus; at: string } | null {
-  const steps = foldSteps(runEvents(runId));
+export async function currentStepOf(runId: number): Promise<{ label: string; status: StepStatus; at: string } | null> {
+  const steps = foldSteps(await runEvents(runId));
   const live = [...steps].reverse().find((s) => s.status === "running" || s.status === "waiting");
   const s = live ?? steps.at(-1);
   return s ? { label: s.label, status: s.status, at: s.at } : null;
@@ -844,7 +844,7 @@ export interface EventInput {
 }
 
 /** Returns the event, or null when dedupe_key already exists. */
-export function addEvent(input: EventInput): EventRow | null {
+export async function addEvent(input: EventInput): Promise<EventRow | null> {
   if (input.dedupe_key) {
     const dup = prep("SELECT id FROM events WHERE dedupe_key = ?").get(input.dedupe_key);
     if (dup) return null;
@@ -857,7 +857,7 @@ export function addEvent(input: EventInput): EventRow | null {
   return ev;
 }
 
-export function listEvents(opts: { limit?: number; unread?: boolean; platform?: string } = {}): EventRow[] {
+export async function listEvents(opts: { limit?: number; unread?: boolean; platform?: string } = {}): Promise<EventRow[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.unread) where.push("read = 0");
@@ -869,22 +869,22 @@ export function listEvents(opts: { limit?: number; unread?: boolean; platform?: 
   return prep(`SELECT * FROM events ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY occurred_at DESC LIMIT ?`).all(...params, limit) as EventRow[];
 }
 
-export function markEventRead(id: number, read = true) {
+export async function markEventRead(id: number, read = true) {
   return prep("UPDATE events SET read = ? WHERE id = ?").run(read ? 1 : 0, id).changes > 0;
 }
-export function markAllEventsRead() {
+export async function markAllEventsRead() {
   return prep("UPDATE events SET read = 1 WHERE read = 0").run().changes;
 }
 
 /* ---------- platform state ---------- */
 
-export function getPlatformState(platform: string): PlatformState {
+export async function getPlatformState(platform: string): Promise<PlatformState> {
   const row = prep("SELECT * FROM platform_state WHERE platform = ?").get(platform) as PlatformState | undefined;
   return row ?? { platform, session_status: "unknown", last_sync_at: null, last_ok_at: null, last_error: null, screenshot_path: null, meta: null };
 }
 
-export function setPlatformState(platform: string, patch: Partial<Omit<PlatformState, "platform">>) {
-  const cur = getPlatformState(platform);
+export async function setPlatformState(platform: string, patch: Partial<Omit<PlatformState, "platform">>) {
+  const cur = await getPlatformState(platform);
   const next: PlatformState = { ...cur, ...patch, platform };
   prep(
     `INSERT INTO platform_state (platform, session_status, last_sync_at, last_ok_at, last_error, screenshot_path, meta)
@@ -896,19 +896,19 @@ export function setPlatformState(platform: string, patch: Partial<Omit<PlatformS
   return next;
 }
 
-export function allPlatformStates(): PlatformState[] {
+export async function allPlatformStates(): Promise<PlatformState[]> {
   return prep("SELECT * FROM platform_state").all() as PlatformState[];
 }
 
 /* ---------- captures ---------- */
 
-export function addCapture(c: { platform: string; url: string; method: string; status: number; content_type: string; body: string }) {
+export async function addCapture(c: { platform: string; url: string; method: string; status: number; content_type: string; body: string }) {
   const MAX = 512 * 1024;
   const body = c.body.length > MAX ? c.body.slice(0, MAX) : c.body;
   prep(`INSERT INTO captures (platform, url, method, status, content_type, body, size, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(c.platform, c.url, c.method, c.status, c.content_type, body, c.body.length, now());
 }
 
-export function pruneCaptures(platform: string, keep = 300) {
+export async function pruneCaptures(platform: string, keep = 300) {
   prep(`DELETE FROM captures WHERE platform = ? AND id NOT IN (SELECT id FROM captures WHERE platform = ? ORDER BY id DESC LIMIT ?)`).run(platform, platform, keep);
 }
 
@@ -922,34 +922,34 @@ export interface CaptureSummary {
   captured_at: string;
 }
 
-export function listCaptures(platform: string, limit = 100): CaptureSummary[] {
+export async function listCaptures(platform: string, limit = 100): Promise<CaptureSummary[]> {
   return prep(`SELECT id, url, method, status, content_type, size, captured_at FROM captures WHERE platform = ? ORDER BY id DESC LIMIT ?`).all(platform, limit) as CaptureSummary[];
 }
 
-export function getCapture(id: number): (CaptureSummary & { platform: string; body: string }) | undefined {
+export async function getCapture(id: number): Promise<(CaptureSummary & { platform: string; body: string }) | undefined> {
   return prep("SELECT * FROM captures WHERE id = ?").get(id) as (CaptureSummary & { platform: string; body: string }) | undefined;
 }
 
 /* ---------- sync log ---------- */
 
-export function startSyncLog(platform: string): number {
+export async function startSyncLog(platform: string): Promise<number> {
   const res = prep("INSERT INTO sync_log (platform, started_at) VALUES (?, ?)").run(platform, now());
   return Number(res.lastInsertRowid);
 }
-export function finishSyncLog(id: number, r: { ok: boolean; message?: string; agents?: number; runs?: number; captures?: number }) {
+export async function finishSyncLog(id: number, r: { ok: boolean; message?: string; agents?: number; runs?: number; captures?: number }) {
   prep(`UPDATE sync_log SET finished_at=?, ok=?, message=?, agents_found=?, runs_found=?, captures=? WHERE id=?`).run(now(), r.ok ? 1 : 0, r.message ?? null, r.agents ?? 0, r.runs ?? 0, r.captures ?? 0, id);
 }
-export function recentSyncLogs(limit = 30) {
+export async function recentSyncLogs(limit = 30) {
   return prep("SELECT * FROM sync_log ORDER BY id DESC LIMIT ?").all(limit);
 }
 
 /* ---------- settings ---------- */
 
-export function getSetting(key: string): string | undefined {
+export async function getSetting(key: string): Promise<string | undefined> {
   const r = prep("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
   return r?.value;
 }
-export function setSetting(key: string, value: string) {
+export async function setSetting(key: string, value: string) {
   prep("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
 }
 
@@ -975,7 +975,7 @@ const AGENT_SELECT = `SELECT a.*,
   (SELECT COUNT(*) FROM runs r WHERE r.agent_id = a.id AND r.status = 'running') AS running
   FROM agent_profiles a`;
 
-export function listAgentProfiles(opts: { provider?: string; kind?: string; includeDisabled?: boolean } = {}): AgentProfileSummary[] {
+export async function listAgentProfiles(opts: { provider?: string; kind?: string; includeDisabled?: boolean } = {}): Promise<AgentProfileSummary[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.provider) {
@@ -990,17 +990,17 @@ export function listAgentProfiles(opts: { provider?: string; kind?: string; incl
   return prep(`${AGENT_SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY a.kind, a.name`).all(...params) as AgentProfileSummary[];
 }
 
-export function getAgentProfile(id: number): AgentProfileSummary | undefined {
+export async function getAgentProfile(id: number): Promise<AgentProfileSummary | undefined> {
   return prep(`${AGENT_SELECT} WHERE a.id = ?`).get(id) as AgentProfileSummary | undefined;
 }
 
-export function findAgentProfile(key: string): AgentProfileSummary | undefined {
+export async function findAgentProfile(key: string): Promise<AgentProfileSummary | undefined> {
   return prep(`${AGENT_SELECT} WHERE a.key = ?`).get(key) as AgentProfileSummary | undefined;
 }
 
 /** Insert or update by key. Fields that are undefined are left untouched on update. */
-export function upsertAgentProfile(input: AgentProfileInput): AgentProfileSummary {
-  const existing = findAgentProfile(input.key);
+export async function upsertAgentProfile(input: AgentProfileInput): Promise<AgentProfileSummary> {
+  const existing = await findAgentProfile(input.key);
   const ts = now();
   const caps = input.capabilities === undefined ? undefined : input.capabilities === null ? null : JSON.stringify(input.capabilities);
   const conf = input.configuration === undefined ? undefined : input.configuration === null ? null : JSON.stringify(input.configuration);
@@ -1009,20 +1009,20 @@ export function upsertAgentProfile(input: AgentProfileInput): AgentProfileSummar
       `UPDATE agent_profiles SET name = COALESCE(?, name), description = COALESCE(?, description), provider_id = COALESCE(?, provider_id), kind = COALESCE(?, kind),
          capabilities = COALESCE(?, capabilities), status = COALESCE(?, status), configuration = COALESCE(?, configuration), updated_at = ? WHERE id = ?`,
     ).run(input.name ?? null, input.description ?? null, input.provider_id ?? null, input.kind ?? null, caps ?? null, input.status ?? null, conf ?? null, ts, existing.id);
-    const a = getAgentProfile(existing.id)!;
+    const a = (await getAgentProfile(existing.id))!;
     notify("agent", a);
     return a;
   }
   const res = db
     .prepare(`INSERT INTO agent_profiles (key, name, description, provider_id, kind, capabilities, status, configuration, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(input.key, input.name ?? input.key, input.description ?? null, input.provider_id ?? null, input.kind ?? "custom", caps ?? null, input.status ?? "active", conf ?? null, ts, ts);
-  const a = getAgentProfile(Number(res.lastInsertRowid))!;
+  const a = (await getAgentProfile(Number(res.lastInsertRowid)))!;
   notify("agent", a);
   return a;
 }
 
-export function updateAgentProfile(id: number, patch: Partial<AgentProfileInput>): AgentProfileSummary | undefined {
-  const a = getAgentProfile(id);
+export async function updateAgentProfile(id: number, patch: Partial<AgentProfileInput>): Promise<AgentProfileSummary | undefined> {
+  const a = await getAgentProfile(id);
   if (!a) return undefined;
   prep(`UPDATE agent_profiles SET name=?, description=?, provider_id=?, kind=?, capabilities=?, status=?, configuration=?, updated_at=? WHERE id=?`).run(
     patch.name ?? a.name,
@@ -1035,12 +1035,12 @@ export function updateAgentProfile(id: number, patch: Partial<AgentProfileInput>
     now(),
     id,
   );
-  const next = getAgentProfile(id);
+  const next = await getAgentProfile(id);
   if (next) notify("agent", next);
   return next;
 }
 
-export function deleteAgentProfile(id: number): boolean {
+export async function deleteAgentProfile(id: number): Promise<boolean> {
   const ok = prep("DELETE FROM agent_profiles WHERE id = ?").run(id).changes > 0;
   if (ok) notify("agent:deleted", { id });
   return ok;
@@ -1048,12 +1048,12 @@ export function deleteAgentProfile(id: number): boolean {
 
 /* ---------- policies, approvals, audit ---------- */
 
-export function getPolicyOverrides(): Record<string, PolicyMode> {
+export async function getPolicyOverrides(): Promise<Record<string, PolicyMode>> {
   const out: Record<string, PolicyMode> = {};
   for (const r of prep("SELECT action, mode FROM policies").all() as { action: string; mode: PolicyMode }[]) out[r.action] = r.mode;
   return out;
 }
-export function setPolicyOverride(action: string, mode: PolicyMode | null) {
+export async function setPolicyOverride(action: string, mode: PolicyMode | null) {
   if (mode === null) prep("DELETE FROM policies WHERE action = ?").run(action);
   else prep("INSERT INTO policies (action, mode, updated_at) VALUES (?, ?, ?) ON CONFLICT(action) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at").run(action, mode, now());
 }
@@ -1061,26 +1061,26 @@ export function setPolicyOverride(action: string, mode: PolicyMode | null) {
 export type ApprovalRow = Approval & { run_label: string | null; run_kind: string | null };
 const APPROVAL_SELECT = `SELECT a.*, r.label AS run_label, r.kind AS run_kind FROM approvals a LEFT JOIN runs r ON r.id = a.run_id`;
 
-export function createApproval(input: { run_id?: number | null; message_id?: number | null; action: string; provider?: string | null; summary: string; detail?: string | null }): ApprovalRow {
+export async function createApproval(input: { run_id?: number | null; message_id?: number | null; action: string; provider?: string | null; summary: string; detail?: string | null }): Promise<ApprovalRow> {
   const res = db
     .prepare(`INSERT INTO approvals (run_id, message_id, action, provider, summary, detail, status, requested_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`)
     .run(input.run_id ?? null, input.message_id ?? null, input.action, input.provider ?? null, input.summary, input.detail ?? null, now());
-  const a = getApproval(Number(res.lastInsertRowid))!;
+  const a = (await getApproval(Number(res.lastInsertRowid)))!;
   notify("approval", a);
   return a;
 }
-export function getApproval(id: number): ApprovalRow | undefined {
+export async function getApproval(id: number): Promise<ApprovalRow | undefined> {
   return prep(`${APPROVAL_SELECT} WHERE a.id = ?`).get(id) as ApprovalRow | undefined;
 }
-export function updateApproval(id: number, patch: { status: ApprovalStatus; decided_by?: string | null; reason?: string | null }): ApprovalRow | undefined {
-  const a = getApproval(id);
+export async function updateApproval(id: number, patch: { status: ApprovalStatus; decided_by?: string | null; reason?: string | null }): Promise<ApprovalRow | undefined> {
+  const a = await getApproval(id);
   if (!a) return undefined;
   prep("UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, reason = ? WHERE id = ?").run(patch.status, patch.status === "pending" ? null : now(), patch.decided_by ?? a.decided_by, patch.reason ?? a.reason, id);
-  const next = getApproval(id)!;
+  const next = (await getApproval(id))!;
   notify("approval", next);
   return next;
 }
-export function listApprovals(opts: { status?: ApprovalStatus | ApprovalStatus[]; message_id?: number; run_id?: number; limit?: number } = {}): ApprovalRow[] {
+export async function listApprovals(opts: { status?: ApprovalStatus | ApprovalStatus[]; message_id?: number; run_id?: number; limit?: number } = {}): Promise<ApprovalRow[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.status) {
@@ -1100,11 +1100,11 @@ export function listApprovals(opts: { status?: ApprovalStatus | ApprovalStatus[]
   return prep(`${APPROVAL_SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY a.requested_at DESC LIMIT ?`).all(...params, limit) as ApprovalRow[];
 }
 
-export function addAudit(input: { actor: string; action: string; target?: string | null; detail?: string | null; metadata?: unknown }): AuditEntry {
+export async function addAudit(input: { actor: string; action: string; target?: string | null; detail?: string | null; metadata?: unknown }): Promise<AuditEntry> {
   const res = prep("INSERT INTO audit_log (at, actor, action, target, detail, metadata) VALUES (?, ?, ?, ?, ?, ?)").run(now(), input.actor, input.action, input.target ?? null, input.detail ?? null, input.metadata === undefined ? null : JSON.stringify(input.metadata));
   return prep("SELECT * FROM audit_log WHERE id = ?").get(Number(res.lastInsertRowid)) as AuditEntry;
 }
-export function listAudit(opts: { limit?: number; action?: string } = {}): AuditEntry[] {
+export async function listAudit(opts: { limit?: number; action?: string } = {}): Promise<AuditEntry[]> {
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
   if (opts.action) return prep("SELECT * FROM audit_log WHERE action LIKE ? ORDER BY id DESC LIMIT ?").all(opts.action + "%", limit) as AuditEntry[];
   return prep("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?").all(limit) as AuditEntry[];
@@ -1122,27 +1122,27 @@ export interface SessionRow {
   ip: string | null;
 }
 
-export function insertSession(input: { token_hash: string; expires_at: string; user_agent?: string | null; ip?: string | null }): SessionRow {
+export async function insertSession(input: { token_hash: string; expires_at: string; user_agent?: string | null; ip?: string | null }): Promise<SessionRow> {
   const ts = now();
   const res = prep("INSERT INTO sessions (token_hash, created_at, last_seen_at, expires_at, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)").run(input.token_hash, ts, ts, input.expires_at, input.user_agent ?? null, input.ip ?? null);
   return prep("SELECT * FROM sessions WHERE id = ?").get(Number(res.lastInsertRowid)) as SessionRow;
 }
-export function findSession(tokenHash: string): SessionRow | undefined {
+export async function findSession(tokenHash: string): Promise<SessionRow | undefined> {
   return prep("SELECT * FROM sessions WHERE token_hash = ? AND expires_at > ?").get(tokenHash, now()) as SessionRow | undefined;
 }
-export function touchSession(id: number) {
+export async function touchSession(id: number) {
   prep("UPDATE sessions SET last_seen_at = ? WHERE id = ?").run(now(), id);
 }
-export function deleteSession(tokenHash: string): boolean {
+export async function deleteSession(tokenHash: string): Promise<boolean> {
   return prep("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash).changes > 0;
 }
-export function deleteAllSessions(): number {
+export async function deleteAllSessions(): Promise<number> {
   return prep("DELETE FROM sessions").run().changes;
 }
-export function purgeExpiredSessions(): number {
+export async function purgeExpiredSessions(): Promise<number> {
   return prep("DELETE FROM sessions WHERE expires_at <= ?").run(now()).changes;
 }
-export function countSessions(): number {
+export async function countSessions(): Promise<number> {
   return (prep("SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?").get(now()) as { n: number }).n;
 }
 
@@ -1164,20 +1164,20 @@ export interface PairingRow {
   ip: string | null;
 }
 
-export function insertPairing(input: { platform: string; code_hash: string; expires_at: string }): PairingRow {
+export async function insertPairing(input: { platform: string; code_hash: string; expires_at: string }): Promise<PairingRow> {
   const res = prep("INSERT INTO pairings (platform, code_hash, status, created_at, expires_at) VALUES (?, ?, 'waiting', ?, ?)").run(input.platform, input.code_hash, now(), input.expires_at);
-  return getPairing(Number(res.lastInsertRowid))!;
+  return (await getPairing(Number(res.lastInsertRowid)))!;
 }
-export function getPairing(id: number): PairingRow | undefined {
+export async function getPairing(id: number): Promise<PairingRow | undefined> {
   return prep("SELECT * FROM pairings WHERE id = ?").get(id) as PairingRow | undefined;
 }
-export function findPairingByCodeHash(hash: string): PairingRow | undefined {
+export async function findPairingByCodeHash(hash: string): Promise<PairingRow | undefined> {
   return prep("SELECT * FROM pairings WHERE code_hash = ? AND status = 'waiting' AND expires_at > ?").get(hash, now()) as PairingRow | undefined;
 }
-export function findPairingByTokenHash(hash: string): PairingRow | undefined {
+export async function findPairingByTokenHash(hash: string): Promise<PairingRow | undefined> {
   return prep("SELECT * FROM pairings WHERE token_hash = ? AND status IN ('paired', 'importing') AND expires_at > ?").get(hash, now()) as PairingRow | undefined;
 }
-export function updatePairing(id: number, patch: Partial<Pick<PairingRow, "status" | "detail" | "token_hash" | "expires_at" | "paired_at" | "finished_at" | "ip">>): PairingRow | undefined {
+export async function updatePairing(id: number, patch: Partial<Pick<PairingRow, "status" | "detail" | "token_hash" | "expires_at" | "paired_at" | "finished_at" | "ip">>): Promise<PairingRow | undefined> {
   const cols: string[] = [];
   const vals: unknown[] = [];
   for (const [k, v] of Object.entries(patch)) {
@@ -1186,23 +1186,23 @@ export function updatePairing(id: number, patch: Partial<Pick<PairingRow, "statu
     vals.push(v);
   }
   if (cols.length) prep(`UPDATE pairings SET ${cols.join(", ")} WHERE id = ?`).run(...vals, id);
-  return getPairing(id);
+  return await getPairing(id);
 }
-export function latestPairing(platform: string): PairingRow | undefined {
+export async function latestPairing(platform: string): Promise<PairingRow | undefined> {
   return prep("SELECT * FROM pairings WHERE platform = ? ORDER BY id DESC LIMIT 1").get(platform) as PairingRow | undefined;
 }
 /** Codes and tokens die on their own; nothing lingers as "waiting" past its time. */
-export function expirePairings(): number {
+export async function expirePairings(): Promise<number> {
   return prep("UPDATE pairings SET status = 'expired', token_hash = NULL, finished_at = ? WHERE status IN ('waiting', 'paired', 'importing') AND expires_at <= ?").run(now(), now()).changes;
 }
 /** A new code for a provider retires any earlier one still waiting. */
-export function replaceWaitingPairings(platform: string, exceptId: number): number {
+export async function replaceWaitingPairings(platform: string, exceptId: number): Promise<number> {
   return prep("UPDATE pairings SET status = 'replaced', finished_at = ? WHERE platform = ? AND status = 'waiting' AND id <> ?").run(now(), platform, exceptId).changes;
 }
 
 /* ---------- overview ---------- */
 
-export function overviewCounts() {
+export async function overviewCounts() {
   const tasks = prep("SELECT COUNT(*) AS n FROM tasks WHERE enabled = 1").get() as { n: number };
   const failed = prep(`SELECT COUNT(*) AS n FROM runs WHERE status IN ('failed','needs_attention') AND COALESCE(finished_at, started_at, created_at) > datetime('now', '-7 days')`).get() as { n: number };
   const unread = prep("SELECT COUNT(*) AS n FROM events WHERE read = 0").get() as { n: number };
@@ -1233,24 +1233,24 @@ const CONVERSATION_SELECT = `SELECT c.*,
   EXISTS(SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND m.status IN ('assigned','delivered')) AS active
   FROM conversations c`;
 
-export function createConversation(title = ""): ConversationSummary {
+export async function createConversation(title = ""): Promise<ConversationSummary> {
   const ts = now();
   const res = prep("INSERT INTO conversations (title, created_at, updated_at, last_message_at) VALUES (?, ?, ?, NULL)").run(title.slice(0, 120), ts, ts);
-  const c = getConversation(Number(res.lastInsertRowid))!;
+  const c = (await getConversation(Number(res.lastInsertRowid)))!;
   notify("conversation", { action: "created", conversation: c });
   return c;
 }
 
-export function getConversation(id: number): ConversationSummary | undefined {
+export async function getConversation(id: number): Promise<ConversationSummary | undefined> {
   return prep(`${CONVERSATION_SELECT} WHERE c.id = ?`).get(id) as ConversationSummary | undefined;
 }
 
-export function listConversations(limit = 200): ConversationSummary[] {
+export async function listConversations(limit = 200): Promise<ConversationSummary[]> {
   return prep(`${CONVERSATION_SELECT} ORDER BY COALESCE(c.last_message_at, c.created_at) DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 1000)) as ConversationSummary[];
 }
 
-export function updateConversation(id: number, patch: { title?: string; last_message_at?: string }): ConversationSummary | undefined {
-  const c = getConversation(id);
+export async function updateConversation(id: number, patch: { title?: string; last_message_at?: string }): Promise<ConversationSummary | undefined> {
+  const c = await getConversation(id);
   if (!c) return undefined;
   prep("UPDATE conversations SET title = ?, last_message_at = ?, updated_at = ? WHERE id = ?").run(
     patch.title === undefined ? c.title : patch.title.slice(0, 120),
@@ -1258,13 +1258,13 @@ export function updateConversation(id: number, patch: { title?: string; last_mes
     now(),
     id,
   );
-  const next = getConversation(id)!;
+  const next = (await getConversation(id))!;
   notify("conversation", { action: "updated", conversation: next });
   return next;
 }
 
-export function deleteConversation(id: number): boolean {
-  const c = getConversation(id);
+export async function deleteConversation(id: number): Promise<boolean> {
+  const c = await getConversation(id);
   if (!c) return false;
   prep("DELETE FROM messages WHERE conversation_id = ?").run(id);
   prep("DELETE FROM conversations WHERE id = ?").run(id);
@@ -1273,7 +1273,7 @@ export function deleteConversation(id: number): boolean {
 }
 
 /** Messages of one thread, oldest first. */
-export function conversationMessages(conversationId: number, limit = 300): MessageWithTask[] {
+export async function conversationMessages(conversationId: number, limit = 300): Promise<MessageWithTask[]> {
   return prep(`${MESSAGE_SELECT} WHERE m.conversation_id = ? ORDER BY m.created_at ASC, m.id ASC LIMIT ?`).all(conversationId, Math.min(Math.max(limit, 1), 2000)) as MessageWithTask[];
 }
 
@@ -1286,20 +1286,20 @@ export type MessageWithAgent = MessageWithTask;
 const MESSAGE_SELECT = `SELECT m.*, t.name AS task_name, t.platform AS task_platform, t.key AS task_key, t.native_url AS task_native_url
   FROM messages m LEFT JOIN tasks t ON t.id = m.task_id`;
 
-export function createMessage(text: string, conversationId: number | null = null): MessageRow {
+export async function createMessage(text: string, conversationId: number | null = null): Promise<MessageRow> {
   const ts = now();
   const res = prep(`INSERT INTO messages (text, status, conversation_id, created_at, updated_at) VALUES (?, 'needs_assignment', ?, ?, ?)`).run(text, conversationId, ts, ts);
   if (conversationId) {
     prep("UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ?").run(ts, ts, conversationId);
-    const c = getConversation(conversationId);
+    const c = await getConversation(conversationId);
     if (c) notify("conversation", { action: "updated", conversation: c });
   }
-  const m = getMessage(Number(res.lastInsertRowid))!;
+  const m = (await getMessage(Number(res.lastInsertRowid)))!;
   notify("message:row", m);
   return m;
 }
 
-export function getMessage(id: number): MessageWithTask | undefined {
+export async function getMessage(id: number): Promise<MessageWithTask | undefined> {
   return prep(`${MESSAGE_SELECT} WHERE m.id = ?`).get(id) as MessageWithTask | undefined;
 }
 
@@ -1318,8 +1318,8 @@ export interface MessagePatch {
   steps?: Step[] | null;
 }
 
-export function updateMessage(id: number, patch: MessagePatch): MessageWithTask | undefined {
-  const m = getMessage(id);
+export async function updateMessage(id: number, patch: MessagePatch): Promise<MessageWithTask | undefined> {
+  const m = await getMessage(id);
   if (!m) return undefined;
   const json = (v: unknown, cur: string | null) => (v === undefined ? cur : v === null ? null : JSON.stringify(v));
   prep(
@@ -1340,19 +1340,19 @@ export function updateMessage(id: number, patch: MessagePatch): MessageWithTask 
     now(),
     id,
   );
-  const next = getMessage(id);
+  const next = await getMessage(id);
   if (next) {
     notify("message:row", next);
     // A status change is what the thread list cares about (running dot, last status).
     if (next.conversation_id && patch.status && patch.status !== m.status) {
-      const c = getConversation(next.conversation_id);
+      const c = await getConversation(next.conversation_id);
       if (c) notify("conversation", { action: "updated", conversation: c });
     }
   }
   return next;
 }
 
-export function listMessages(opts: { status?: string; task_id?: number; limit?: number } = {}): MessageWithTask[] {
+export async function listMessages(opts: { status?: string; task_id?: number; limit?: number } = {}): Promise<MessageWithTask[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.status) {
@@ -1368,24 +1368,24 @@ export function listMessages(opts: { status?: string; task_id?: number; limit?: 
 }
 
 /** Messages waiting for a task's agent that pulls its instructions. */
-export function inboxFor(taskId: number): MessageWithTask[] {
+export async function inboxFor(taskId: number): Promise<MessageWithTask[]> {
   return prep(`${MESSAGE_SELECT} WHERE m.task_id = ? AND m.delivery_mode = 'inbox' AND m.status IN ('assigned','delivered') ORDER BY m.created_at ASC`).all(taskId) as MessageWithTask[];
 }
 
-export function deleteMessage(id: number): boolean {
-  const m = getMessage(id);
+export async function deleteMessage(id: number): Promise<boolean> {
+  const m = await getMessage(id);
   const ok = prep("DELETE FROM messages WHERE id = ?").run(id).changes > 0;
   if (ok && m) {
     notify("message:deleted", { id, conversation_id: m.conversation_id });
     if (m.conversation_id) {
-      const c = getConversation(m.conversation_id);
+      const c = await getConversation(m.conversation_id);
       if (c) notify("conversation", { action: "updated", conversation: c });
     }
   }
   return ok;
 }
 
-export function openMessageCount(): number {
+export async function openMessageCount(): Promise<number> {
   return (prep(`SELECT COUNT(*) AS n FROM messages WHERE status IN ('needs_assignment','failed')`).get() as { n: number }).n;
 }
 
@@ -1402,7 +1402,7 @@ export interface DayStat {
 }
 
 /** Runs per day for the last N days, bucketed by status. Days with no runs are included as zeros. */
-export function runStats(days = 14): DayStat[] {
+export async function runStats(days = 14): Promise<DayStat[]> {
   const n = Math.min(Math.max(days, 1), 90);
   const rows = db
     .prepare(`SELECT substr(COALESCE(finished_at, started_at, created_at), 1, 10) AS day, status, COUNT(*) AS n FROM runs WHERE COALESCE(finished_at, started_at, created_at) >= date('now', ?) GROUP BY day, status`)
@@ -1421,7 +1421,7 @@ export function runStats(days = 14): DayStat[] {
 }
 
 /** Last few run statuses per task, newest first, for the history dots on the tasks table. */
-export function recentStatusesByTask(limit = 6): Record<number, string[]> {
+export async function recentStatusesByTask(limit = 6): Promise<Record<number, string[]>> {
   const rows = db
     .prepare(`SELECT task_id, status FROM (SELECT task_id, status, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY COALESCE(finished_at, started_at, created_at) DESC) AS rn FROM runs WHERE task_id IS NOT NULL) WHERE rn <= ?`)
     .all(limit) as { task_id: number; status: string }[];

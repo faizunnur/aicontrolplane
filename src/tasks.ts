@@ -30,10 +30,10 @@ export function taskRef(t: { id: number; key: string; name: string; configuratio
   return { id: t.id, key: t.key, name: t.name, configuration: { ...parse(t.configuration), delivery: parse(t.delivery) } };
 }
 
-export function taskView(t: TaskWithLastRun, recent: Record<number, string[]> = {}) {
+export async function taskView(t: TaskWithLastRun, recent: Record<number, string[]> = {}) {
   const adapter = getProvider(t.platform);
-  const agent = t.agent_id ? getAgentProfile(t.agent_id) : undefined;
-  const current = listRuns({ task_id: t.id, status: "running", limit: 1 })[0] ?? null;
+  const agent = t.agent_id ? await getAgentProfile(t.agent_id) : undefined;
+  const current = (await listRuns({ task_id: t.id, status: "running", limit: 1 }))[0] ?? null;
   const can = adapter ? adapter.canRunTask(taskRef(t)) : { ok: false, reason: "unknown provider" };
   const caps = adapter?.capabilities();
   const notes = adapter?.capabilityNotes() ?? {};
@@ -57,11 +57,11 @@ export function taskView(t: TaskWithLastRun, recent: Record<number, string[]> = 
     },
   };
 }
-export type TaskView = ReturnType<typeof taskView>;
+export type TaskView = Awaited<ReturnType<typeof taskView>>;
 
-export function listTaskViews(opts: { platform?: string; agent_id?: number; includeDisabled?: boolean } = {}): TaskView[] {
-  const recent = recentStatusesByTask(6);
-  return listTasks(opts).map((t) => taskView(t, recent));
+export async function listTaskViews(opts: { platform?: string; agent_id?: number; includeDisabled?: boolean } = {}): Promise<TaskView[]> {
+  const recent = await recentStatusesByTask(6);
+  return Promise.all((await listTasks(opts)).map((t) => taskView(t, recent)));
 }
 
 export class TaskStartError extends Error {
@@ -80,7 +80,7 @@ export class TaskStartError extends Error {
  * callback. Throws TaskStartError when the task cannot be started at all.
  */
 export async function startTask(taskId: number, opts: { text?: string; trigger?: RunTrigger; messageId?: number } = {}): Promise<Run> {
-  const task = getTask(taskId);
+  const task = await getTask(taskId);
   if (!task) throw new TaskStartError("unknown task", 404);
   const adapter: ProviderAdapter | undefined = getProvider(task.platform);
   if (!adapter) throw new TaskStartError(`unknown provider ${task.platform}`, 404);
@@ -89,30 +89,30 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
   const can = adapter.canRunTask(ref);
   if (!can.ok) throw new TaskStartError(can.reason ?? "this task cannot be started", 409);
 
-  const agent = task.agent_id ? getAgentProfile(task.agent_id) : ensureTaskAgent(task);
-  const { run, track } = beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user" });
+  const agent = task.agent_id ? await getAgentProfile(task.agent_id) : await ensureTaskAgent(task);
+  const { run, track } = await beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user" });
   // Everything this run does logs with its id attached.
   return withLogContext({ run_id: run.id }, async () => {
-  track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);
+  await track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);
 
   const decision = await guard({ runId: run.id, messageId: opts.messageId ?? null, provider: task.platform, track }, "run_task", `Start "${task.name}" at ${adapter.name}?`, opts.text?.slice(0, 240) ?? null);
   if (decision !== "approved") {
-    return endRun(run.id, { status: "cancelled", error: decision === "timeout" ? "not approved in time" : "rejected" })!;
+    return (await endRun(run.id, { status: "cancelled", error: decision === "timeout" ? "not approved in time" : "rejected" }))!;
   }
 
-  track.start("start", `Starting at ${adapter.name}`);
+  await track.start("start", `Starting at ${adapter.name}`);
   const reportUrl = config.publicUrl ? `${config.publicUrl}/api/runs/${run.id}` : null;
   const r = await adapter.runTask(ref, { runId: run.id, track, messageId: opts.messageId, trigger: opts.trigger }, { text: opts.text, run_id: run.id, report_url: reportUrl });
   if (!r.ok) {
-    track.fail("start", r.message);
+    await track.fail("start", r.message);
     log.warn(`task ${task.id} (${task.name}) could not be started: ${r.message}`);
-    return endRun(run.id, { status: "failed", error: r.message })!;
+    return (await endRun(run.id, { status: "failed", error: r.message }))!;
   }
-  track.done("start", r.message);
+  await track.done("start", r.message);
   if (r.pending) {
-    track.waiting("report", `Waiting for ${agent?.name ?? task.name} to report back`);
+    await track.waiting("report", `Waiting for ${agent?.name ?? task.name} to report back`);
     return run;
   }
-  return endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null, external_id: r.external_id ?? null })!;
+  return (await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null, external_id: r.external_id ?? null }))!;
   });
 }

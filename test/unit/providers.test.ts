@@ -17,14 +17,14 @@ describe("provider registry", () => {
     assert.equal(getProvider("nope"), undefined);
   });
 
-  it("declares honest capabilities: browser for chat and task pages, nothing for task control", () => {
+  it("declares honest capabilities: browser for chat and task pages, nothing for task control", async () => {
     const c = getProvider("chatgpt")!.capabilities();
     assert.equal(c.chat, "browser");
     assert.equal(c.listTasks, "browser");
     for (const op of ["createTask", "updateTask", "cancelTask", "runTask", "getRun"] as const) assert.equal(c[op], null, `${op} must be unsupported`);
     const g = getProvider("gemini")!.capabilities();
     assert.equal(g.listTasks, null, "Gemini has no tasks page address, so listing is unsupported");
-    const view = providerView(getProvider("gemini")!);
+    const view = await providerView(getProvider("gemini")!);
     assert.ok(view.unsupported.find((u) => u.operation === "listTasks")?.reason.includes("AI setup"));
   });
 
@@ -68,16 +68,16 @@ describe("provider registry", () => {
 
   it("providers declare the sign-in mode they need, and a remembered mode wins", async () => {
     const { setSetting } = await import("../../src/db.js");
-    assert.equal(getProvider("grok")!.preferredSignIn(), "local", "Grok's sign-in page refuses any browser in a datacenter: sign in from your own computer");
-    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live");
-    setSetting("signin_mode:chatgpt", "desktop");
-    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "desktop");
-    setSetting("signin_mode:chatgpt", "local");
-    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "local", "a sign-in that worked from the user's computer is remembered");
-    setSetting("signin_mode:chatgpt", "nonsense");
-    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live", "an unknown remembered mode falls back to the provider's default");
-    setSetting("signin_mode:chatgpt", "live");
-    assert.equal(getProvider("chatgpt")!.preferredSignIn(), "live");
+    assert.equal(await getProvider("grok")!.preferredSignIn(), "local", "Grok's sign-in page refuses any browser in a datacenter: sign in from your own computer");
+    assert.equal(await getProvider("chatgpt")!.preferredSignIn(), "live");
+    await setSetting("signin_mode:chatgpt", "desktop");
+    assert.equal(await getProvider("chatgpt")!.preferredSignIn(), "desktop");
+    await setSetting("signin_mode:chatgpt", "local");
+    assert.equal(await getProvider("chatgpt")!.preferredSignIn(), "local", "a sign-in that worked from the user's computer is remembered");
+    await setSetting("signin_mode:chatgpt", "nonsense");
+    assert.equal(await getProvider("chatgpt")!.preferredSignIn(), "live", "an unknown remembered mode falls back to the provider's default");
+    await setSetting("signin_mode:chatgpt", "live");
+    assert.equal(await getProvider("chatgpt")!.preferredSignIn(), "live");
   });
 
   it("aliases are what the router recognises", () => {

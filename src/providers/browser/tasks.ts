@@ -55,7 +55,7 @@ export async function collectTasks(p: PlatformConfig, outputUrlFor: OutputUrlHoo
         if (!isStall(err)) throw err;
         log.warn(`collect ${p.id}: ${cleanError(err)}; retrying on a fresh tab`);
         await browser.resetConsolePage(p.id);
-        return collectOnce(p, outputUrlFor, ctx);
+        return await collectOnce(p, outputUrlFor, ctx);
       }
     },
     { label: `Looking at ${p.name}'s tasks`, platform: p.id, messageId: ctx.messageId ?? null },
@@ -90,7 +90,7 @@ async function collectOnce(p: PlatformConfig, outputUrlFor: OutputUrlHook, ctx: 
     }
   };
 
-  ctx.track?.start("open", `Opening ${p.name}'s tasks page`);
+  await ctx.track?.start("open", `Opening ${p.name}'s tasks page`);
   const listening: Page[] = [];
   let page: Page;
   try {
@@ -106,21 +106,21 @@ async function collectOnce(p: PlatformConfig, outputUrlFor: OutputUrlHook, ctx: 
     for (const pg of listening) pg.off("response", onResponse);
   }
   const finalUrl = page.url();
-  ctx.track?.done("open", hostOf(finalUrl));
+  await ctx.track?.done("open", hostOf(finalUrl));
 
-  ctx.track?.start("check", "Checking the sign-in");
+  await ctx.track?.start("check", "Checking the sign-in");
   const sessionStatus: SessionStatus = await detectLoginState(p, page, { unauthorized: captured.some((c) => c.status === 401) });
-  if (sessionStatus === "needs_login") ctx.track?.fail("check", "signed out");
-  else ctx.track?.done("check", "signed in");
+  if (sessionStatus === "needs_login") await ctx.track?.fail("check", "signed out");
+  else await ctx.track?.done("check", "signed in");
 
-  ctx.track?.start("capture", "Reading what the page loaded");
+  await ctx.track?.start("capture", "Reading what the page loaded");
   const screenshotPath = await pc.screenshot(page);
   const snapshot = await textSnapshot(p, page);
-  for (const c of captured) addCapture({ platform: p.id, url: c.url, method: c.method, status: c.status, content_type: c.contentType, body: c.body });
-  pruneCaptures(p.id);
+  for (const c of captured) await addCapture({ platform: p.id, url: c.url, method: c.method, status: c.status, content_type: c.contentType, body: c.body });
+  await pruneCaptures(p.id);
 
   const norm = sessionStatus === "logged_in" ? normalizePayloads(p, captured.map((c) => tryParse(c.body)).filter((v) => v !== undefined), { outputUrlFor }) : { tasks: [], runs: [] };
-  ctx.track?.done("capture", `${captured.length} payloads, ${norm.tasks.length} tasks, ${norm.runs.length} runs`);
+  await ctx.track?.done("capture", `${captured.length} payloads, ${norm.tasks.length} tasks, ${norm.runs.length} runs`);
 
   const meta: CollectMeta = {
     finalUrl,

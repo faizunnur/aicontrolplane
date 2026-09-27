@@ -76,13 +76,13 @@ export class CustomProviderAdapter implements ProviderAdapter {
   unsupported(op: ProviderOperation) {
     return new UnsupportedOperationError(this.id, op, this.capabilityNotes()[op] ?? `${this.name} cannot do this.`);
   }
-  connectionStatus(): ConnectionStatus {
+  async connectionStatus(): Promise<ConnectionStatus> {
     return { status: "none", lastCheckedAt: null, lastError: null };
   }
   async connect(): Promise<ConnectResult> {
     throw this.unsupported("signIn");
   }
-  preferredSignIn(): SignInMode {
+  async preferredSignIn(): Promise<SignInMode> {
     return "live";
   }
   async checkAuth(): Promise<SessionStatus> {

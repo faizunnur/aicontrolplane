@@ -86,7 +86,7 @@ const COMMANDS: [CommandAction, RegExp][] = [
 const GREETING = /^(hi|hello|hey|hiya|yo|good (morning|afternoon|evening|night)|thanks|thank you|thanks!|thx|cheers|ok|okay|cool|nice|great|perfect|got it|never ?mind|sorry)[\s!.,]*$/;
 const HELP = /^(help|what can you do|what else can you do|who are you|what are you|what do you do|how do you work|what can i ask( you)?|what can i say|how can you help( me)?|what are you for)\b[\s?.!]*$/;
 
-export function classify(raw: string): Intent {
+export async function classify(raw: string): Promise<Intent> {
   const text = raw.trim().toLowerCase().replace(/\s+/g, " ");
   if (!text) return { kind: "chat", source: "rules" };
   if (addressesProvider(text)) return { kind: "chat", source: "rules" };
@@ -102,7 +102,7 @@ export function classify(raw: string): Intent {
     if (action === "pause" || action === "resume" || action === "continue") return { kind: "command", action, target, provider: providerIn(target), source: "rules" };
     // "stop" and "run" are also ordinary words: only a target that names something we manage counts.
     if (action === "stop" && /^(waiting|the wait|it|that|this|everything|all|all runs|the run)$/.test(target)) return { kind: "command", action, target, provider: providerIn(text), source: "rules" };
-    if (resolveTarget(target).matched || /\b(task|job|routine|automation|scan|monitor|report|briefing|research|sync|run|audit|digest|review|check)\b/.test(target)) {
+    if ((await resolveTarget(target)).matched || /\b(task|job|routine|automation|scan|monitor|report|briefing|research|sync|run|audit|digest|review|check)\b/.test(target)) {
       return { kind: "command", action, target, provider: providerIn(target), source: "rules" };
     }
   }
@@ -122,13 +122,13 @@ export function classify(raw: string): Intent {
 
 /** Deterministic first; Claude only reconsiders question-shaped or imperative text the rules left as chat. */
 export async function classifyIntent(raw: string): Promise<Intent> {
-  const rules = classify(raw);
+  const rules = await classify(raw);
   if (rules.kind !== "chat" || !config.router.llm) return rules;
   const text = raw.trim().toLowerCase();
   const worthAsking = (QUESTION_START.test(text) || /\?$/.test(text) || /^(run|start|pause|resume|stop|cancel|continue|approve|reject)\b/.test(text)) && !addressesProvider(text);
   if (!worthAsking) return rules;
   try {
-    const r = await classifyWithClaude(raw, listProviders().map((a) => ({ id: a.id, name: a.name })), listTasks().map((t) => t.name));
+    const r = await classifyWithClaude(raw, listProviders().map((a) => ({ id: a.id, name: a.name })), (await listTasks()).map((t) => t.name));
     if (!r) return rules;
     if (r.kind === "control_question" && r.topic) return { kind: "question", topic: r.topic as QuestionTopic, provider: r.provider ?? null, timeframe: (r.timeframe as Timeframe) ?? "all", source: "claude" };
     if (r.kind === "task_command" && r.action && r.target) return { kind: "command", action: r.action as CommandAction, target: r.target, provider: r.provider ?? null, source: "claude" };
@@ -152,12 +152,12 @@ export interface TargetMatch {
 }
 
 /** Find the task (or agent) the user named. Provider aliases narrow the search; leftover words score against names and purposes. */
-export function resolveTarget(target: string): TargetMatch {
+export async function resolveTarget(target: string): Promise<TargetMatch> {
   const text = target.toLowerCase();
   const provider = providerIn(text);
   const providerWords = new Set(provider ? listProviders().find((a) => a.id === provider)?.aliases.flatMap((al) => al.split(/\s+/)) ?? [] : []);
   const words = [...new Set(tokenize(text).map((w) => w.replace(/(ings?|ed|es|s)$/u, "")))].filter((w) => !FILLER.has(w) && !providerWords.has(w));
-  const tasks = listTasks({ platform: provider ?? undefined, includeDisabled: true });
+  const tasks = await listTasks({ platform: provider ?? undefined, includeDisabled: true });
   const scored = tasks
     .map((t) => {
       const hay = new Set([...tokenize(t.name), ...tokenize(t.key), ...tokenize(t.purpose ?? "")].map((w) => w.replace(/(ings?|ed|es|s)$/u, "")));
@@ -176,7 +176,7 @@ export function resolveTarget(target: string): TargetMatch {
     return { matched: true, task: scored[0].task, agentId: scored[0].task.agent_id, provider, candidates: scored.slice(0, 5).map(({ id, name, platform, score }) => ({ id, name, platform, score })) };
   }
   // No single task: maybe an agent by name.
-  const agents = listAgentProfiles().filter((a) => words.length && words.every((w) => tokenize(a.name).map((x) => x.replace(/(ings?|ed|es|s)$/u, "")).includes(w)));
+  const agents = (await listAgentProfiles()).filter((a) => words.length && words.every((w) => tokenize(a.name).map((x) => x.replace(/(ings?|ed|es|s)$/u, "")).includes(w)));
   if (agents.length === 1) return { matched: true, task: null, agentId: agents[0].id, provider: provider ?? agents[0].provider_id, candidates: scored.slice(0, 5).map(({ id, name, platform, score }) => ({ id, name, platform, score })) };
   return { matched: false, task: null, agentId: null, provider, candidates: scored.slice(0, 5).map(({ id, name, platform, score }) => ({ id, name, platform, score })) };
 }

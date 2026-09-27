@@ -16,8 +16,8 @@ function parse(s: string | null) {
 }
 
 /** Expand JSON columns and add a human hint so the UI can render a message without extra calls. */
-export function expandMessage(m: MessageWithTask) {
-  const agent = m.task_id ? getTask(m.task_id) : undefined;
+export async function expandMessage(m: MessageWithTask) {
+  const agent = m.task_id ? await getTask(m.task_id) : undefined;
   const mode = m.delivery_mode ?? (agent ? resolveMode(agent) : null);
   return {
     ...m,
@@ -28,12 +28,12 @@ export function expandMessage(m: MessageWithTask) {
     delivery_hint: mode ? describeMode(mode) : null,
   };
 }
-export type ExpandedMessage = ReturnType<typeof expandMessage>;
+export type ExpandedMessage = Awaited<ReturnType<typeof expandMessage>>;
 
 /** One AI as the sidebar and the Activity view show it. */
-export function connectionCard(p: PlatformConfig) {
-  const s = getPlatformState(p.id);
-  const tasks = listTasks({ platform: p.id });
+export async function connectionCard(p: PlatformConfig) {
+  const s = await getPlatformState(p.id);
+  const tasks = await listTasks({ platform: p.id });
   const status = !p.appUrl ? "none" : s.session_status;
   const adapter = getProvider(p.id);
   return {
@@ -45,9 +45,9 @@ export function connectionCard(p: PlatformConfig) {
     capabilities: adapter?.capabilities() ?? null,
     canChat: adapter ? adapter.supports("chat") : !!p.composerSelector,
     canSync: adapter ? adapter.supports("listTasks") : !!p.tasksUrl,
-    signInMode: adapter?.preferredSignIn() ?? "live",
+    signInMode: (await adapter?.preferredSignIn()) ?? "live",
     /** A sign-in from the user's computer in progress (or just finished), if any. */
-    pairing: p.appUrl ? activePairing(p.id) : null,
+    pairing: p.appUrl ? await activePairing(p.id) : null,
     builtin: adapter?.builtin ?? false,
     status, // logged_in | needs_login | error | unknown | none
     lastSync: s.last_sync_at,
@@ -63,4 +63,4 @@ export function connectionCard(p: PlatformConfig) {
     })),
   };
 }
-export type ConnectionCard = ReturnType<typeof connectionCard>;
+export type ConnectionCard = Awaited<ReturnType<typeof connectionCard>>;

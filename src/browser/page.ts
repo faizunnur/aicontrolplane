@@ -76,7 +76,7 @@ export class PageController {
       fs.mkdirSync(config.screenshotDir, { recursive: true });
       const file = path.join(config.screenshotDir, `${this.id}.png`);
       await p.screenshot({ path: file, fullPage: false, timeout: 15_000 });
-      setPlatformState(this.id, { screenshot_path: file });
+      await setPlatformState(this.id, { screenshot_path: file });
       return file;
     } catch (err) {
       log.warn(`screenshot failed for ${this.id}`, err);

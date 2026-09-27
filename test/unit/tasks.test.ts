@@ -30,11 +30,11 @@ function receiver(reply: (body: unknown, req: http.IncomingMessage) => { status:
 }
 
 describe("task registry", () => {
-  it("shows every task in one shape with provider, agent, runs and what can be done", () => {
-    policy.setApprovalMode("auto");
-    const t = db.upsertTask({ platform: "chatgpt", key: "daily-briefing", name: "Daily briefing", source: "discovered", schedule: "daily 09:00", next_run: "2026-09-23T09:00:00.000Z" });
-    db.recordRun({ task_id: t.id, external_id: "r1", status: "success", source: "collector", summary: "sent" });
-    const view = listTaskViews({ platform: "chatgpt" }).find((v) => v.id === t.id)!;
+  it("shows every task in one shape with provider, agent, runs and what can be done", async () => {
+    await policy.setApprovalMode("auto");
+    const t = await db.upsertTask({ platform: "chatgpt", key: "daily-briefing", name: "Daily briefing", source: "discovered", schedule: "daily 09:00", next_run: "2026-09-23T09:00:00.000Z" });
+    await db.recordRun({ task_id: t.id, external_id: "r1", status: "success", source: "collector", summary: "sent" });
+    const view = (await listTaskViews({ platform: "chatgpt" })).find((v) => v.id === t.id)!;
     assert.equal(view.provider.name, "ChatGPT");
     assert.equal(view.result, "sent");
     assert.equal(view.next_run, "2026-09-23T09:00:00.000Z");
@@ -46,21 +46,21 @@ describe("task registry", () => {
   });
 
   it("refuses to start a task whose provider or configuration cannot", async () => {
-    const chatgpt = db.upsertTask({ platform: "chatgpt", key: "t-nostart", name: "No start", source: "discovered" });
-    await assert.rejects(() => startTask(chatgpt.id), UnsupportedOperationError);
-    const claude = db.upsertTask({ platform: "claude", key: "routine-x", name: "Routine X", source: "discovered" });
-    await assert.rejects(() => startTask(claude.id), (err: unknown) => err instanceof TaskStartError && /fire_url/.test(err.message));
-    const custom = db.upsertTask({ platform: "custom", key: "no-hook", name: "No hook", source: "push" });
-    await assert.rejects(() => startTask(custom.id), (err: unknown) => err instanceof TaskStartError && /webhook/.test(err.message));
-    await assert.rejects(() => startTask(999_999), (err: unknown) => err instanceof TaskStartError && err.status === 404);
+    const chatgpt = await db.upsertTask({ platform: "chatgpt", key: "t-nostart", name: "No start", source: "discovered" });
+    await assert.rejects(async () => await startTask(chatgpt.id), UnsupportedOperationError);
+    const claude = await db.upsertTask({ platform: "claude", key: "routine-x", name: "Routine X", source: "discovered" });
+    await assert.rejects(async () => await startTask(claude.id), (err: unknown) => err instanceof TaskStartError && /fire_url/.test(err.message));
+    const custom = await db.upsertTask({ platform: "custom", key: "no-hook", name: "No hook", source: "push" });
+    await assert.rejects(async () => await startTask(custom.id), (err: unknown) => err instanceof TaskStartError && /webhook/.test(err.message));
+    await assert.rejects(async () => await startTask(999_999), (err: unknown) => err instanceof TaskStartError && err.status === 404);
   });
 
   it("starts a Claude routine through its fire endpoint with the documented headers", async () => {
     const fire = await receiver(() => ({ status: 200, body: { type: "routine_fire", claude_code_session_id: "session_01X", claude_code_session_url: "https://claude.ai/code/session_01X" } }));
     try {
-      policy.setApprovalMode("auto");
-      const t = db.upsertTask({ platform: "claude", key: "nightly-review", name: "Nightly review", source: "discovered", configuration: { fire_url: fire.url, fire_token: "sk-ant-oat01-test" } });
-      const view = listTaskViews({ platform: "claude" }).find((v) => v.id === t.id)!;
+      await policy.setApprovalMode("auto");
+      const t = await db.upsertTask({ platform: "claude", key: "nightly-review", name: "Nightly review", source: "discovered", configuration: { fire_url: fire.url, fire_token: "sk-ant-oat01-test" } });
+      const view = (await listTaskViews({ platform: "claude" })).find((v) => v.id === t.id)!;
       assert.equal(view.can.run, true, "a routine with its trigger configured can be started");
       assert.equal(getProvider("claude")!.canRunTask({ id: 0, key: "x", name: "x", configuration: { fire_url: "http://example.com/fire", fire_token: "t" } }).ok, false, "plain http is refused for a real endpoint");
       const run = await startTask(t.id, { text: "alert body" });
@@ -68,7 +68,7 @@ describe("task registry", () => {
       assert.equal(run.kind, "task");
       assert.equal(run.external_id, "session_01X");
       assert.equal(run.output_url, "https://claude.ai/code/session_01X");
-      assert.deepEqual(db.foldSteps(db.runEvents(run.id)).map((s) => `${s.key}:${s.status}`), ["select:done", "start:done", "done:done"]);
+      assert.deepEqual(db.foldSteps(await db.runEvents(run.id)).map((s) => `${s.key}:${s.status}`), ["select:done", "start:done", "done:done"]);
       assert.equal(fire.calls.length, 1);
       assert.equal(fire.calls[0].headers.authorization, "Bearer sk-ant-oat01-test");
       assert.equal(fire.calls[0].headers["anthropic-beta"], "experimental-cc-routine-2026-04-01");
@@ -80,11 +80,11 @@ describe("task registry", () => {
   });
 
   it("starts a custom agent's task through its webhook and leaves the run open for the report", async () => {
-    policy.setApprovalMode("auto");
+    await policy.setApprovalMode("auto");
     const hook = await receiver(() => ({ status: 202, body: { accepted: true } }));
     try {
-      const t = db.upsertTask({ platform: "custom", key: "repo-scan", name: "Repository scan", source: "push", delivery: { mode: "webhook", webhook_url: hook.url, webhook_token: "hook-secret" } });
-      const view = listTaskViews({ platform: "custom" }).find((v) => v.id === t.id)!;
+      const t = await db.upsertTask({ platform: "custom", key: "repo-scan", name: "Repository scan", source: "push", delivery: { mode: "webhook", webhook_url: hook.url, webhook_token: "hook-secret" } });
+      const view = (await listTaskViews({ platform: "custom" })).find((v) => v.id === t.id)!;
       assert.equal(view.can.run, true);
       const run = await startTask(t.id, { text: "scan main only" });
       assert.equal(run.status, "running", "open until the agent reports back");
@@ -96,7 +96,7 @@ describe("task registry", () => {
       assert.equal(body.run_id, run.id);
       assert.equal(body.task.key, "repo-scan");
       assert.equal(body.text, "scan main only");
-      const steps = db.foldSteps(db.runEvents(run.id));
+      const steps = db.foldSteps(await db.runEvents(run.id));
       assert.deepEqual(steps.map((s) => `${s.key}:${s.status}`), ["select:done", "start:done", "report:waiting"]);
       assert.ok(!steps.some((s) => s.key === "approve"), "auto preset: no approval step");
     } finally {
@@ -105,21 +105,22 @@ describe("task registry", () => {
   });
 
   it("asks first under the manual preset and records a rejected start as cancelled", async () => {
-    policy.setApprovalMode("manual");
+    await policy.setApprovalMode("manual");
     const hook = await receiver(() => ({ status: 200, body: {} }));
     try {
-      const t = db.upsertTask({ platform: "custom", key: "deploy-job", name: "Deploy job", source: "push", delivery: { mode: "webhook", webhook_url: hook.url } });
+      const t = await db.upsertTask({ platform: "custom", key: "deploy-job", name: "Deploy job", source: "push", delivery: { mode: "webhook", webhook_url: hook.url } });
+      // Deliberately NOT awaited: the start parks on its approval, which the test rejects below.
       const pending = startTask(t.id);
       await new Promise((r) => setTimeout(r, 30));
-      const approval = policy.pendingApprovals().find((a) => /Deploy job/.test(a.summary))!;
+      const approval = (await policy.pendingApprovals()).find((a) => /Deploy job/.test(a.summary))!;
       assert.ok(approval);
-      policy.decide(approval.id, "rejected");
+      await policy.decide(approval.id, "rejected");
       const run = await pending;
       assert.equal(run.status, "cancelled");
       assert.equal(hook.calls.length, 0, "nothing reached the agent");
     } finally {
       hook.close();
-      policy.setApprovalMode("auto");
+      await policy.setApprovalMode("auto");
     }
   });
 });

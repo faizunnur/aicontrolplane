@@ -16,17 +16,17 @@ const log = logger("agents");
 
 export const SYSTEM_AGENT_KEY = "control-plane";
 
-export function ensureSystemAgent(): AgentProfileSummary {
-  return upsertAgentProfile({ key: SYSTEM_AGENT_KEY, name: "Control plane", kind: "system", description: "The control plane itself: looking at providers, screenshots, and actions run on your behalf.", capabilities: ["sync", "screenshot", "action"] });
+export async function ensureSystemAgent(): Promise<AgentProfileSummary> {
+  return await upsertAgentProfile({ key: SYSTEM_AGENT_KEY, name: "Control plane", kind: "system", description: "The control plane itself: looking at providers, screenshots, and actions run on your behalf.", capabilities: ["sync", "screenshot", "action"] });
 }
 
 /** The built-in assistant of a provider, created on first use. Null for the custom-agents provider. */
-export function ensureProviderAgent(providerId: string): AgentProfileSummary | null {
+export async function ensureProviderAgent(providerId: string): Promise<AgentProfileSummary | null> {
   const adapter = getProvider(providerId);
   if (!adapter || adapter.kind === "custom") return null;
   const caps = adapter.capabilities();
   const supported = (Object.keys(caps) as ProviderOperation[]).filter((op) => caps[op] !== null);
-  return upsertAgentProfile({ key: providerId, name: adapter.name, kind: "assistant", provider_id: providerId, description: adapter.config().purpose || null, capabilities: supported });
+  return await upsertAgentProfile({ key: providerId, name: adapter.name, kind: "assistant", provider_id: providerId, description: adapter.config().purpose || null, capabilities: supported });
 }
 
 export interface ProfileHint {
@@ -40,29 +40,29 @@ export interface ProfileHint {
  * The agent behind a task. A named profile (from an ingest payload) wins; otherwise a task at a
  * provider belongs to that provider's assistant, and a custom task gets a profile of its own.
  */
-export function ensureTaskAgent(task: Task, hint?: ProfileHint | null): AgentProfileSummary | null {
+export async function ensureTaskAgent(task: Task, hint?: ProfileHint | null): Promise<AgentProfileSummary | null> {
   let agent: AgentProfileSummary | null = null;
   if (hint?.key) {
-    agent = upsertAgentProfile({ key: hint.key, name: hint.name, description: hint.description, provider_id: task.platform, kind: "custom", capabilities: hint.capabilities });
+    agent = await upsertAgentProfile({ key: hint.key, name: hint.name, description: hint.description, provider_id: task.platform, kind: "custom", capabilities: hint.capabilities });
   } else if (task.agent_id) {
-    agent = getAgentProfile(task.agent_id) ?? null;
+    agent = await getAgentProfile(task.agent_id) ?? null;
     if (agent) return agent;
   }
   if (!agent) {
     const adapter = getProvider(task.platform);
-    agent = adapter && adapter.kind !== "custom" ? ensureProviderAgent(task.platform) : upsertAgentProfile({ key: `${task.platform}/${task.key}`, name: task.name, description: task.purpose, provider_id: task.platform, kind: "custom" });
+    agent = adapter && adapter.kind !== "custom" ? await ensureProviderAgent(task.platform) : await upsertAgentProfile({ key: `${task.platform}/${task.key}`, name: task.name, description: task.purpose, provider_id: task.platform, kind: "custom" });
   }
-  if (agent && task.agent_id !== agent.id) updateTask(task.id, { agent_id: agent.id });
+  if (agent && task.agent_id !== agent.id) await updateTask(task.id, { agent_id: agent.id });
   return agent;
 }
 
 /** Attach every task that has no agent yet. Runs at boot; cheap and idempotent. */
-export function backfillAgents(): number {
-  ensureSystemAgent();
+export async function backfillAgents(): Promise<number> {
+  await ensureSystemAgent();
   let n = 0;
-  for (const task of listTasks({ includeDisabled: true })) {
+  for (const task of await listTasks({ includeDisabled: true })) {
     if (task.agent_id) continue;
-    if (ensureTaskAgent(task)) n++;
+    if (await ensureTaskAgent(task)) n++;
   }
   if (n) log.info(`attached ${n} task(s) to agent profiles`);
   return n;

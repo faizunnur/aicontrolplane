@@ -30,11 +30,11 @@ function broadcast(event: string, data: unknown) {
 }
 
 // "msg" rather than "message": an EventSource treats unnamed events as "message" too, so keep the names distinct.
-bus.on("message:row", (row: MessageWithTask) => broadcast("msg", expandMessage(row)));
+bus.on("message:row", async (row: MessageWithTask) => broadcast("msg", await expandMessage(row)));
 bus.on("message:deleted", (info: { id: number; conversation_id: number | null }) => broadcast("msg-deleted", info));
-bus.on("platform:row", (id: string) => {
+bus.on("platform:row", async (id: string) => {
   const p = getPlatform(id);
-  if (p) broadcast("connection", connectionCard(p));
+  if (p) broadcast("connection", await connectionCard(p));
 });
 bus.on("browser", (state: unknown) => broadcast("browser", state));
 bus.on("conversation", (c: unknown) => broadcast("conversation", c));

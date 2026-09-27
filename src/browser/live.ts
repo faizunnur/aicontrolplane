@@ -102,7 +102,7 @@ function onConnect(ws: WebSocket) {
   sendJson(client, { t: "state", browser: browser.snapshot() });
   void attach(client);
 
-  ws.on("message", (data, isBinary) => {
+  ws.on("message", async (data, isBinary) => {
     if (isBinary) return;
     let msg: Record<string, unknown>;
     try {
@@ -110,7 +110,7 @@ function onConnect(ws: WebSocket) {
     } catch {
       return;
     }
-    handle(client, msg).catch((err) => log.warn("live command failed", err));
+    handle(client, msg).catch((err: unknown) => log.warn("live command failed", err));
   });
   ws.on("close", () => {
     clients.delete(client);
@@ -300,7 +300,7 @@ async function handle(c: Client, msg: Record<string, unknown>) {
   }
   if (t === "override") {
     c.override = !!msg.on;
-    if (c.override) addAudit({ actor: "you", action: "browser.take_control", target: c.stream?.platform ?? null, detail: browser.busy?.label ?? null });
+    if (c.override) await addAudit({ actor: "you", action: "browser.take_control", target: c.stream?.platform ?? null, detail: browser.busy?.label ?? null });
     return;
   }
 
@@ -317,7 +317,7 @@ async function handle(c: Client, msg: Record<string, unknown>) {
         if (!url) return;
         if (!/^[a-z]+:\/\//i.test(url)) url = /^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(url) ? `https://${url}` : `https://www.google.com/search?q=${encodeURIComponent(url)}`;
         if (!/^https?:\/\//i.test(url)) return sendJson(c, { t: "error", message: "Only http and https addresses can be opened here." });
-        addAudit({ actor: "you", action: "browser.navigate", target: s.platform, detail: url.slice(0, 300) });
+        await addAudit({ actor: "you", action: "browser.navigate", target: s.platform, detail: url.slice(0, 300) });
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
       } else if (t === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
       else if (t === "forward") await page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });

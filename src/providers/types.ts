@@ -178,13 +178,13 @@ export interface ProviderAdapter {
   capabilities(): ProviderCapabilities;
   capabilityNotes(): CapabilityNotes;
   supports(op: ProviderOperation): boolean;
-  connectionStatus(): ConnectionStatus;
+  connectionStatus(): Promise<ConnectionStatus>;
 
   /** Bring the provider's site up in its tab so the user can sign in through the live view, and say what guards it. */
   connect(ctx?: ExecutionContext): Promise<ConnectResult>;
   checkAuth(ctx?: ExecutionContext): Promise<SessionStatus>;
   /** The sign-in mode this provider is known to need. */
-  preferredSignIn(): SignInMode;
+  preferredSignIn(): Promise<SignInMode>;
   sendMessage(text: string, ctx: ExecutionContext): Promise<ChatResult>;
   listTasks(ctx: ExecutionContext): Promise<TaskListResult>;
   runTask(task: TaskRef, ctx: ExecutionContext, input?: RunTaskInput): Promise<RunTaskResult>;

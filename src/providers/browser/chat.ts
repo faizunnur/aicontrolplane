@@ -57,19 +57,19 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
   const pc = new PageController(p.id, p.name);
   const url = p.chatUrl || p.appUrl;
 
-  step?.start("open", `Opening ${p.name}`);
+  await step?.start("open", `Opening ${p.name}`);
   const page = await pc.open(url);
-  step?.done("open", hostOf(url));
+  await step?.done("open", hostOf(url));
 
-  step?.start("check", "Checking the sign-in");
+  await step?.start("check", "Checking the sign-in");
   if ((await detectLoginState(p, page)) === "needs_login") {
-    setPlatformState(p.id, { session_status: "needs_login" });
-    step?.fail("check", "signed out");
+    await setPlatformState(p.id, { session_status: "needs_login" });
+    await step?.fail("check", "signed out");
     return { ok: false, error: `${p.name} needs you to sign in again`, url: page.url() };
   }
-  step?.done("check", "signed in");
+  await step?.done("check", "signed in");
 
-  step?.start("type", "Typing your message");
+  await step?.start("type", "Typing your message");
   const composer = page.locator(p.composerSelector).first();
   await composer.waitFor({ state: "visible", timeout: 20_000 });
   const before = p.replySelector ? await page.locator(p.replySelector).count().catch(() => 0) : 0;
@@ -81,7 +81,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
     await composer.pressSequentially(text, { delay: 5 });
   }
   await page.waitForTimeout(300);
-  step?.done("type");
+  await step?.done("type");
 
   // Policy decides whether sending needs you. Under "ask" the message sits typed in the box,
   // visible in the live view, until you approve it in the thread.
@@ -90,19 +90,19 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
     return { ok: false, cancelled: true, error: decision === "timeout" ? `Nobody approved it within 15 minutes, so it was not sent to ${p.name}.` : `Not sent. You rejected it.`, url: page.url() };
   }
 
-  step?.start("send", "Sending");
+  await step?.start("send", "Sending");
   if (p.sendSelector) await page.locator(p.sendSelector).first().click({ timeout: 10_000 });
   else await composer.press("Enter");
-  step?.done("send");
+  await step?.done("send");
 
   if (!p.replySelector) {
     await pc.screenshot(page);
-    step?.skip("wait", `${p.name} has no reply selector configured`);
+    await step?.skip("wait", `${p.name} has no reply selector configured`);
     return { ok: true, reply: "", url: page.url() };
   }
 
   // Wait for a new reply element, then for its text to stop changing and the busy indicator to go.
-  step?.start("wait", `Waiting for ${p.name} to answer`);
+  await step?.start("wait", `Waiting for ${p.name} to answer`);
   const started = Date.now();
   let lastText = "";
   let stable = 0;
@@ -111,7 +111,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
     await page.waitForTimeout(1_000);
     if (step && isCancelled(step.runId)) {
       await pc.screenshot(page);
-      step.fail("wait", "stopped by you");
+      await step.fail("wait", "stopped by you");
       return { ok: false, cancelled: true, error: `You stopped waiting. It was sent to ${p.name}; the answer is in its tab.`, url: page.url() };
     }
     const replies = page.locator(p.replySelector);
@@ -124,21 +124,21 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
     else stable = 0;
     lastText = txt || lastText;
     if (stable >= STABLE_POLLS) {
-      step?.done("wait", `${Math.round((Date.now() - started) / 1000)}s`);
-      step?.start("read", "Reading the answer");
+      await step?.done("wait", `${Math.round((Date.now() - started) / 1000)}s`);
+      await step?.start("read", "Reading the answer");
       await pc.screenshot(page);
-      step?.done("read", `${lastText.length} characters`);
+      await step?.done("read", `${lastText.length} characters`);
       return { ok: true, reply: lastText.slice(0, 8_000), url: page.url() };
     }
   }
   await pc.screenshot(page);
   if (seenNew && lastText) {
-    step?.done("wait", "still writing after 120s");
-    step?.start("read", "Reading the answer");
-    step?.done("read", `${lastText.length} characters so far`);
+    await step?.done("wait", "still writing after 120s");
+    await step?.start("read", "Reading the answer");
+    await step?.done("read", `${lastText.length} characters so far`);
     return { ok: true, reply: lastText.slice(0, 8_000), partial: true, url: page.url() };
   }
-  step?.fail("wait", "no answer in 120s");
+  await step?.fail("wait", "no answer in 120s");
   return { ok: false, error: `${p.name} did not answer within ${Math.round(REPLY_TIMEOUT_MS / 1000)}s`, url: page.url() };
 }
 
@@ -153,11 +153,11 @@ export async function checkSignIn(p: PlatformConfig): Promise<Exclude<SessionSta
         const page = await pc.open(p.appUrl, { networkIdleMs: 10_000, settleMs: 1_000 });
         const status = (await detectLoginState(p, page)) === "needs_login" ? "needs_login" : "logged_in";
         await pc.screenshot(page);
-        setPlatformState(p.id, { session_status: status, last_error: null });
+        await setPlatformState(p.id, { session_status: status, last_error: null });
         if (status === "logged_in") void browser.backupSessions();
         return status;
       } catch (err) {
-        setPlatformState(p.id, { session_status: "error", last_error: cleanError(err) });
+        await setPlatformState(p.id, { session_status: "error", last_error: cleanError(err) });
         return "error";
       }
     },

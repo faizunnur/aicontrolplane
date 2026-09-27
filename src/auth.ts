@@ -30,50 +30,50 @@ const envAdmin = process.env.ACP_ADMIN_TOKEN || "";
 const envIngest = process.env.ACP_INGEST_TOKEN || "";
 
 /** Hash of the admin password, or null when none exists yet (first run). */
-function adminHash(): string | null {
+async function adminHash(): Promise<string | null> {
   if (envAdmin) return tokenHash(envAdmin);
-  return getSetting("admin_password_hash") ?? null;
+  return await getSetting("admin_password_hash") ?? null;
 }
-export function setupRequired(): boolean {
-  return adminHash() === null;
+export async function setupRequired(): Promise<boolean> {
+  return await adminHash() === null;
 }
 export function adminFromEnv(): boolean {
   return !!envAdmin;
 }
-export function verifyAdmin(password: string): boolean {
-  const h = adminHash();
+export async function verifyAdmin(password: string): Promise<boolean> {
+  const h = await adminHash();
   return h !== null && safeEqual(tokenHash(password), h);
 }
 /** First-run only: create the password and an ingest token. Returns false if one already exists. */
-export function createAdminPassword(password: string): boolean {
-  if (!setupRequired()) return false;
-  setSetting("admin_password_hash", tokenHash(password));
-  if (!envIngest && !getSetting("ingest_token")) setSetting("ingest_token", randomBytes(24).toString("hex"));
+export async function createAdminPassword(password: string): Promise<boolean> {
+  if (!await setupRequired()) return false;
+  await setSetting("admin_password_hash", tokenHash(password));
+  if (!envIngest && !await getSetting("ingest_token")) await setSetting("ingest_token", randomBytes(24).toString("hex"));
   return true;
 }
 /** Changing the password signs every browser out; the caller issues a fresh session for this one. */
-export function changeAdminPassword(current: string, next: string): boolean {
+export async function changeAdminPassword(current: string, next: string): Promise<boolean> {
   if (envAdmin) return false;
-  if (!verifyAdmin(current)) return false;
-  setSetting("admin_password_hash", tokenHash(next));
-  deleteAllSessions();
-  addAudit({ actor: "you", action: "auth.password_changed" });
+  if (!await verifyAdmin(current)) return false;
+  await setSetting("admin_password_hash", tokenHash(next));
+  await deleteAllSessions();
+  await addAudit({ actor: "you", action: "auth.password_changed" });
   return true;
 }
-export function ingestToken(): string {
+export async function ingestToken(): Promise<string> {
   if (envIngest) return envIngest;
-  let t = getSetting("ingest_token");
+  let t = await getSetting("ingest_token");
   if (!t) {
     t = randomBytes(24).toString("hex");
-    setSetting("ingest_token", t);
+    await setSetting("ingest_token", t);
   }
   return t;
 }
-export function rotateIngestToken(): string {
+export async function rotateIngestToken(): Promise<string> {
   if (envIngest) return envIngest;
   const t = randomBytes(24).toString("hex");
-  setSetting("ingest_token", t);
-  addAudit({ actor: "you", action: "auth.ingest_token_rotated" });
+  await setSetting("ingest_token", t);
+  await addAudit({ actor: "you", action: "auth.ingest_token_rotated" });
   return t;
 }
 
@@ -107,35 +107,35 @@ export function clientIp(req: IncomingMessage): string {
 }
 
 /** Start a session for this browser. Returns the raw token to put in the cookie; only its hash is stored. */
-export function createSession(req: IncomingMessage): string {
-  purgeExpiredSessions();
+export async function createSession(req: IncomingMessage): Promise<string> {
+  await purgeExpiredSessions();
   const token = randomBytes(32).toString("base64url");
-  insertSession({ token_hash: tokenHash(token), expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(), user_agent: String(req.headers["user-agent"] ?? "").slice(0, 300) || null, ip: clientIp(req) });
-  addAudit({ actor: "you", action: "auth.login", detail: clientIp(req) });
+  await insertSession({ token_hash: tokenHash(token), expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(), user_agent: String(req.headers["user-agent"] ?? "").slice(0, 300) || null, ip: clientIp(req) });
+  await addAudit({ actor: "you", action: "auth.login", detail: clientIp(req) });
   return token;
 }
 
 const touched = new Map<number, number>();
-function sessionFromCookie(req: IncomingMessage) {
+async function sessionFromCookie(req: IncomingMessage) {
   const raw = parseCookies(req.headers.cookie)[SESSION_COOKIE];
   if (!raw) return undefined;
-  const s = findSession(tokenHash(raw));
+  const s = await findSession(tokenHash(raw));
   if (!s) return undefined;
   // Note activity at most once a minute per session; the row is not worth a write per request.
   const last = touched.get(s.id) ?? 0;
   if (Date.now() - last > 60_000) {
     touched.set(s.id, Date.now());
-    touchSession(s.id);
+    await touchSession(s.id);
   }
   return s;
 }
 
 /** End this browser's session. */
-export function revokeSession(req: IncomingMessage): boolean {
+export async function revokeSession(req: IncomingMessage): Promise<boolean> {
   const raw = parseCookies(req.headers.cookie)[SESSION_COOKIE];
   if (!raw) return false;
-  const ok = deleteSession(tokenHash(raw));
-  if (ok) addAudit({ actor: "you", action: "auth.logout" });
+  const ok = await deleteSession(tokenHash(raw));
+  if (ok) await addAudit({ actor: "you", action: "auth.logout" });
   return ok;
 }
 
@@ -143,27 +143,27 @@ export function revokeSession(req: IncomingMessage): boolean {
  * Admin access: the password as a bearer token (for scripts), or a live session cookie (the UI).
  * Never a token in the URL: it would land in logs and browser history.
  */
-export function isAdmin(req: IncomingMessage): boolean {
+export async function isAdmin(req: IncomingMessage): Promise<boolean> {
   const b = bearer(req);
-  if (b && verifyAdmin(b)) return true;
-  return sessionFromCookie(req) !== undefined;
+  if (b && await verifyAdmin(b)) return true;
+  return await sessionFromCookie(req) !== undefined;
 }
 
-export function isIngest(req: IncomingMessage): boolean {
+export async function isIngest(req: IncomingMessage): Promise<boolean> {
   const b = bearer(req);
-  if (b && (safeEqual(b, ingestToken()) || verifyAdmin(b))) return true;
+  if (b && (safeEqual(b, await ingestToken()) || await verifyAdmin(b))) return true;
   const key = req.headers["x-api-key"];
-  if (typeof key === "string" && (safeEqual(key, ingestToken()) || verifyAdmin(key))) return true;
+  if (typeof key === "string" && (safeEqual(key, await ingestToken()) || await verifyAdmin(key))) return true;
   return false;
 }
 
-export function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  if (isAdmin(req)) return next();
-  res.status(401).json({ error: "unauthorized", setup: setupRequired() });
+export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if (await isAdmin(req)) return next();
+  res.status(401).json({ error: "unauthorized", setup: await setupRequired() });
 }
 
-export function requireIngest(req: Request, res: Response, next: NextFunction) {
-  if (isIngest(req)) return next();
+export async function requireIngest(req: Request, res: Response, next: NextFunction) {
+  if (await isIngest(req)) return next();
   res.status(401).json({ error: "unauthorized: send Authorization: Bearer <ingest token>" });
 }
 

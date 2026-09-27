@@ -84,36 +84,36 @@ export async function pollOnce(): Promise<number> {
         const messageId = parsed.messageId ?? `${from}:${occurred}:${subject}`;
         const link = firstUrl(text);
 
-        const ev = addEvent({
-          platform,
-          kind: "email",
-          title: subject,
-          body: text,
-          link,
-          occurred_at: occurred,
-          dedupe_key: `email:${messageId}`,
-        });
+        const ev = await addEvent({
+                  platform,
+                  kind: "email",
+                  title: subject,
+                  body: text,
+                  link,
+                  occurred_at: occurred,
+                  dedupe_key: `email:${messageId}`,
+                });
         await client.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
         if (!ev) continue;
         count++;
         ingestedTotal++;
 
-        const agent = matchAgent(platform, subject, text);
+        const agent = await matchAgent(platform, subject, text);
         if (agent) {
           const status = mapRunStatus(subject + " " + text.slice(0, 300));
-          recordRun({
-            task_id: agent.id,
-            kind: "email",
-            provider: platform,
-            trigger: "push",
-            external_id: `email:${messageId}`,
-            status: status === "unknown" ? "success" : status,
-            finished_at: occurred,
-            summary: subject,
-            details: text.slice(0, 2_000),
-            output_url: link,
-            source: "email",
-          });
+          await recordRun({
+                        task_id: agent.id,
+                        kind: "email",
+                        provider: platform,
+                        trigger: "push",
+                        external_id: `email:${messageId}`,
+                        status: status === "unknown" ? "success" : status,
+                        finished_at: occurred,
+                        summary: subject,
+                        details: text.slice(0, 2_000),
+                        output_url: link,
+                        source: "email",
+                      });
           if (status === "failed" || status === "needs_attention") {
             void sendAlert({ key: `run:${agent.id}`, title: `${agent.name} ${status}`, body: subject, link: link ?? undefined });
           }
@@ -133,9 +133,9 @@ export async function pollOnce(): Promise<number> {
   }
 }
 
-function matchAgent(platform: string, subject: string, text: string) {
+async function matchAgent(platform: string, subject: string, text: string) {
   const hay = (subject + "\n" + text.slice(0, 1_000)).toLowerCase();
-  const candidates = listTasks({ platform, includeDisabled: true }).filter((a) => a.name.length >= 4);
+  const candidates = (await listTasks({ platform, includeDisabled: true })).filter((a) => a.name.length >= 4);
   candidates.sort((a, b) => b.name.length - a.name.length);
   return candidates.find((a) => hay.includes(a.name.toLowerCase()));
 }
