@@ -68,6 +68,19 @@ function scheduleNext(ms: number) {
 
 async function tick() {
   try {
+    await syncTick();
+  } finally {
+    scheduleNext(config.sync.intervalMin * 60_000);
+  }
+}
+
+/**
+ * One scheduled pass: sync every syncable provider unless a human is using the browser, then
+ * refresh the session backup. Fired by the local timer in single-process mode, or by the
+ * queue's cron in split mode (one firing per interval however many browser workers run).
+ */
+export async function syncTick(): Promise<void> {
+  try {
     if (vncState.connections > 0 || Date.now() - vncState.lastActivityAt < 60_000) {
       log.info("skipping scheduled sync: browser screen is in use");
     } else if (browser.signIn) {
@@ -79,8 +92,6 @@ async function tick() {
     if (browser.isRunning()) await browser.backupSessions();
   } catch (err) {
     log.error("scheduled sync failed", err);
-  } finally {
-    scheduleNext(config.sync.intervalMin * 60_000);
   }
 }
 

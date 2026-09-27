@@ -32,6 +32,11 @@ export interface Queue {
   /** Boss mode: connect and begin claiming. Inline mode: no-op. */
   start(): Promise<void>;
   stop(): Promise<void>;
+  /**
+   * Fire a job on a cron, once per interval across every process (boss mode). The inline
+   * engine has no cron — single-process deployments keep their plain timers instead.
+   */
+  schedule(name: string, cron: string, data?: unknown): Promise<void>;
 }
 
 /* ---------- the job catalog: every name and payload in one place ---------- */
@@ -112,6 +117,9 @@ export class InlineQueue implements Queue {
   }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
+  async schedule(): Promise<void> {
+    /* single process: the caller keeps its local timer */
+  }
 }
 
 /* ---------- pg-boss engine ---------- */
@@ -122,6 +130,7 @@ interface BossLike {
   createQueue(name: string): Promise<void>;
   send(name: string, data: object, options?: object): Promise<string | null>;
   work(name: string, options: object, handler: (jobs: { data: unknown }[]) => Promise<void>): Promise<string>;
+  schedule(name: string, cron: string, data?: object, options?: object): Promise<void>;
 }
 
 export class BossQueue implements Queue {
@@ -181,5 +190,11 @@ export class BossQueue implements Queue {
 
   async stop(): Promise<void> {
     await this.boss?.stop({ wait: true, timeout: 15_000 });
+  }
+
+  async schedule(name: string, cron: string, data?: unknown): Promise<void> {
+    if (!this.boss) throw new Error("queue not started");
+    await this.ensureQueue(name);
+    await this.boss.schedule(name, cron, (data as object) ?? {}, {});
   }
 }

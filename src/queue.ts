@@ -38,4 +38,5 @@ export const queue: Queue = {
   work: (name, handler, opts) => engine.work(name, handler, opts),
   start: () => engine.start(),
   stop: () => engine.stop(),
+  schedule: (name, cron, data) => engine.schedule(name, cron, data),
 };

@@ -8,6 +8,7 @@ import { dbReady } from "../../../src/db.js";
 import { logger } from "../../../src/logger.js";
 import { saveToDatabase, stopPersistLoop } from "../../../src/persist.js";
 import { initPlatforms } from "../../../src/platforms.js";
+import { scheduleCrons } from "../../../src/jobs.js";
 import { queue } from "../../../src/queue.js";
 import { onRunEnded } from "../../../src/runs.js";
 import { startExecutionServices } from "../../../src/services.js";
@@ -30,6 +31,7 @@ if (config.redisUrl) {
 }
 await startExecutionServices("core");
 await queue.start();
+await scheduleCrons("core");
 log.info(`worker up (queue: ${queue.kind}, data: ${config.dataDir})`);
 
 // Health probes for the orchestrator: liveness = process; readiness = database reachable.
