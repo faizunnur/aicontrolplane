@@ -1,7 +1,8 @@
 import { deliverMessage, deliverToConnection } from "./deliver.js";
 import { logger } from "./logger.js";
 import { settleDecision } from "./policy.js";
-import { JOB, queue, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "./queue.js";
+import { executeBrowserOpJob } from "./browser-ops.js";
+import { JOB, queue, type BrowserOpJob, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "./queue.js";
 import { executeTaskRun } from "./tasks.js";
 
 const log = logger("jobs");
@@ -43,6 +44,9 @@ export function registerJobHandlers(scope: HandlerScope): void {
     queue.work<RunResumeJob>(JOB.browserRunResume, async ({ runId, approvalId, decision }) => {
       await settleDecision(runId, approvalId, decision);
     });
+    queue.work<BrowserOpJob>(JOB.browserOp, async ({ opId }) => {
+      await executeBrowserOpJob(opId);
+    }, { teamSize: 2 });
   }
   log.debug(`job handlers registered (${scope})`);
 }

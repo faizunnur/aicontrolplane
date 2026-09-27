@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { availableActions, runAction } from "../actions.js";
+import { availableActions } from "../actions.js";
 import { ensureTaskAgent } from "../agents.js";
 import { alertsConfigured, sendAlert } from "../alerts.js";
 import { approvalMode, decide, decideForMessage, listPolicies, pendingApprovals, requestExternalApproval, setApprovalMode, setPolicy } from "../policy.js";
@@ -89,9 +89,10 @@ import {
   verifyAdmin,
 } from "../auth.js";
 import { rateLimit } from "../ratelimit.js";
-import { isSyncRunning, schedulerStatus, syncAll, syncProvider } from "../sync.js";
+import { isSyncRunning, schedulerStatus } from "../sync.js";
 import { resolveMode } from "../deliver.js";
 import { JOB, queue, type ChatDeliverJob, type DispatchDeliverJob } from "../queue.js";
+import { browserRuntimeAvailable, callBrowserOp, desktopState } from "../browser-ops.js";
 import { getProvider, listProviders, providerView, requireProvider } from "../providers/registry.js";
 import { connectedPlatforms, routeToConnection } from "../router.js";
 
@@ -169,7 +170,7 @@ api.get("/session", requireAdmin, (_req, res) => {
 
 const pairingLimit = rateLimit({ name: "pairing", max: 10, windowMs: 10 * 60_000 });
 api.post("/pairing/exchange", pairingLimit, async (req, res) => {
-  if (!browser.enabled) return bad(res, "the browser is disabled on this deployment, so there is nowhere to put a sign-in", 409);
+  if (!browserRuntimeAvailable()) return bad(res, "the browser is disabled on this deployment, so there is nowhere to put a sign-in", 409);
   const code = typeof req.body?.code === "string" ? req.body.code : "";
   const found = code ? await exchangePairing(code, clientIp(req)) : null;
   // One answer for unknown, expired and used codes alike: nothing to enumerate.
@@ -189,14 +190,13 @@ api.post("/connections/:id/import-session", requirePairingFor, async (req, res, 
   const pairing = res.locals.pairing as PairingRow | undefined;
   try {
     const a = requireProvider(String(req.params.id));
-    if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
+    if (!browserRuntimeAvailable()) return bad(res, "the browser is disabled on this deployment", 409);
     const p = a.config();
     const domains = sessionDomains(p);
     const picked = selectProviderState({ cookies: req.body?.cookies, origins: req.body?.origins }, domains);
     if (!picked.cookies.length) return bad(res, `no usable cookies for ${domains.join(", ")} were sent`);
     if (pairing) await markImporting(pairing.id);
-    const imported = await browser.importProviderState(p, domains, picked);
-    const status = await a.checkAuth();
+    const { imported, status } = await callBrowserOp<{ imported: { cookies: number; origins: number; cleared: number }; status: string }>("session.import", { platformId: a.id, cookies: picked.cookies, origins: picked.origins }, 120_000);
     const h = req.body?.helper && typeof req.body.helper === "object" ? (req.body.helper as { version?: unknown; os?: unknown }) : null;
     const via = h ? ` via helper ${String(h.version ?? "?")} on ${String(h.os ?? "?")}` : "";
     if (status === "logged_in") {
@@ -563,15 +563,19 @@ async function vncAvailable(): Promise<boolean> {
   vncProbe = { at: Date.now(), ok };
   return ok;
 }
-const signInOptions = async (a: ReturnType<typeof requireProvider>) => ({ preferred: await a.preferredSignIn(), desktop: browser.canDesktopSignIn(), local: { ok: browser.enabled }, vnc: { available: await vncAvailable(), url: VNC_PATH } });
+const signInOptions = async (a: ReturnType<typeof requireProvider>) => {
+  const d = await desktopState();
+  return { preferred: await a.preferredSignIn(), desktop: d.canDesktop, local: { ok: d.enabled }, vnc: { available: await vncAvailable(), url: VNC_PATH } };
+};
 
 /* local: the user signs in on their own computer and a helper hands the session to the cloud browser. */
 api.post("/connections/:id/pairing", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!a.supports("signIn")) throw a.unsupported("signIn");
-    if (!browser.enabled) return bad(res, "the browser is disabled on this deployment, so there is nowhere to put a sign-in", 409);
-    if (browser.signIn) return bad(res, `a sign-in to ${browser.signIn.platform} is open on the cloud desktop; finish or cancel it first`, 409);
+    const desk = await desktopState();
+    if (!desk.enabled) return bad(res, "the browser is disabled on this deployment, so there is nowhere to put a sign-in", 409);
+    if (desk.signIn) return bad(res, `a sign-in to ${desk.signIn.platform} is open on the cloud desktop; finish or cancel it first`, 409);
     const { row, code } = await createPairing(a.id);
     const base = (config.publicUrl || `${req.protocol}://${req.headers.host}`).replace(/\/$/, "");
     const secure = /^https:/i.test(base) || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/i.test(base);
@@ -602,8 +606,8 @@ api.delete("/connections/:id/pairing", async (req, res) => {
 api.post("/connections/:id/connect", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
-    if (!browser.enabled) return bad(res, "the browser is disabled on this deployment", 409);
-    const found = await a.connect();
+    if (!browserRuntimeAvailable()) return bad(res, "the browser is disabled on this deployment", 409);
+    const found = await callBrowserOp<Awaited<ReturnType<typeof a.connect>>>("auth.connect", { platformId: a.id }, 120_000);
     if (found.blocked) await addAudit({ actor: "system", action: "signin.blocked", target: a.id, detail: found.challenge });
     res.json({ ok: true, platform: a.id, mode: "live", ...found, ...(await signInOptions(a)), screen: VNC_PATH });
   } catch (err) {
@@ -615,8 +619,7 @@ api.post("/connections/:id/signin", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!a.supports("signIn")) throw a.unsupported("signIn");
-    const c = a.config();
-    const signIn = await browser.startDesktopSignIn(c.id, c.name, c.appUrl);
+    const signIn = await callBrowserOp("desktop.start", { platformId: a.id }, 120_000);
     await addAudit({ actor: "you", action: "signin.desktop_started", target: a.id });
     res.json({ ok: true, platform: a.id, mode: "desktop", signIn, ...(await signInOptions(a)) });
   } catch (err) {
@@ -627,8 +630,7 @@ api.post("/connections/:id/signin", async (req, res, next) => {
 api.post("/connections/:id/signin/finish", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
-    const wasDesktop = await browser.finishDesktopSignIn();
-    const status = await a.checkAuth();
+    const { wasDesktop, status } = await callBrowserOp<{ wasDesktop: boolean; status: string }>("desktop.finish", { platformId: a.id }, 120_000);
     if (status === "logged_in") {
       if (wasDesktop) await setSetting(`signin_mode:${a.id}`, "desktop");
       await addAudit({ actor: "you", action: "signin.completed", target: a.id, detail: wasDesktop ? "desktop" : "live" });
@@ -641,7 +643,7 @@ api.post("/connections/:id/signin/finish", async (req, res, next) => {
 api.post("/connections/:id/signin/cancel", async (req, res, next) => {
   try {
     requireProvider(req.params.id);
-    res.json({ ok: await browser.cancelDesktopSignIn() });
+    res.json(await callBrowserOp("desktop.cancel", {}, 60_000));
   } catch (err) {
     next(err);
   }
@@ -650,8 +652,8 @@ api.post("/connections/:id/signin/cancel", async (req, res, next) => {
 api.post("/connections/:id/check", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
-    const status = await a.checkAuth();
-    res.json({ ...await connectionCard(a.config()), status });
+    const status = await callBrowserOp<string>("auth.check", { platformId: a.id }, 120_000);
+    res.json({ ...(await connectionCard(a.config())), status });
   } catch (err) {
     next(err);
   }
@@ -1192,17 +1194,17 @@ api.get("/captures/:id", async (req, res) => {
 /* ---------- sync & actions ---------- */
 
 api.post("/sync", async (req, res) => {
-  if (!browser.enabled) return bad(res, "browser is disabled", 409);
+  if (!browserRuntimeAvailable()) return bad(res, "browser is disabled", 409);
   if (isSyncRunning()) return bad(res, "a sync is already running", 409);
   const ids = Array.isArray(req.body?.platforms) ? (req.body.platforms as string[]) : undefined;
-  res.json({ ok: true, results: await syncAll(ids) });
+  res.json({ ok: true, results: await callBrowserOp("sync.all", { platformIds: ids ?? null }, 15 * 60_000) });
 });
 api.post("/platforms/:id/sync", async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!a.supports("listTasks")) throw a.unsupported("listTasks");
-    if (!browser.enabled) return bad(res, "browser is disabled", 409);
-    res.json(await syncProvider(a));
+    if (!browserRuntimeAvailable()) return bad(res, "browser is disabled", 409);
+    res.json(await callBrowserOp("sync.provider", { platformId: a.id }, 5 * 60_000));
   } catch (err) {
     next(err);
   }
@@ -1210,8 +1212,8 @@ api.post("/platforms/:id/sync", async (req, res, next) => {
 api.post("/platforms/:id/actions/:action", async (req, res) => {
   const p = getPlatform(req.params.id);
   if (!p) return bad(res, "unknown platform", 404);
-  const task = req.body?.task_id || req.body?.agent_id ? await getTask(num(req.body.task_id ?? req.body.agent_id, 0)) : undefined;
-  res.json(await runAction(p, req.params.action, task, {}, { trigger: "user" }));
+  const taskId = req.body?.task_id || req.body?.agent_id ? num(req.body.task_id ?? req.body.agent_id, 0) : null;
+  res.json(await callBrowserOp("action.run", { platformId: p.id, action: req.params.action, taskId, vars: {} }, 5 * 60_000));
 });
 api.get("/sync/log", async (_req, res) => res.json(await recentSyncLogs(50)));
 
@@ -1246,7 +1248,7 @@ api.post("/browser/open", async (req, res) => {
   if (!p) return bad(res, "unknown platform", 404);
   const url = typeof req.body?.url === "string" && /^https?:\/\//.test(req.body.url) ? req.body.url : p.tasksUrl || p.appUrl;
   if (!url) return bad(res, "no url");
-  const r = await requireProvider(p.id).openConsole(url);
+  const r = await callBrowserOp<{ ok: boolean; message: string }>("console.open", { platformId: p.id, url }, 90_000);
   if (!r.ok) return bad(res, r.message, 409);
   res.json({ ok: true, url });
 });

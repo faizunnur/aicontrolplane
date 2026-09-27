@@ -33,6 +33,10 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
     try {
       await api.api("/connections", { body: { name: "Mock AI", appUrl: mock.url, purpose: "testing" } });
       await api.api("/connections/mock-ai", { method: "PUT", body: { ...MOCK_SELECTORS, chatUrl: mock.url } });
+      // An interactive browser op from the api (which holds no Chrome) is answered by the
+      // browser worker through the ops table.
+      const check = await api.api("/connections/mock-ai/check", { body: {} });
+      assert.equal(check.status, "logged_in", "the sign-in check crossed to the browser worker and back");
       const sse = await listenSse(api);
 
       // Auto mode: enqueue on the api, execute on the worker, reply lands back in the thread.

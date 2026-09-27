@@ -797,6 +797,32 @@ export async function getSettingCached(key: string, ttlMs = 5_000): Promise<stri
   return v;
 }
 
+/* ---------- browser ops (interactive browser work crossing processes) ---------- */
+
+export interface BrowserOpRow {
+  id: number;
+  op: string;
+  payload: string | null;
+  status: "pending" | "done" | "failed";
+  result: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export async function createBrowserOp(op: string, payload: unknown): Promise<BrowserOpRow> {
+  const row = await q.get<{ id: number }>("INSERT INTO browser_ops (op, payload, status, created_at) VALUES (?, ?, 'pending', ?) RETURNING id", [op, payload === undefined ? null : JSON.stringify(payload), now()]);
+  return (await getBrowserOp(row!.id))!;
+}
+export async function getBrowserOp(id: number): Promise<BrowserOpRow | undefined> {
+  return q.get<BrowserOpRow>("SELECT * FROM browser_ops WHERE id = ?", [id]);
+}
+export async function finishBrowserOp(id: number, status: "done" | "failed", result: unknown): Promise<void> {
+  await q.run("UPDATE browser_ops SET status = ?, result = ?, finished_at = ? WHERE id = ? AND status = 'pending'", [status, result === undefined ? null : JSON.stringify(result), now(), id]);
+}
+export async function pruneBrowserOps(olderThanMs = 60 * 60_000): Promise<number> {
+  return (await q.run("DELETE FROM browser_ops WHERE created_at < ?", [new Date(Date.now() - olderThanMs).toISOString()])).changes;
+}
+
 /* ---------- browser session state (sealed storageState blobs) ---------- */
 
 export async function getBrowserSession(id: string): Promise<string | undefined> {

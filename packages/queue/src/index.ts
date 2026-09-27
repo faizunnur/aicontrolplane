@@ -51,6 +51,9 @@ export interface RunResumeJob {
   approvalId: number;
   decision: "approved" | "rejected" | "timeout";
 }
+export interface BrowserOpJob {
+  opId: number;
+}
 
 /**
  * Job names. The `browser.` prefix marks work that may drive Chrome: those queues are claimed
@@ -64,6 +67,7 @@ export const JOB = {
   taskStart: "task.start",
   runResume: "run.resume",
   browserRunResume: "browser.run.resume",
+  browserOp: "browser.op",
 } as const;
 
 /** Which resume queue continues a parked run, by its kind. */
