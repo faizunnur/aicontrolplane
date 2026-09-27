@@ -1,6 +1,7 @@
 import { bus } from "./bus.js";
 import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, setPolicyOverride, setSetting, transitionRun, updateApproval, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
+import { JOB, queue, type RunResumeJob } from "./queue.js";
 import { endRun, finishParked, RunTracker } from "./runs.js";
 import type { PolicyMode, Run } from "../packages/core/src/index.js";
 
@@ -161,20 +162,16 @@ export async function decide(id: number, decision: "approved" | "rejected", by =
   await addAudit({ actor: by, action: `approval.${decision}`, target: `approval:${id}`, detail: a.summary });
   log.info(`approval #${id} ${decision} by ${by}${reason ? `: ${reason}` : ""}`);
   if (a.run_id) {
-    // Resumption runs on its own; the decision itself is already durable.
-    void settleDecision(a.run_id, row, decision === "approved" ? "approved" : "rejected").catch(async (err) => {
-      log.error(`resuming run #${a.run_id} after approval #${id} failed`, err);
-      const run = await getRun(a.run_id!);
-      if (run && (run.status === "running" || run.status === "waiting_approval")) {
-        await (run.status === "running" ? endRun(run.id, { status: "failed", error: err instanceof Error ? err.message : String(err) }) : finishParked(run, "failed", { error: err instanceof Error ? err.message : String(err) }));
-      }
-    });
+    // Resumption is a job: durable in split mode, immediate inline. The decision itself is already recorded.
+    await queue.send<RunResumeJob>(JOB.runResume, { runId: a.run_id, approvalId: id, decision: decision === "approved" ? "approved" : "rejected" }, { singletonKey: `resume:${id}` });
   }
   return row;
 }
 
-/** Continue or settle a parked run once its approval is decided (or timed out). */
-async function settleDecision(runId: number, approval: ApprovalRow, decision: Decision): Promise<void> {
+/** Continue or settle a parked run once its approval is decided (or timed out). The run.resume job body. */
+export async function settleDecision(runId: number, approvalId: number, decision: Decision): Promise<void> {
+  const approval = await getApproval(approvalId);
+  if (!approval) return;
   const run = await getRun(runId);
   if (!run || run.status !== "waiting_approval") return; // decided while running (legacy) or already settled
   const track = new RunTracker(run.id, run.message_id);
@@ -190,13 +187,19 @@ async function settleDecision(runId: number, approval: ApprovalRow, decision: De
   await addRunEvent(run.id, { type: "approval", label: "Approved", metadata: { approval_id: approval.id } });
   const checkpoint = parseCheckpoint(run.checkpoint);
   const resumer = checkpoint ? resumers.get(checkpoint.kind ?? run.kind) : undefined;
-  const claimed = await transitionRun(run.id, ["waiting_approval"], "running");
+  const claimed = await transitionRun(run.id, ["waiting_approval"], "running", { started_at: run.started_at ?? new Date().toISOString() });
   if (!claimed) return;
   if (!resumer) {
     await endRun(run.id, { status: "needs_attention", error: "Approved, but nothing knows how to continue this run (no resumer registered)." });
     return;
   }
-  await resumer(claimed, approval);
+  try {
+    await resumer(claimed, approval);
+  } catch (err) {
+    log.error(`resuming run #${runId} after approval #${approvalId} failed`, err);
+    const after = await getRun(runId);
+    if (after && after.status === "running") await endRun(runId, { status: "failed", error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 function parseCheckpoint(raw: string | null): { v: number; kind: string; step: string; inputs: Record<string, unknown> } | null {
@@ -223,7 +226,7 @@ export async function sweepApprovals(timeoutMs = APPROVAL_TIMEOUT_MS): Promise<n
     if (!row) continue;
     expired++;
     if (a.run_id) {
-      await settleDecision(a.run_id, row, "timeout").catch((err) => log.error(`settling run #${a.run_id} after approval timeout failed`, err));
+      await queue.send<RunResumeJob>(JOB.runResume, { runId: a.run_id, approvalId: a.id, decision: "timeout" }, { singletonKey: `resume:${a.id}` });
     }
     await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval expired undecided", body: a.summary, dedupe_key: `approval_expired:${a.id}` });
   }

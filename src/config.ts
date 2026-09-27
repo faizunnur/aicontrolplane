@@ -72,10 +72,25 @@ function dbConfig() {
   return { driver, url };
 }
 
+/**
+ * What this process is. "all" (the default) runs everything in one process — the
+ * single-container mode. "api" serves HTTP only and enqueues work; "worker" executes jobs,
+ * schedulers and pollers; "browser" is reserved for the browser fleet split. Split roles
+ * need Postgres (the queue lives there).
+ */
+function roleConfig(): "all" | "api" | "worker" | "browser" {
+  const r = (process.env.ROLE || "all").toLowerCase();
+  if (r === "api" || r === "worker" || r === "browser" || r === "all") return r;
+  console.warn(`[config] ROLE "${r}" is not all | api | worker | browser; using all`);
+  return "all";
+}
+
 export const config = {
   isProd,
   port: num(process.env.PORT, 8080),
   dataDir,
+  role: roleConfig(),
+  redisUrl: process.env.REDIS_URL || "",
   db: dbConfig(),
   dbPath: path.join(dataDir, "acp.sqlite"),
   profileDir: path.join(dataDir, "profile"),

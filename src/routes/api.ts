@@ -59,7 +59,6 @@ import {
   upsertAgentProfile,
   upsertTask,
 } from "../db.js";
-import { deliverMessage } from "../deliver.js";
 import { streamClients, streamHandler } from "../live.js";
 import { routeMessage } from "../router.js";
 import { handleControl } from "../answers.js";
@@ -91,7 +90,7 @@ import {
 } from "../auth.js";
 import { rateLimit } from "../ratelimit.js";
 import { isSyncRunning, schedulerStatus, syncAll, syncProvider } from "../sync.js";
-import { deliverToConnection } from "../deliver.js";
+import { JOB, queue, type ChatDeliverJob, type DispatchDeliverJob } from "../queue.js";
 import { getProvider, listProviders, providerView, requireProvider } from "../providers/registry.js";
 import { connectedPlatforms, routeToConnection } from "../router.js";
 
@@ -109,7 +108,10 @@ const DELIVERY = z
 
 async function assignAndDeliver(messageId: number, agentId: number) {
   await updateMessage(messageId, { task_id: agentId, status: "assigned", error: null, delivered_at: null, acked_at: null });
-  return await expandMessage(await deliverMessage(messageId));
+  // Delivery is a job: inline it completes before this returns; split it lands on a worker
+  // and the thread follows over the stream.
+  await queue.send<DispatchDeliverJob>(JOB.dispatchDeliver, { messageId });
+  return await expandMessage((await getMessage(messageId))!);
 }
 
 function bad(res: Response, msg: string, code = 400) {
@@ -699,7 +701,7 @@ api.post("/chat", async (req, res) => {
     await updateMessage(msg.id, { routing: { method: "manual", confidence: 1, reason: "You chose it." } });
     // Respond right away; the reply lands in the thread when the AI answers.
     res.json({ message: await expandMessage((await getMessage(msg.id))!), routed: chosen, conversation: await getConversation(conversation.id) });
-    void deliverToConnection(msg.id, chosen);
+    void queue.send<ChatDeliverJob>(JOB.chatDeliver, { messageId: msg.id, platformId: chosen });
     return;
   }
   const routing = await routeToConnection(text);
@@ -709,7 +711,7 @@ api.post("/chat", async (req, res) => {
       });
   if (routing.top && routing.top.confidence >= config.router.autoThreshold) {
     res.json({ message: await expandMessage((await getMessage(msg.id))!), routed: routing.top.platform, conversation: await getConversation(conversation.id) });
-    void deliverToConnection(msg.id, routing.top.platform);
+    void queue.send<ChatDeliverJob>(JOB.chatDeliver, { messageId: msg.id, platformId: routing.top.platform });
     return;
   }
   res.json({ message: await expandMessage((await getMessage(msg.id))!), routed: null, conversation: await getConversation(conversation.id) });
@@ -722,7 +724,7 @@ api.post("/chat/:id/send", async (req, res) => {
   if (!p) return bad(res, "unknown AI", 404);
   await updateMessage(m.id, { routing: { method: "manual", confidence: 1, reason: "You chose it." } });
   res.json({ ok: true });
-  void deliverToConnection(m.id, platform);
+  void queue.send<ChatDeliverJob>(JOB.chatDeliver, { messageId: m.id, platformId: platform });
 });
 /** Manual mode: the agent paused before an action and waits for this. */
 api.post("/chat/:id/approve", async (req, res) => {

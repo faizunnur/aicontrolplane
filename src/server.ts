@@ -4,23 +4,22 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
-import { backfillAgents } from "./agents.js";
 import { settleCommandMessage } from "./answers.js";
 import { crossOrigin, isAdmin } from "./auth.js";
 import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { dbReady, pruneOutbox } from "./db.js";
+import { dbReady } from "./db.js";
 import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
-import { startEmailPoller } from "./ingest/email.js";
-import { persistEnabled, saveToDatabase, startPersistLoop, stopPersistLoop } from "./persist.js";
+import { saveToDatabase, stopPersistLoop } from "./persist.js";
 import { initPlatforms } from "./platforms.js";
-import { recoverInterruptedApprovals, sweepApprovals } from "./policy.js";
 import { UnsupportedOperationError } from "./providers/types.js";
-import { onRunEnded, recoverInterruptedRuns } from "./runs.js";
-import { startScheduler, stopScheduler } from "./sync.js";
+import { onRunEnded } from "./runs.js";
+import { queue } from "./queue.js";
+import { startExecutionServices } from "./services.js";
+import { stopScheduler } from "./sync.js";
 
 const log = logger("server");
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -171,29 +170,15 @@ server.listen(config.port, async () => {
   } else if (st.persistedBy === "postgres") {
     log.info("Postgres is the database; the data folder only caches the browser profile and screenshots");
   }
-  if (persistEnabled) startPersistLoop();
-  try {
-    await initPlatforms();
-    await backfillAgents();
-    // Work that was in flight when the last process stopped is surfaced, never left hanging.
-    const approvals = await recoverInterruptedApprovals();
-    const runs = await recoverInterruptedRuns();
-    if (approvals || runs) log.warn(`recovered after restart: ${approvals} pending approval(s), ${runs} running run(s) marked interrupted`);
-  } catch (err) {
-    log.error("startup recovery failed", err);
-  }
-  startScheduler();
-  startEmailPoller();
-  // Approvals nobody decides expire on a clock (durable timers, not in-memory ones), and the
-  // outbox event log keeps a bounded replay window.
-  const sweep = setInterval(() => {
-    void sweepApprovals().catch((err) => log.error("approval sweep failed", err));
-    void pruneOutbox().catch((err) => log.error("outbox prune failed", err));
-  }, 60_000);
-  sweep.unref?.();
-  if (browser.enabled) {
-    // Warm the browser so the VNC screen shows something immediately.
-    browser.getContext().catch((err) => log.error("browser failed to launch", err));
+  await initPlatforms();
+  if (config.role === "all") {
+    // Single-container mode: this process also executes everything it accepts.
+    await startExecutionServices();
+    await queue.start();
+  } else {
+    // ROLE=api: enqueue and serve only; workers execute. Connect the shared queue for sends.
+    log.info(`role: ${config.role} — execution happens on worker processes`);
+    await queue.start();
   }
 });
 
@@ -202,8 +187,9 @@ async function shutdown(signal: string) {
   stopScheduler();
   stopPersistLoop();
   server.close();
-  // Back up sessions and close Chromium cleanly, then push the final state to Postgres,
-  // but never hang a redeploy: a few seconds each, then exit regardless.
+  // Stop claiming jobs, back up sessions and close Chromium cleanly, then push the final
+  // state to Postgres — but never hang a redeploy: a few seconds each, then exit regardless.
+  await Promise.race([queue.stop(), new Promise((r) => setTimeout(r, 8_000))]);
   await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 6_000))]);
   await Promise.race([saveToDatabase(true), new Promise((r) => setTimeout(r, 5_000))]);
   process.exit(0);

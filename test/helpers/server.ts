@@ -150,6 +150,61 @@ export async function startServer(env: Record<string, string> = {}, opts: { data
   };
 }
 
+/** A worker process (ROLE=worker) sharing the api's database. Health-checked, no login. */
+export async function startWorker(env: Record<string, string>, opts: { dataDir?: string } = {}): Promise<{ port: number; dataDir: string; stop(): Promise<void>; kill(): void }> {
+  const port = await freePort();
+  const dataDir = opts.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "acp-worker-"));
+  fs.mkdirSync(dataDir, { recursive: true });
+  const child: ChildProcess = spawn(process.execPath, ["--import", "tsx", "src/bootstrap.ts"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      ROLE: "worker",
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      HEADLESS: "true",
+      BROWSER_ENABLED: "true",
+      SYNC_ENABLED: "false",
+      ROUTER_PROVIDER: "none",
+      NODE_ENV: "test",
+      LOG_LEVEL: process.env.ACP_TEST_LOG || "warn",
+      RAILWAY_VOLUME_MOUNT_PATH: "",
+      ...env,
+    },
+    stdio: process.env.ACP_TEST_STDIO === "inherit" ? ["ignore", "inherit", "inherit"] : ["ignore", "pipe", "pipe"],
+  });
+  const logs: string[] = [];
+  child.stdout?.on("data", (d) => logs.push(String(d)));
+  child.stderr?.on("data", (d) => logs.push(String(d)));
+  const deadline = Date.now() + 90_000;
+  let up = false;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) break;
+    try {
+      if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) {
+        up = true;
+        break;
+      }
+    } catch {
+      /* not yet */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  if (!up) {
+    stopChild(child);
+    throw new Error(`worker did not come up on :${port}\n${logs.join("")}`);
+  }
+  return {
+    port,
+    dataDir,
+    stop: async () => {
+      stopChild(child);
+      await new Promise((r) => setTimeout(r, 500));
+    },
+    kill: () => stopChild(child),
+  };
+}
+
 function stopChild(child: ChildProcess) {
   if (child.exitCode !== null || !child.pid) return;
   if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });

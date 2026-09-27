@@ -65,6 +65,11 @@ export async function initPlatforms(): Promise<void> {
   await loadFromDb();
 }
 
+/** Force a reload now — for an executor that just missed a platform another process added. */
+export async function refreshPlatformsNow(): Promise<void> {
+  await loadFromDb();
+}
+
 /** Reads stay synchronous; a stale copy quietly refreshes in the background. */
 function maybeRefresh() {
   if (Date.now() - loadedAt < REFRESH_MS || loading) return;

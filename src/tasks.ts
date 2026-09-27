@@ -1,12 +1,13 @@
 import { ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { findRunByIdempotencyKey, getAgentProfile, getRun, getTask, listRuns, listTasks, recentStatusesByTask, type TaskWithLastRun } from "./db.js";
+import { findRunByIdempotencyKey, getAgentProfile, getRun, getTask, listRuns, listTasks, recentStatusesByTask, transitionRun, type TaskWithLastRun } from "./db.js";
+import { JOB, queue, type TaskStartJob } from "./queue.js";
 import { logger } from "./logger.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import type { ProviderAdapter, TaskRef } from "./providers/types.js";
-import { beginRun, endRun, RunTracker } from "./runs.js";
+import { beginRun, endRun, isCancelled, RunTracker } from "./runs.js";
 import type { Run, RunTrigger } from "../packages/core/src/index.js";
 
 const log = logger("tasks");
@@ -95,24 +96,63 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
     if (existing) return existing;
   }
   const agent = task.agent_id ? await getAgentProfile(task.agent_id) : await ensureTaskAgent(task);
-  const { run, track } = await beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user", idempotency_key: opts.idempotencyKey ?? null });
-  // Everything this run does logs with its id attached.
-  return withLogContext({ run_id: run.id }, async () => {
+  // The run is born queued, carrying its inputs: any worker (or this process, inline) executes it.
+  const { run } = await beginRun({
+    kind: "task",
+    label: task.name,
+    provider: task.platform,
+    task_id: task.id,
+    agent_id: agent?.id ?? null,
+    message_id: opts.messageId ?? null,
+    trigger: opts.trigger ?? "user",
+    idempotency_key: opts.idempotencyKey ?? null,
+    status: "queued",
+    checkpoint: JSON.stringify({ v: 1, kind: "task", step: "start", inputs: { text: opts.text ?? null, trigger: opts.trigger ?? "user", message_id: opts.messageId ?? null } }),
+  });
+  await queue.send<TaskStartJob>(JOB.taskStart, { runId: run.id }, { singletonKey: `task-run:${run.id}` });
+  return (await getRun(run.id))!;
+}
+
+/** The queued half: claim the run, pass the gate, start it. Any executing process runs this. */
+export async function executeTaskRun(runId: number): Promise<void> {
+  const claimed = await transitionRun(runId, ["queued", "retrying"], "running", { started_at: new Date().toISOString() });
+  if (!claimed) return; // someone else has it, or it was cancelled while queued
+  const inputs = checkpointInputs(claimed);
+  const task = claimed.task_id ? await getTask(claimed.task_id) : undefined;
+  const adapter = task ? getProvider(task.platform) : undefined;
+  const track = new RunTracker(claimed.id, claimed.message_id);
+  await withLogContext({ run_id: claimed.id }, async () => {
+    if (!task || !adapter) {
+      await endRun(claimed.id, { status: "failed", error: "the task behind this run is gone" });
+      return;
+    }
+    if (await isCancelled(claimed.id)) {
+      await endRun(claimed.id, { status: "cancelled", error: "stopped before it started" });
+      return;
+    }
+    const agent = task.agent_id ? await getAgentProfile(task.agent_id) : undefined;
     await track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);
     try {
       await guard(
-        { runId: run.id, messageId: opts.messageId ?? null, provider: task.platform, track, kind: "task", checkpoint: { step: "start", inputs: { text: opts.text ?? null, trigger: opts.trigger ?? "user", message_id: opts.messageId ?? null } } },
+        { runId: claimed.id, messageId: inputs.message_id ?? null, provider: task.platform, track, kind: "task", checkpoint: { step: "start", inputs } },
         "run_task",
         `Start "${task.name}" at ${adapter.name}?`,
-        opts.text?.slice(0, 240) ?? null,
+        inputs.text?.slice(0, 240) ?? null,
       );
     } catch (err) {
-      // Parked: the caller gets the run in waiting_approval; the decision resumes or settles it.
-      if (err instanceof ApprovalPending) return (await getRun(run.id))!;
+      if (err instanceof ApprovalPending) return; // parked; the decision resumes or settles it
       throw err;
     }
-    return performTaskStart(run.id, track, task.id, { text: opts.text, trigger: opts.trigger, messageId: opts.messageId });
+    await performTaskStart(claimed.id, track, task.id, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined });
   });
+}
+
+function checkpointInputs(run: Run): { text?: string | null; trigger?: RunTrigger; message_id?: number | null } {
+  try {
+    return run.checkpoint ? ((JSON.parse(run.checkpoint) as { inputs?: Record<string, unknown> }).inputs as { text?: string | null; trigger?: RunTrigger; message_id?: number | null }) ?? {} : {};
+  } catch {
+    return {};
+  }
 }
 
 /** The start segment: everything after the gate. Runs first-pass and on resume after approval. */
@@ -141,14 +181,7 @@ registerResumer("task", async (run) => {
     await endRun(run.id, { status: "failed", error: "the task behind this run is gone" });
     return;
   }
-  const checkpoint = (() => {
-    try {
-      return run.checkpoint ? (JSON.parse(run.checkpoint) as { inputs?: { text?: string | null; trigger?: RunTrigger; message_id?: number | null } }) : null;
-    } catch {
-      return null;
-    }
-  })();
-  const inputs = checkpoint?.inputs ?? {};
+  const inputs = checkpointInputs(run);
   await withLogContext({ run_id: run.id }, () =>
     performTaskStart(run.id, new RunTracker(run.id, run.message_id), run.task_id!, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined }),
   );

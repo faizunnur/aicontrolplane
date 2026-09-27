@@ -390,6 +390,10 @@ export interface StartRunInput {
   /** Same key, same run: a duplicate submission returns the existing row instead of a second execution. */
   idempotency_key?: string | null;
   priority?: number | null;
+  /** "queued" when a worker will claim it; "running" (the default) when the caller executes now. */
+  status?: "running" | "queued";
+  /** Resume/execution inputs, stored from birth so any process can pick the run up. */
+  checkpoint?: string | null;
 }
 
 /** Begin a run the control plane executes itself. It is "running" until finishRun. */
@@ -400,9 +404,10 @@ export async function startRun(input: StartRunInput): Promise<Run> {
     const existing = await findRunByIdempotencyKey(input.idempotency_key);
     if (existing) return existing;
   }
+  const status = input.status ?? "running";
   const row = await q.get<{ id: number }>(
-    `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at, idempotency_key, priority, queued_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'running', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?) RETURNING id`,
+    `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at, idempotency_key, priority, queued_at, checkpoint)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?) RETURNING id`,
     [
       input.task_id ?? null,
       input.agent_id ?? task?.agent_id ?? null,
@@ -411,12 +416,14 @@ export async function startRun(input: StartRunInput): Promise<Run> {
       input.trigger ?? "user",
       input.message_id ?? null,
       input.label,
-      ts,
+      status,
+      status === "running" ? ts : null,
       input.source ?? "control-plane",
       ts,
       input.idempotency_key ?? null,
       input.priority ?? null,
       ts,
+      input.checkpoint ?? null,
     ],
   );
   const run = (await getRun(row!.id))!;
@@ -460,11 +467,11 @@ export async function transitionRun(
   id: number,
   from: readonly RunStatus[],
   to: RunStatus,
-  patch: { summary?: string | null; error?: string | null; output_url?: string | null; details?: string | null; external_id?: string | null; checkpoint?: string | null; locked_by?: string | null; lease_expires_at?: string | null; attempt?: number; queued_at?: string | null; finished?: boolean } = {},
+  patch: { summary?: string | null; error?: string | null; output_url?: string | null; details?: string | null; external_id?: string | null; checkpoint?: string | null; locked_by?: string | null; lease_expires_at?: string | null; attempt?: number; queued_at?: string | null; started_at?: string | null; finished?: boolean } = {},
 ): Promise<Run | undefined> {
   const sets: string[] = ["status = ?"];
   const params: unknown[] = [to];
-  for (const k of ["summary", "error", "output_url", "details", "external_id", "checkpoint", "locked_by", "lease_expires_at", "attempt", "queued_at"] as const) {
+  for (const k of ["summary", "error", "output_url", "details", "external_id", "checkpoint", "locked_by", "lease_expires_at", "attempt", "queued_at", "started_at"] as const) {
     if (patch[k] !== undefined) {
       sets.push(`${k} = ?`);
       params.push(patch[k]);

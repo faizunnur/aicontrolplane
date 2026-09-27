@@ -5,7 +5,7 @@ import { config } from "./config.js";
 import { withLogContext } from "./context.js";
 import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
-import { getPlatform } from "./platforms.js";
+import { getPlatform, refreshPlatformsNow } from "./platforms.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import { beginRun, endRun, RunTracker } from "./runs.js";
@@ -63,7 +63,12 @@ function describeRouting(routing: string | null): string {
 export async function deliverToConnection(messageId: number, platformId: string): Promise<MessageWithTask> {
   const msg = await getMessage(messageId);
   if (!msg) throw new Error("message not found");
-  const adapter = getProvider(platformId);
+  let adapter = getProvider(platformId);
+  if (!adapter) {
+    // Another process may have added the platform moments ago; read the store once before giving up.
+    await refreshPlatformsNow();
+    adapter = getProvider(platformId);
+  }
   if (!adapter) throw new Error(`unknown provider ${platformId}`);
   const p = adapter.config();
   const { run, track } = await beginRun({ kind: "chat", label: `Message to ${p.name}`, provider: p.id, message_id: msg.id, trigger: "user", agent_id: (await ensureProviderAgent(p.id))?.id ?? null });
