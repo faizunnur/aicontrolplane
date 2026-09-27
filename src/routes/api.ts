@@ -330,7 +330,9 @@ api.post("/runs", requireIngest, async (req, res) => {
   const platform = d.agent.platform.toLowerCase();
   const task = await upsertTask({ platform, key: d.agent.key, name: d.agent.name, source: "push" });
   const agent = await ensureTaskAgent(task, d.profile ?? null);
-  const { run } = await beginRun({ kind: "external", label: d.label ?? task.name, provider: platform, task_id: task.id, agent_id: agent?.id ?? null, trigger: "push", source: "push" });
+  // The same Idempotency-Key opens the same run: an agent retrying a dropped response cannot double-open.
+  const idem = req.header("idempotency-key")?.slice(0, 200) || null;
+  const { run } = await beginRun({ kind: "external", label: d.label ?? task.name, provider: platform, task_id: task.id, agent_id: agent?.id ?? null, trigger: "push", source: "push", idempotency_key: idem });
   if (d.external_id) await finishRunExternalId(run.id, d.external_id);
   res.json({ ok: true, run: await getRun(run.id), events_url: `/api/runs/${run.id}/events`, finish_url: `/api/runs/${run.id}/finish` });
 });
@@ -1022,7 +1024,7 @@ api.delete("/tasks/:id", async (req, res) => {
 api.post("/tasks/:id/run", async (req, res, next) => {
   try {
     await addAudit({ actor: "you", action: "task.run_requested", target: `task:${req.params.id}` });
-    const run = await startTask(num(req.params.id, 0), { text: typeof req.body?.text === "string" ? req.body.text.slice(0, 20_000) : undefined, trigger: "user" });
+    const run = await startTask(num(req.params.id, 0), { text: typeof req.body?.text === "string" ? req.body.text.slice(0, 20_000) : undefined, trigger: "user", idempotencyKey: req.header("idempotency-key")?.slice(0, 200) });
     res.json({ ok: run.status !== "failed", run: { ...run, events: await runEvents(run.id), steps: foldSteps(await runEvents(run.id)) } });
   } catch (err) {
     next(err);

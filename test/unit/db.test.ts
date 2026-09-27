@@ -10,7 +10,7 @@ describe("schema", () => {
   it("applies every migration to a fresh database", async () => {
     const applied = (await db.schemaVersion()).map((m) => m.id);
     // SQLite replays its historical chain; Postgres starts from its own baseline (id 100+).
-    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8]);
+    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     else assert.ok(applied.includes(100), "postgres baseline applied");
     if (db.db) {
       const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);

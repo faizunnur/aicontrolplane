@@ -1,7 +1,7 @@
 import { ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { getAgentProfile, getRun, getTask, listRuns, listTasks, recentStatusesByTask, type TaskWithLastRun } from "./db.js";
+import { findRunByIdempotencyKey, getAgentProfile, getRun, getTask, listRuns, listTasks, recentStatusesByTask, type TaskWithLastRun } from "./db.js";
 import { logger } from "./logger.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
@@ -79,7 +79,7 @@ export class TaskStartError extends Error {
  * closes the run (the provider took it and runs it elsewhere) or leaves it open for the agent's
  * callback. Throws TaskStartError when the task cannot be started at all.
  */
-export async function startTask(taskId: number, opts: { text?: string; trigger?: RunTrigger; messageId?: number } = {}): Promise<Run> {
+export async function startTask(taskId: number, opts: { text?: string; trigger?: RunTrigger; messageId?: number; idempotencyKey?: string } = {}): Promise<Run> {
   const task = await getTask(taskId);
   if (!task) throw new TaskStartError("unknown task", 404);
   const adapter: ProviderAdapter | undefined = getProvider(task.platform);
@@ -89,8 +89,13 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
   const can = adapter.canRunTask(ref);
   if (!can.ok) throw new TaskStartError(can.reason ?? "this task cannot be started", 409);
 
+  // The same key returns the same run: a retried request cannot start the task twice.
+  if (opts.idempotencyKey) {
+    const existing = await findRunByIdempotencyKey(opts.idempotencyKey);
+    if (existing) return existing;
+  }
   const agent = task.agent_id ? await getAgentProfile(task.agent_id) : await ensureTaskAgent(task);
-  const { run, track } = await beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user" });
+  const { run, track } = await beginRun({ kind: "task", label: task.name, provider: task.platform, task_id: task.id, agent_id: agent?.id ?? null, message_id: opts.messageId ?? null, trigger: opts.trigger ?? "user", idempotency_key: opts.idempotencyKey ?? null });
   // Everything this run does logs with its id attached.
   return withLogContext({ run_id: run.id }, async () => {
     await track.set("select", `${task.name} on ${adapter.name}`, "done", agent ? `agent: ${agent.name}` : null);

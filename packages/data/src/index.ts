@@ -47,13 +47,40 @@ let q: SqlDriver;
 /** The raw SQLite handle — only in sqlite mode, only for the legacy file-mirror backup. */
 export let db: Database.Database | undefined;
 let _notify: Notify = () => {};
+/**
+ * Every announced change is first appended to the outbox — the durable, ordered event log
+ * with a monotonic id (the replay cursor for reconnecting clients, and what a relay tails
+ * to carry events across instances) — then handed to the wired announcer (the in-process
+ * bus today). A log append failing must never break the write it describes.
+ */
 const notify: Notify = (topic, payload) => {
+  void appendOutbox(topic, payload).catch(() => undefined);
   try {
     _notify(topic, payload);
   } catch {
     /* an announcement failing must never break the write it announces */
   }
 };
+
+async function appendOutbox(topic: string, payload: unknown): Promise<void> {
+  let body: string | null = null;
+  try {
+    body = payload === undefined ? null : JSON.stringify(payload);
+  } catch {
+    body = null;
+  }
+  await q.run("INSERT INTO outbox (topic, payload, created_at, published_at) VALUES (?, ?, ?, ?)", [topic, body, now(), now()]);
+}
+
+/** Outbox entries after a cursor, oldest first — the replay path for reconnecting consumers. */
+export async function outboxAfter(id: number, limit = 500): Promise<{ id: number; topic: string; payload: string | null; created_at: string }[]> {
+  return q.all("SELECT id, topic, payload, created_at FROM outbox WHERE id > ? ORDER BY id LIMIT ?", [id, Math.min(Math.max(limit, 1), 2000)]);
+}
+
+/** Trim the log; consumers further behind than this refetch state instead of replaying. */
+export async function pruneOutbox(olderThanMs = 60 * 60_000): Promise<number> {
+  return (await q.run("DELETE FROM outbox WHERE created_at < ?", [new Date(Date.now() - olderThanMs).toISOString()])).changes;
+}
 
 export function dataDriver(): "sqlite" | "pg" {
   return q.kind;

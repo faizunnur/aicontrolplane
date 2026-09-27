@@ -11,7 +11,7 @@ import { handleLiveUpgrade } from "./browser/live.js";
 import { browser, storageInfo, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
-import { dbReady } from "./db.js";
+import { dbReady, pruneOutbox } from "./db.js";
 import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
 import { startEmailPoller } from "./ingest/email.js";
@@ -184,8 +184,12 @@ server.listen(config.port, async () => {
   }
   startScheduler();
   startEmailPoller();
-  // Approvals nobody decides expire on a clock (durable timers, not in-memory ones).
-  const sweep = setInterval(() => void sweepApprovals().catch((err) => log.error("approval sweep failed", err)), 60_000);
+  // Approvals nobody decides expire on a clock (durable timers, not in-memory ones), and the
+  // outbox event log keeps a bounded replay window.
+  const sweep = setInterval(() => {
+    void sweepApprovals().catch((err) => log.error("approval sweep failed", err));
+    void pruneOutbox().catch((err) => log.error("outbox prune failed", err));
+  }, 60_000);
   sweep.unref?.();
   if (browser.enabled) {
     // Warm the browser so the VNC screen shows something immediately.
