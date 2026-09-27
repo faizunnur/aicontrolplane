@@ -201,7 +201,7 @@ export async function executeCommand(intent: Extract<Intent, { kind: "command" }
         runs = runs.filter((r) => (t.task ? r.task_id === t.task.id : t.agentId ? r.agent_id === t.agentId : t.provider ? r.provider === t.provider : false));
       } else if (wait) runs = runs.slice(0, 1);
       if (!runs.length) return { text: all ? "Nothing is running." : `I found nothing running that matches "${intent.target}".`, data: null };
-      for (const r of runs) requestCancel(r.id);
+      for (const r of runs) await requestCancel(r.id);
       return { text: `Stopping ${runs.length === 1 ? `${runs[0].label ?? runs[0].kind} on ${providerName(runs[0].provider)}` : `${runs.length} runs`}. Each stops at its next step.`, data: { runs: runs.map((r) => r.id) } };
     }
     case "pause":

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { getTask, getPlatformState, listTasks, type MessageWithTask } from "./db.js";
+import { foldSteps, getTask, getPlatformState, listTasks, runEvents, type MessageWithTask } from "./db.js";
 import { describeMode, resolveMode } from "./deliver.js";
 import { activePairing } from "./pairing.js";
 import { getProvider } from "./providers/registry.js";
@@ -19,11 +19,15 @@ function parse(s: string | null) {
 export async function expandMessage(m: MessageWithTask) {
   const agent = m.task_id ? await getTask(m.task_id) : undefined;
   const mode = m.delivery_mode ?? (agent ? resolveMode(agent) : null);
+  // While the message's run is live its steps come from the timeline (the source of truth,
+  // written once per step); the snapshot on the row is only written when the run settles.
+  const live = m.run_id && (m.status === "assigned" || m.status === "delivered");
+  const steps = live ? foldSteps(await runEvents(m.run_id!)) : (parse(m.steps) ?? []);
   return {
     ...m,
     suggestions: parse(m.suggestions) ?? [],
     routing: parse(m.routing),
-    steps: parse(m.steps) ?? [],
+    steps,
     delivery_mode: mode,
     delivery_hint: mode ? describeMode(mode) : null,
   };

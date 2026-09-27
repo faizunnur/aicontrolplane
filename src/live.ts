@@ -40,7 +40,22 @@ bus.on("browser", (state: unknown) => broadcast("browser", state));
 bus.on("conversation", (c: unknown) => broadcast("conversation", c));
 bus.on("settings", (s: unknown) => broadcast("settings", s));
 bus.on("run", (r: unknown) => broadcast("run", r));
-bus.on("run-event", (e: unknown) => broadcast("run-event", e));
+bus.on("run-event", async (e: { run_id: number; type?: string }) => {
+  broadcast("run-event", e);
+  // The thread renders a live run's steps from "msg" updates. Steps are no longer mirrored
+  // onto the message row while a run executes, so refresh the open pages' view of the
+  // message here — folding costs a read only while someone is actually watching.
+  if (!clients.size || e.type !== "step") return;
+  try {
+    const { getRun, getMessage } = await import("./db.js");
+    const run = await getRun(e.run_id);
+    if (!run?.message_id) return;
+    const m = await getMessage(run.message_id);
+    if (m) broadcast("msg", await expandMessage(m));
+  } catch (err) {
+    log.debug("live step fanout failed", err);
+  }
+});
 bus.on("task", (t: unknown) => broadcast("task", t));
 bus.on("task:deleted", (t: unknown) => broadcast("task-deleted", t));
 bus.on("notification", (n: unknown) => broadcast("notification", n));

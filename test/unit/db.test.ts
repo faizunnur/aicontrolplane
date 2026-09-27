@@ -10,7 +10,7 @@ describe("schema", () => {
   it("applies every migration to a fresh database", async () => {
     const applied = (await db.schemaVersion()).map((m) => m.id);
     // SQLite replays its historical chain; Postgres starts from its own baseline (id 100+).
-    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7]);
+    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8]);
     else assert.ok(applied.includes(100), "postgres baseline applied");
     if (db.db) {
       const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
@@ -89,13 +89,16 @@ describe("runs the control plane executes", () => {
     assert.deepEqual(steps.map((s) => `${s.key}:${s.status}`), ["route:done", "open:done", "wait:failed"]);
     assert.equal(steps[2].detail, "gave up");
     assert.ok(steps[1].ended_at);
-    assert.deepEqual(JSON.parse((await db.getMessage(m.id))!.steps!).map((s: { key: string }) => s.key), ["route", "open", "wait"]);
+    // While the run is live the row carries no snapshot; the timeline is the source of truth.
+    assert.equal((await db.getMessage(m.id))!.steps, null);
     const events = await db.runEvents(run.id);
     assert.equal(events.filter((e) => e.type === "step").length, 5, "every state change is an event");
     const done = (await endRun(run.id, { status: "failed", error: "gave up" }))!;
     assert.equal(done.status, "failed");
     assert.ok(done.finished_at);
     assert.equal((await db.runEvents(run.id)).at(-1)!.type, "error");
+    // Settling the run snapshots the folded steps onto the message row, once.
+    assert.deepEqual(JSON.parse((await db.getMessage(m.id))!.steps!).map((s: { key: string }) => s.key), ["route", "open", "wait"]);
   });
 
   it("a run without a message keeps its timeline in run_events only", async () => {
@@ -113,7 +116,7 @@ describe("runs the control plane executes", () => {
 
   it("stop requests surface as a CancelledError at the next step", async () => {
     const { run, track } = await beginRun({ kind: "action", label: "x", provider: "mock" });
-    requestCancel(run.id);
+    await requestCancel(run.id);
     await assert.rejects(async () => await track.start("a", "A"), CancelledError);
     await endRun(run.id, { status: "cancelled" });
     assert.equal((await db.getRun(run.id))!.status, "cancelled");

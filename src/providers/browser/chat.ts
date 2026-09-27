@@ -109,7 +109,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
   let seenNew = false;
   while (Date.now() - started < REPLY_TIMEOUT_MS) {
     await page.waitForTimeout(1_000);
-    if (step && isCancelled(step.runId)) {
+    if (step && (await isCancelled(step.runId))) {
       await pc.screenshot(page);
       await step.fail("wait", "stopped by you");
       return { ok: false, cancelled: true, error: `You stopped waiting. It was sent to ${p.name}; the answer is in its tab.`, url: page.url() };

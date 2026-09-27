@@ -24,6 +24,7 @@ import type {
   Task,
   TaskSource,
 } from "../../core/src/index.js";
+import { TERMINAL_RUN_STATUSES } from "../../core/src/index.js";
 import type { SqlDriver } from "./driver.js";
 import { openSqlite } from "./sqlite.js";
 import { openPg } from "./pg.js";
@@ -359,16 +360,37 @@ export interface StartRunInput {
   message_id?: number | null;
   trigger?: RunTrigger;
   source?: string;
+  /** Same key, same run: a duplicate submission returns the existing row instead of a second execution. */
+  idempotency_key?: string | null;
+  priority?: number | null;
 }
 
 /** Begin a run the control plane executes itself. It is "running" until finishRun. */
 export async function startRun(input: StartRunInput): Promise<Run> {
   const ts = now();
   const task = input.task_id ? await getTask(input.task_id) : undefined;
+  if (input.idempotency_key) {
+    const existing = await findRunByIdempotencyKey(input.idempotency_key);
+    if (existing) return existing;
+  }
   const row = await q.get<{ id: number }>(
-    `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'running', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?) RETURNING id`,
-    [input.task_id ?? null, input.agent_id ?? task?.agent_id ?? null, input.provider ?? task?.platform ?? null, input.kind, input.trigger ?? "user", input.message_id ?? null, input.label, ts, input.source ?? "control-plane", ts],
+    `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at, idempotency_key, priority, queued_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'running', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?) RETURNING id`,
+    [
+      input.task_id ?? null,
+      input.agent_id ?? task?.agent_id ?? null,
+      input.provider ?? task?.platform ?? null,
+      input.kind,
+      input.trigger ?? "user",
+      input.message_id ?? null,
+      input.label,
+      ts,
+      input.source ?? "control-plane",
+      ts,
+      input.idempotency_key ?? null,
+      input.priority ?? null,
+      ts,
+    ],
   );
   const run = (await getRun(row!.id))!;
   if (input.message_id) await q.run("UPDATE messages SET run_id = ? WHERE id = ?", [run.id, input.message_id]);
@@ -399,6 +421,47 @@ export async function finishRun(id: number, patch: { status: RunStatus; summary?
 
 export async function getRun(id: number): Promise<Run | undefined> {
   return q.get<Run>("SELECT * FROM runs WHERE id = ?", [id]);
+}
+
+/**
+ * THE one writer of runs.status: a guarded single-statement transition. Returns the updated
+ * row, or undefined when the run was not in any of the expected states (someone else moved
+ * it first — the caller backs off, never overwrites). Legality against RUN_TRANSITIONS is
+ * the caller's contract; the guard here makes races safe, the map makes intents reviewable.
+ */
+export async function transitionRun(
+  id: number,
+  from: readonly RunStatus[],
+  to: RunStatus,
+  patch: { summary?: string | null; error?: string | null; output_url?: string | null; details?: string | null; external_id?: string | null; checkpoint?: string | null; locked_by?: string | null; lease_expires_at?: string | null; attempt?: number; queued_at?: string | null; finished?: boolean } = {},
+): Promise<Run | undefined> {
+  const sets: string[] = ["status = ?"];
+  const params: unknown[] = [to];
+  for (const k of ["summary", "error", "output_url", "details", "external_id", "checkpoint", "locked_by", "lease_expires_at", "attempt", "queued_at"] as const) {
+    if (patch[k] !== undefined) {
+      sets.push(`${k} = ?`);
+      params.push(patch[k]);
+    }
+  }
+  if (patch.finished ?? TERMINAL_RUN_STATUSES.includes(to)) sets.push("finished_at = ?"), params.push(now());
+  const res = await q.run(`UPDATE runs SET ${sets.join(", ")} WHERE id = ? AND status IN (${from.map(() => "?").join(",")})`, [...params, id, ...from]);
+  if (res.changes === 0) return undefined;
+  const run = (await getRun(id))!;
+  notify("run", run);
+  return run;
+}
+
+/** Cooperative stop: flip the flag; the executing side checks it between steps. */
+export async function setCancelRequested(id: number): Promise<void> {
+  await q.run("UPDATE runs SET cancel_requested = 1 WHERE id = ?", [id]);
+}
+export async function cancelRequested(id: number): Promise<boolean> {
+  return ((await q.get<{ cancel_requested: number }>("SELECT cancel_requested FROM runs WHERE id = ?", [id]))?.cancel_requested ?? 0) === 1;
+}
+
+/** A run already recorded under this idempotency key, if any. */
+export async function findRunByIdempotencyKey(key: string): Promise<Run | undefined> {
+  return q.get<Run>("SELECT * FROM runs WHERE idempotency_key = ?", [key]);
 }
 
 /** Attach the provider's own id to a run, so a later report with the same id updates it. */

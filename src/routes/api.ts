@@ -737,7 +737,7 @@ api.post("/chat/:id/cancel", async (req, res) => {
   if (!m) return bad(res, "not found", 404);
   if (!["assigned", "delivered"].includes(m.status)) return bad(res, "nothing is running for this message", 409);
   const run = await runForMessage(m.id);
-  if (run) requestCancel(run.id);
+  if (run) await requestCancel(run.id);
   await decideForMessage(m.id, "rejected");
   res.json({ ok: true, run_id: run?.id ?? null });
 });

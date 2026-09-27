@@ -1,5 +1,29 @@
 export type SessionStatus = "logged_in" | "needs_login" | "unknown" | "error";
-export type RunStatus = "success" | "failed" | "running" | "needs_attention" | "cancelled" | "unknown";
+/**
+ * The run state machine. Terminal: success | failed | cancelled | timed_out | needs_attention.
+ * queued/scheduled wait for a worker; running holds a lease; waiting parks on an external
+ * report; waiting_approval parks on a human decision; retrying waits for its backoff.
+ * "unknown" exists only for rows imported from providers that do not say.
+ */
+export type RunStatus = "success" | "failed" | "running" | "needs_attention" | "cancelled" | "unknown" | "queued" | "scheduled" | "waiting" | "waiting_approval" | "retrying" | "timed_out";
+
+/** States a run can still move out of (plus "unknown", which imported rows may overwrite). */
+export const ACTIVE_RUN_STATUSES: readonly RunStatus[] = ["running", "queued", "scheduled", "waiting", "waiting_approval", "retrying"];
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["success", "failed", "cancelled", "timed_out", "needs_attention"];
+
+/**
+ * Legal transitions. One writer (packages/data transitionRun) enforces this map with a guarded
+ * UPDATE; nothing else may touch runs.status.
+ */
+export const RUN_TRANSITIONS: Readonly<Record<string, readonly RunStatus[]>> = {
+  queued: ["running", "cancelled", "timed_out"],
+  scheduled: ["queued", "running", "cancelled"],
+  running: ["success", "failed", "cancelled", "timed_out", "needs_attention", "waiting", "waiting_approval", "retrying"],
+  waiting: ["running", "success", "failed", "cancelled", "timed_out", "needs_attention"],
+  waiting_approval: ["queued", "running", "cancelled", "timed_out", "failed"],
+  retrying: ["queued", "running", "cancelled", "failed", "timed_out"],
+  unknown: ["queued", "running", "success", "failed", "cancelled", "needs_attention"],
+};
 export type TaskSource = "registry" | "discovered" | "push";
 /** @deprecated the registry stored tasks under the name "agents"; use TaskSource. */
 export type AgentSource = TaskSource;
@@ -198,6 +222,20 @@ export interface Run {
   source: string;
   raw: string | null;
   created_at: string;
+  /** Same command, same key: the second submission returns the first run instead of executing twice. */
+  idempotency_key: string | null;
+  /** How many times execution has been attempted (retries increment it). */
+  attempt: number;
+  max_attempts: number | null;
+  /** Worker holding the lease, and until when. An expired lease is how crashed work is found. */
+  locked_by: string | null;
+  lease_expires_at: string | null;
+  /** 1 when a stop was requested; workers check it cooperatively. */
+  cancel_requested: number;
+  priority: number | null;
+  queued_at: string | null;
+  /** Resume data for parked runs (versioned JSON: {v, step, inputs}). */
+  checkpoint: string | null;
 }
 
 /** One line of a run's timeline. Steps are events with a key and a status; the latest event per key is the step's state. */

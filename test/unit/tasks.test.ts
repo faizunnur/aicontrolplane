@@ -111,8 +111,11 @@ describe("task registry", () => {
       const t = await db.upsertTask({ platform: "custom", key: "deploy-job", name: "Deploy job", source: "push", delivery: { mode: "webhook", webhook_url: hook.url } });
       // Deliberately NOT awaited: the start parks on its approval, which the test rejects below.
       const pending = startTask(t.id);
-      await new Promise((r) => setTimeout(r, 30));
-      const approval = (await policy.pendingApprovals()).find((a) => /Deploy job/.test(a.summary))!;
+      let approval;
+      for (let i = 0; i < 100 && !approval; i++) {
+        await new Promise((r) => setTimeout(r, 30));
+        approval = (await policy.pendingApprovals()).find((a) => /Deploy job/.test(a.summary));
+      }
       assert.ok(approval);
       await policy.decide(approval.id, "rejected");
       const run = await pending;
