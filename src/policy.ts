@@ -1,5 +1,5 @@
 import { bus } from "./bus.js";
-import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSetting, listApprovals, setPolicyOverride, setSetting, updateApproval, updateMessage, type ApprovalRow } from "./db.js";
+import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSetting, getSettingCached, listApprovals, setPolicyOverride, setSetting, updateApproval, updateMessage, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
 import { endRun, type RunTracker } from "./runs.js";
 import type { PolicyMode } from "../packages/core/src/index.js";
@@ -49,7 +49,7 @@ export type Decision = "approved" | "rejected" | "timeout";
 export const APPROVAL_TIMEOUT_MS = 15 * 60_000;
 
 export async function approvalMode(): Promise<ApprovalPreset> {
-  return await getSetting("approval_mode") === "manual" ? "manual" : "auto";
+  return (await getSettingCached("approval_mode")) === "manual" ? "manual" : "auto";
 }
 export async function setApprovalMode(mode: ApprovalPreset) {
   await setSetting("approval_mode", mode);

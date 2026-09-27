@@ -1,5 +1,5 @@
 import { browser } from "../browser/manager.js";
-import { getPlatformState, getSetting } from "../db.js";
+import { getPlatformState, getSettingCached } from "../db.js";
 import type { PlatformConfig, SessionStatus } from "../../packages/core/src/index.js";
 import { runConfiguredAction } from "./browser/actions.js";
 import { checkSignIn, sendThroughBrowser } from "./browser/chat.js";
@@ -134,7 +134,7 @@ export class BrowserProviderAdapter implements ProviderAdapter {
 
   /** What worked last time wins; otherwise what the provider is known to need; otherwise the live view. */
   async preferredSignIn(): Promise<SignInMode> {
-    const remembered = await getSetting(`signin_mode:${this.id}`);
+    const remembered = await getSettingCached(`signin_mode:${this.id}`);
     if (remembered && (SIGN_IN_MODES as readonly string[]).includes(remembered)) return remembered as SignInMode;
     return this.defaultSignIn();
   }

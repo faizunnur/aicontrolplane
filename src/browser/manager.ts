@@ -7,7 +7,9 @@ import { config } from "../config.js";
 import { logger } from "../logger.js";
 import { persistStatus, saveToDatabase } from "../persist.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
+import { browserSessionUpdatedAt } from "../db.js";
 import { chromeInstallCandidates } from "./executable.js";
+import { loadSessionState, saveSessionState } from "./session-store.js";
 
 const log = logger("browser");
 
@@ -321,18 +323,12 @@ class BrowserManager {
 
   /* ---------- session backup: survives a lost or corrupted profile ---------- */
 
-  private get backupFile() {
-    return path.join(config.dataDir, "sessions.json");
-  }
-
-  /** Write cookies + local storage to the volume. Called after successful syncs and on shutdown. */
+  /** Seal cookies + local storage into the database. Called after successful syncs and on shutdown. */
   async backupSessions(): Promise<number> {
     if (!this.context) return 0;
     try {
       const state = await this.context.storageState();
-      const tmp = this.backupFile + ".tmp";
-      fs.writeFileSync(tmp, JSON.stringify(state));
-      fs.renameSync(tmp, this.backupFile);
+      await saveSessionState(JSON.stringify(state));
       void saveToDatabase().catch(() => undefined);
       return state.cookies.length;
     } catch (err) {
@@ -344,14 +340,15 @@ class BrowserManager {
   /** If the profile came up with no cookies but a backup exists, restore it. */
   private async restoreSessionsIfEmpty(ctx: BrowserContext) {
     try {
-      if (!fs.existsSync(this.backupFile)) return;
       const existing = await ctx.cookies();
       if (existing.length > 0) return;
-      const state = JSON.parse(fs.readFileSync(this.backupFile, "utf8")) as { cookies?: Cookie[] };
+      const raw = await loadSessionState();
+      if (!raw) return;
+      const state = JSON.parse(raw) as { cookies?: Cookie[] };
       const cookies = (state.cookies ?? []).filter((c) => c && c.name && c.domain);
       if (!cookies.length) return;
       await ctx.addCookies(cookies);
-      log.warn(`profile had no cookies; restored ${cookies.length} from sessions.json`);
+      log.warn(`profile had no cookies; restored ${cookies.length} from the session backup`);
     } catch (err) {
       log.warn("session restore failed", err);
     }
@@ -531,15 +528,15 @@ async function stopChild(child: ChildProcess, graceMs: number): Promise<void> {
  * Is DATA_DIR on a mounted volume? On Linux we read /proc/mounts; anywhere else we
  * cannot tell and return null. A false here means logins vanish on redeploy.
  */
-export function storageInfo(): {
+export async function storageInfo(): Promise<{
   dataDir: string;
   persistent: boolean | null;
   mount: string | null;
   backupAt: string | null;
   /** What keeps state across redeploys. "unknown" when the platform cannot tell (e.g. local dev). */
-  persistedBy: "volume" | "database" | "none" | "unknown";
+  persistedBy: "postgres" | "volume" | "database" | "none" | "unknown";
   database: { enabled: boolean; lastSaveAt: string | null; lastError: string | null };
-} {
+}> {
   let persistent: boolean | null = null;
   let mount: string | null = null;
   try {
@@ -559,13 +556,18 @@ export function storageInfo(): {
   }
   let backupAt: string | null = null;
   try {
-    const f = path.join(config.dataDir, "sessions.json");
-    if (fs.existsSync(f)) backupAt = fs.statSync(f).mtime.toISOString();
+    backupAt = (await browserSessionUpdatedAt("default")) ?? null;
+    if (!backupAt) {
+      const f = path.join(config.dataDir, "sessions.json");
+      if (fs.existsSync(f)) backupAt = fs.statSync(f).mtime.toISOString();
+    }
   } catch {
     backupAt = null;
   }
   const database = persistStatus();
-  const persistedBy = database.enabled && !database.lastError ? "database" : persistent === true ? "volume" : persistent === false ? "none" : "unknown";
+  // Postgres as the primary database persists everything by itself; the volume/mirror story
+  // only applies to SQLite mode.
+  const persistedBy = config.db.driver === "pg" ? "postgres" : database.enabled && !database.lastError ? "database" : persistent === true ? "volume" : persistent === false ? "none" : "unknown";
   return { dataDir: config.dataDir, persistent, mount, backupAt, persistedBy, database };
 }
 

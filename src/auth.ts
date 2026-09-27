@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "./config.js";
-import { addAudit, deleteAllSessions, deleteSession, findSession, getSetting, insertSession, purgeExpiredSessions, setSetting, touchSession } from "./db.js";
+import { addAudit, deleteAllSessions, deleteSession, findSession, getSetting, getSettingCached, insertSession, purgeExpiredSessions, setSetting, touchSession } from "./db.js";
 
 export const SESSION_COOKIE = "acp_session";
 /** A login lasts this long without use. */
@@ -32,7 +32,7 @@ const envIngest = process.env.ACP_INGEST_TOKEN || "";
 /** Hash of the admin password, or null when none exists yet (first run). */
 async function adminHash(): Promise<string | null> {
   if (envAdmin) return tokenHash(envAdmin);
-  return await getSetting("admin_password_hash") ?? null;
+  return (await getSettingCached("admin_password_hash")) ?? null;
 }
 export async function setupRequired(): Promise<boolean> {
   return await adminHash() === null;
@@ -62,7 +62,7 @@ export async function changeAdminPassword(current: string, next: string): Promis
 }
 export async function ingestToken(): Promise<string> {
   if (envIngest) return envIngest;
-  let t = await getSetting("ingest_token");
+  let t = await getSettingCached("ingest_token");
   if (!t) {
     t = randomBytes(24).toString("hex");
     await setSetting("ingest_token", t);

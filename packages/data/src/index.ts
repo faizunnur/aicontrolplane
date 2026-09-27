@@ -670,6 +670,34 @@ export async function getSetting(key: string): Promise<string | undefined> {
 }
 export async function setSetting(key: string, value: string): Promise<void> {
   await q.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [key, value]);
+  settingCache.delete(key);
+}
+
+/**
+ * A setting read on hot paths (per request, per capability check). The TTL bounds staleness
+ * across instances; a write through setSetting on this instance invalidates at once.
+ */
+const settingCache = new Map<string, { v: string | undefined; at: number }>();
+export async function getSettingCached(key: string, ttlMs = 5_000): Promise<string | undefined> {
+  const hit = settingCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.v;
+  const v = await getSetting(key);
+  settingCache.set(key, { v, at: Date.now() });
+  return v;
+}
+
+/* ---------- browser session state (sealed storageState blobs) ---------- */
+
+export async function getBrowserSession(id: string): Promise<string | undefined> {
+  const r = await q.get<{ blob: string }>("SELECT blob FROM browser_sessions WHERE id = ?", [id]);
+  return r?.blob;
+}
+export async function setBrowserSession(id: string, blob: string): Promise<void> {
+  await q.run("INSERT INTO browser_sessions (id, blob, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at", [id, blob, now()]);
+}
+export async function browserSessionUpdatedAt(id: string): Promise<string | undefined> {
+  const r = await q.get<{ updated_at: string }>("SELECT updated_at FROM browser_sessions WHERE id = ?", [id]);
+  return r?.updated_at;
 }
 
 /* ---------- agent profiles (who does the work) ---------- */

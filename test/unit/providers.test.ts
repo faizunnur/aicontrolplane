@@ -28,18 +28,18 @@ describe("provider registry", () => {
     assert.ok(view.unsupported.find((u) => u.operation === "listTasks")?.reason.includes("AI setup"));
   });
 
-  it("capabilities follow configuration changes without rebuilding the registry", () => {
-    savePlatformOverride("gemini", { tasksUrl: "https://gemini.google.com/app/scheduled" });
+  it("capabilities follow configuration changes without rebuilding the registry", async () => {
+    await savePlatformOverride("gemini", { tasksUrl: "https://gemini.google.com/app/scheduled" });
     try {
       assert.equal(getProvider("gemini")!.capabilities().listTasks, "browser");
     } finally {
-      deletePlatformOverride("gemini");
+      await deletePlatformOverride("gemini");
     }
     assert.equal(getProvider("gemini")!.capabilities().listTasks, null);
   });
 
-  it("a provider added by hand gets the generic browser adapter", () => {
-    savePlatformOverride("muse", { name: "Muse", appUrl: "https://muse.example/", chatUrl: "https://muse.example/", composerSelector: "textarea", hidden: false });
+  it("a provider added by hand gets the generic browser adapter", async () => {
+    await savePlatformOverride("muse", { name: "Muse", appUrl: "https://muse.example/", chatUrl: "https://muse.example/", composerSelector: "textarea", hidden: false });
     try {
       const a = getProvider("muse")!;
       assert.equal(a.kind, "browser");
@@ -48,7 +48,7 @@ describe("provider registry", () => {
       assert.equal(a.capabilities().chat, "browser");
       assert.equal(a.capabilities().listTasks, null);
     } finally {
-      deletePlatformOverride("muse");
+      await deletePlatformOverride("muse");
     }
   });
 

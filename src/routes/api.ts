@@ -512,7 +512,7 @@ api.post("/connections", async (req, res) => {
   if (!id || getPlatform(id)?.appUrl) return bad(res, "an AI with that name already exists");
   const appUrl = parsed.data.appUrl || "";
   if (appUrl && !/^https?:\/\//.test(appUrl)) return bad(res, "URL must start with http:// or https://");
-  savePlatformOverride(id, { ...parsed.data, hidden: false, chatUrl: parsed.data.chatUrl || appUrl, composerSelector: parsed.data.composerSelector || (appUrl ? "textarea, div[contenteditable=\"true\"]" : ""), replySelector: parsed.data.replySelector || "" });
+  await savePlatformOverride(id, { ...parsed.data, hidden: false, chatUrl: parsed.data.chatUrl || appUrl, composerSelector: parsed.data.composerSelector || (appUrl ? "textarea, div[contenteditable=\"true\"]" : ""), replySelector: parsed.data.replySelector || "" });
   res.json(await connectionCard(getPlatform(id)!));
 });
 api.put("/connections/:id", async (req, res) => {
@@ -520,18 +520,18 @@ api.put("/connections/:id", async (req, res) => {
   if (!p) return bad(res, "unknown AI", 404);
   const parsed = connectionPatch.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid settings", issues: parsed.error.issues });
-  savePlatformOverride(p.id, parsed.data);
+  await savePlatformOverride(p.id, parsed.data);
   res.json(await connectionCard(getPlatform(p.id)!));
 });
-api.delete("/connections/:id", (req, res) => {
+api.delete("/connections/:id", async (req, res) => {
   const p = getPlatform(req.params.id);
   if (!p) return bad(res, "unknown AI", 404);
-  if (["chatgpt", "claude", "grok"].includes(p.id)) savePlatformOverride(p.id, { hidden: true });
-  else deletePlatformOverride(p.id);
+  if (["chatgpt", "claude", "grok"].includes(p.id)) await savePlatformOverride(p.id, { hidden: true });
+  else await deletePlatformOverride(p.id);
   res.json({ ok: true });
 });
 api.post("/connections/:id/restore", async (req, res) => {
-  deletePlatformOverride(req.params.id);
+  await deletePlatformOverride(req.params.id);
   const p = getPlatform(req.params.id);
   res.json(p ? await connectionCard(p) : { ok: true });
 });
@@ -806,7 +806,7 @@ api.get("/home", async (req, res) => {
     attention,
     activity,
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
-    storage: storageInfo(),
+    storage: await storageInfo(),
     browser: await browser.status(),
     scheduler: schedulerStatus(),
     alerts: { configured: alertsConfigured() },
@@ -826,7 +826,7 @@ api.get("/settings", async (_req, res) => {
     router: { provider: config.router.provider, model: config.router.model, llm: config.router.llm },
     alerts: { webhook: !!config.alerts.webhookUrl, telegram: !!(config.alerts.telegramToken && config.alerts.telegramChatId) },
     email: emailStatus(),
-    storage: storageInfo(),
+    storage: await storageInfo(),
     syncIntervalMin: config.sync.intervalMin,
   });
 });
@@ -967,7 +967,7 @@ api.get("/diagnostics", async (_req, res) => {
     }
     return { id: p.id, name: p.name, syncable: !!p.tasksUrl, state: { ...s, meta: { finalUrl: meta.finalUrl, title: meta.title, snapshotAt: meta.snapshotAt } }, hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)), tasks: (await listTasks({ platform: p.id })).length, actions: availableActions(p) };
   });
-  res.json({ counts: { ...await overviewCounts(), openMessages: await openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: storageInfo(), scheduler: schedulerStatus(), browser: await browser.status(), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, publicUrlSource: config.publicUrlSource, schema: await schemaVersion() });
+  res.json({ counts: { ...await overviewCounts(), openMessages: await openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: await storageInfo(), scheduler: schedulerStatus(), browser: await browser.status(), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, publicUrlSource: config.publicUrlSource, schema: await schemaVersion() });
 });
 
 /* ---------- agents (registry) ---------- */
@@ -1151,15 +1151,15 @@ const platformPatch = z
     ),
   })
   .partial();
-api.put("/platforms/:id", (req, res) => {
+api.put("/platforms/:id", async (req, res) => {
   const id = req.params.id.toLowerCase().replace(/[^a-z0-9_-]/g, "");
   if (!id) return bad(res, "invalid id");
   const parsed = platformPatch.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid platform config", issues: parsed.error.issues });
-  res.json(savePlatformOverride(id, parsed.data));
+  res.json(await savePlatformOverride(id, parsed.data));
 });
-api.delete("/platforms/:id/overrides", (req, res) => {
-  deletePlatformOverride(req.params.id);
+api.delete("/platforms/:id/overrides", async (req, res) => {
+  await deletePlatformOverride(req.params.id);
   res.json({ ok: true });
 });
 api.get("/platforms/:id/screenshot.png", async (req, res) => {
@@ -1213,7 +1213,7 @@ api.get("/browser", async (_req, res) => {
   const domains = Object.values(getPlatforms())
     .map((p) => p.cookieDomain)
     .filter(Boolean);
-  res.json({ ...(await browser.status()), vnc: { connections: vncState.connections }, storage: storageInfo(), cookies: await browser.cookieCounts(domains) });
+  res.json({ ...(await browser.status()), vnc: { connections: vncState.connections }, storage: await storageInfo(), cookies: await browser.cookieCounts(domains) });
 });
 api.post("/browser/backup", async (_req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);

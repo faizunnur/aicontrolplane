@@ -16,6 +16,7 @@ import { logger } from "./logger.js";
 import { api } from "./routes/api.js";
 import { startEmailPoller } from "./ingest/email.js";
 import { persistEnabled, saveToDatabase, startPersistLoop, stopPersistLoop } from "./persist.js";
+import { initPlatforms } from "./platforms.js";
 import { recoverInterruptedApprovals } from "./policy.js";
 import { UnsupportedOperationError } from "./providers/types.js";
 import { onRunEnded, recoverInterruptedRuns } from "./runs.js";
@@ -160,16 +161,19 @@ server.listen(config.port, async () => {
   log.info(`AI Control Plane listening on :${config.port} (data: ${config.dataDir})`);
   if (config.publicUrl) log.info(`public url: ${config.publicUrl} (from ${config.publicUrlSource === "env" ? "PUBLIC_URL" : "the host's own domain"})`);
   else log.warn("PUBLIC_URL is not set: alerts and agent report URLs will have no address, and pairing commands fall back to each request's Host header. Set PUBLIC_URL (or run where RAILWAY_PUBLIC_DOMAIN is provided) to pin it.");
-  const st = storageInfo();
+  const st = await storageInfo();
   if (st.persistedBy === "none" && st.persistent === false) {
     log.warn(`DATA_DIR ${st.dataDir} is NOT on a mounted volume and no DATABASE_URL is set. Logins, chat history and settings will be lost on redeploy. Attach a volume at ${st.dataDir} or add a Postgres database.`);
   } else if (st.persistedBy === "volume") {
     log.info(`data dir is on volume ${st.mount}${st.backupAt ? `, session backup from ${st.backupAt}` : ""}`);
   } else if (st.persistedBy === "database") {
     log.info("state is mirrored to the Postgres database; no volume needed");
+  } else if (st.persistedBy === "postgres") {
+    log.info("Postgres is the database; the data folder only caches the browser profile and screenshots");
   }
   if (persistEnabled) startPersistLoop();
   try {
+    await initPlatforms();
     await backfillAgents();
     // Work that was in flight when the last process stopped is surfaced, never left hanging.
     const approvals = await recoverInterruptedApprovals();
