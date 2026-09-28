@@ -37,22 +37,71 @@ export const MIRRORED_TOPICS = [
   "browser",
 ] as const;
 
+/** Where a Redis URL points, without its password — for log lines. */
+export function redisTarget(redisUrl: string): string {
+  try {
+    const u = new URL(redisUrl);
+    if (!u.hostname) return "(REDIS_URL has no host)";
+    return `${u.hostname}:${u.port || "6379"}`;
+  } catch {
+    return "(REDIS_URL is not a valid URL)";
+  }
+}
+
+/**
+ * Redis carries live updates and counters, never facts, so a process must run without it.
+ * This client connects in the background and keeps retrying forever; while it is down,
+ * commands fail at once instead of queueing (callers already treat them as best-effort),
+ * and connection errors are reported at most once a minute, naming the target.
+ */
+export function resilientRedis(redisUrl: string, onError: (err: unknown) => void): Redis {
+  const client = new Redis(redisUrl, { maxRetriesPerRequest: 1, enableOfflineQueue: false, retryStrategy: (n) => Math.min(n * 500, 5_000) });
+  const where = redisTarget(redisUrl);
+  let last = 0;
+  client.on("error", (err: unknown) => {
+    const now = Date.now();
+    if (now - last < 60_000) return;
+    last = now;
+    onError(new Error(`redis at ${where}: ${err instanceof Error ? err.message : String(err)} (retrying in the background)`));
+  });
+  return client;
+}
+
+/**
+ * Subscribe now and again after every reconnect. Resolves true once subscribed, or false when
+ * Redis has not answered within the grace period — the client keeps trying either way.
+ */
+export function keepSubscribed(sub: Redis, channel: string, onError: (err: unknown) => void, graceMs = 5_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), graceMs);
+    const attempt = () => {
+      sub.subscribe(channel).then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      }, onError);
+    };
+    sub.on("ready", attempt);
+    if (sub.status === "ready") attempt();
+  });
+}
+
 export interface RedisBridgeOptions {
   channel?: string;
   onError?: (err: unknown) => void;
+  /** How long startup waits for Redis before carrying on without it. */
+  graceMs?: number;
 }
 
-/** Mirror local bus topics onto a Redis channel and remote ones back onto the local bus. */
-export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: RedisBridgeOptions = {}): Promise<{ stop(): Promise<void> }> {
+/**
+ * Mirror local bus topics onto a Redis channel and remote ones back onto the local bus.
+ * Never throws: `connected` says whether Redis answered within the grace period.
+ */
+export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: RedisBridgeOptions = {}): Promise<{ connected: boolean; stop(): Promise<void> }> {
   const channel = opts.channel ?? "acp:1:events";
   const onError = opts.onError ?? (() => {});
-  const pub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
-  const sub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
-  pub.on("error", onError);
-  sub.on("error", onError);
-  await pub.connect();
-  await sub.connect();
-  await sub.subscribe(channel);
+  const pub = resilientRedis(redisUrl, onError);
+  const sub = resilientRedis(redisUrl, onError);
+  const subscribed = keepSubscribed(sub, channel, onError, opts.graceMs);
 
   // bus.emit is synchronous, so this flag cleanly stops a remote delivery re-publishing itself.
   let deliveringRemote = false;
@@ -66,7 +115,8 @@ export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: Red
       } catch {
         return; // unserializable payloads stay local
       }
-      pub.publish(channel, body).catch(onError);
+      // A dropped event costs clients a refetch; the outage itself is reported by the client.
+      pub.publish(channel, body).catch(() => undefined);
     });
   }
 
@@ -85,7 +135,9 @@ export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: Red
     }
   });
 
+  const connected = await subscribed;
   return {
+    connected,
     stop: async () => {
       try {
         await sub.unsubscribe(channel);
@@ -98,19 +150,14 @@ export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: Red
   };
 }
 
-/** Fixed-window counter in Redis: the same limiter every instance shares. */
+/** Fixed-window counter in Redis: the same limiter every instance shares. Rejects while Redis is down. */
 export function redisRateLimiter(redisUrl: string, onError: (err: unknown) => void = () => {}) {
-  const client = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
-  client.on("error", onError);
-  let connected = false;
-  return async (key: string, windowMs: number): Promise<number> => {
-    if (!connected) {
-      await client.connect();
-      connected = true;
-    }
+  const client = resilientRedis(redisUrl, onError);
+  const count = async (key: string, windowMs: number): Promise<number> => {
     const bucket = `rl:${key}:${Math.floor(Date.now() / windowMs)}`;
     const n = await client.incr(bucket);
     if (n === 1) await client.pexpire(bucket, windowMs);
     return n;
   };
+  return Object.assign(count, { close: () => client.disconnect() });
 }

@@ -182,8 +182,9 @@ server.listen(config.port, async () => {
   await initPlatforms();
   if (config.redisUrl) {
     // Events written by other instances (workers, other apis) reach this one's clients.
-    await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
-    log.info("redis event bridge up");
+    const bridge = await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
+    if (bridge.connected) log.info("redis event bridge up");
+    else log.warn("Redis not reachable yet: running without live updates between services; they resume once it answers");
   }
   if (config.role === "all") {
     // Single-container mode: this process also executes everything it accepts.

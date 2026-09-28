@@ -1,4 +1,4 @@
-import { Redis } from "ioredis";
+import { keepSubscribed, resilientRedis } from "../../packages/realtime/src/index.js";
 import { logger } from "../logger.js";
 import { acquireStream, applyCommand, refreshLevel, releaseStream, LEVEL_ORDER, type Level, type Meta, type Sink } from "./live-stream.js";
 
@@ -26,15 +26,11 @@ interface Want {
   attached: boolean;
 }
 
-export async function startLiveRelay(redisUrl: string): Promise<{ stop(): Promise<void> }> {
-  const pub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
-  const sub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
+export async function startLiveRelay(redisUrl: string): Promise<{ connected: boolean; stop(): Promise<void> }> {
   const onError = (err: unknown) => log.warn("live relay redis error", err);
-  pub.on("error", onError);
-  sub.on("error", onError);
-  await pub.connect();
-  await sub.connect();
-  await sub.subscribe(LIVE_CTL_CHANNEL);
+  const pub = resilientRedis(redisUrl, onError);
+  const sub = resilientRedis(redisUrl, onError);
+  const subscribed = keepSubscribed(sub, LIVE_CTL_CHANNEL, onError);
 
   const wants = new Map<string, Want>();
 
@@ -42,7 +38,9 @@ export async function startLiveRelay(redisUrl: string): Promise<{ stop(): Promis
     level,
     congested: () => false, // redis takes every frame; the api side drops for slow sockets
     deliver: (frame, meta, metaChanged) => {
-      pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ platform, meta, metaChanged, data: frame.toString("base64") })).catch(onError);
+      // Many per second: while Redis is down a dropped frame is expected, and the outage is
+      // already reported by the client.
+      pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ platform, meta, metaChanged, data: frame.toString("base64") })).catch(() => undefined);
     },
   });
 
@@ -94,8 +92,11 @@ export async function startLiveRelay(redisUrl: string): Promise<{ stop(): Promis
   }, 5_000);
   reap.unref?.();
 
-  log.info("live view relay up");
+  const connected = await subscribed;
+  if (connected) log.info("live view relay up");
+  else log.warn("live view relay: Redis not reachable yet; the live view starts working once it is");
   return {
+    connected,
     stop: async () => {
       clearInterval(reap);
       for (const [platform, w] of wants) if (w.attached) releaseStream(platform, w.sink);

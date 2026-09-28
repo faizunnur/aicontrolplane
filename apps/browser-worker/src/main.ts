@@ -28,8 +28,9 @@ onRunEnded(settleCommandMessage);
 
 await initPlatforms();
 if (config.redisUrl) {
-  await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
-  log.info("redis event bridge up");
+  const bridge = await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });
+  if (bridge.connected) log.info("redis event bridge up");
+  else log.warn("Redis not reachable yet: running without live updates between services; they resume once it answers");
   await startLiveRelay(config.redisUrl);
 }
 await startExecutionServices("browser");

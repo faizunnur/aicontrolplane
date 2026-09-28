@@ -169,7 +169,8 @@ function detach(c: Client) {
 
 /* ---------- the remote transport (api process without a browser) ---------- */
 
-import { Redis } from "ioredis";
+import type { Redis } from "ioredis";
+import { keepSubscribed, resilientRedis } from "../../packages/realtime/src/index.js";
 
 const remoteLast = new Map<string, { frame: Buffer; meta: Meta }>();
 let ctlPub: Redis | null = null;
@@ -191,32 +192,26 @@ function publishWants() {
 
 if (remote) {
   const onError = (err: unknown) => log.warn("live remote transport error", err);
-  ctlPub = new Redis(config.redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
-  ctlPub.on("error", onError);
-  const frameSub = new Redis(config.redisUrl, { lazyConnect: true, maxRetriesPerRequest: 2 });
-  frameSub.on("error", onError);
-  void (async () => {
-    await ctlPub!.connect();
-    await frameSub.connect();
-    await frameSub.subscribe(LIVE_FRAME_CHANNEL);
-    frameSub.on("message", (_ch: string, raw: string) => {
-      try {
-        const msg = JSON.parse(raw) as { platform: string; meta?: Meta; metaChanged?: boolean; data?: string; error?: string };
-        if (msg.error) {
-          for (const c of clients) if (c.attached === msg.platform) sendJson(c, { t: "error", message: msg.error });
-          return;
-        }
-        if (!msg.data || !msg.meta) return;
-        const frame = Buffer.from(msg.data, "base64");
-        remoteLast.set(msg.platform, { frame, meta: msg.meta });
-        for (const c of clients) if (c.attached === msg.platform) deliverTo(c, frame, msg.meta, !!msg.metaChanged);
-      } catch (err) {
-        onError(err);
+  ctlPub = resilientRedis(config.redisUrl, onError);
+  const frameSub = resilientRedis(config.redisUrl, onError);
+  void keepSubscribed(frameSub, LIVE_FRAME_CHANNEL, onError);
+  frameSub.on("message", (_ch: string, raw: string) => {
+    try {
+      const msg = JSON.parse(raw) as { platform: string; meta?: Meta; metaChanged?: boolean; data?: string; error?: string };
+      if (msg.error) {
+        for (const c of clients) if (c.attached === msg.platform) sendJson(c, { t: "error", message: msg.error });
+        return;
       }
-    });
-    const beat = setInterval(publishWants, 3_000);
-    beat.unref?.();
-  })().catch(onError);
+      if (!msg.data || !msg.meta) return;
+      const frame = Buffer.from(msg.data, "base64");
+      remoteLast.set(msg.platform, { frame, meta: msg.meta });
+      for (const c of clients) if (c.attached === msg.platform) deliverTo(c, frame, msg.meta, !!msg.metaChanged);
+    } catch (err) {
+      onError(err);
+    }
+  });
+  const beat = setInterval(publishWants, 3_000);
+  beat.unref?.();
 }
 
 /* ---------- commands from the UI ---------- */
