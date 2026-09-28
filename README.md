@@ -166,7 +166,7 @@ The same Docker images run everywhere; nothing in the code depends on where it i
 | Where | Quick start | Full guide |
 |---|---|---|
 | **Your computer** | `npm install && npx playwright install chromium && npm run dev`, then open http://localhost:8080 | [docs/local.md](docs/local.md) |
-| **Railway** | Deploy this repo, add Postgres, set `DATABASE_URL=${{Postgres.DATABASE_URL}}` and `ACP_MASTER_KEY`, 2 GB memory, generate a domain | [docs/railway.md](docs/railway.md) |
+| **Railway** | Deploy this repo, add Postgres, set `DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}` and `ACP_MASTER_KEY`, 2 GB memory, generate a domain | [docs/railway.md](docs/railway.md) |
 | **Your own server** | `docker compose -f docker-compose.selfhosted.yml up -d` | [docs/self-hosted.md](docs/self-hosted.md) |
 
 Then open the app, create your account, and sign in to each AI from the menu next to it on the left. For Grok,

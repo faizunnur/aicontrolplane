@@ -29,7 +29,7 @@ longer enough.
 
    | Variable | Value | Why |
    |---|---|---|
-   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Postgres becomes the database: chats, runs, approvals, settings, sealed sign-ins. |
+   | `DATABASE_URL` | `${{Postgres.DATABASE_PRIVATE_URL}}`: the value under Postgres → Connect → **Private Network** | Postgres becomes the database: chats, runs, approvals, settings, sealed sign-ins. |
    | `ACP_MASTER_KEY` | output of `openssl rand -hex 32` | Encrypts stored secrets (provider cookies, webhook and routine tokens). **Required on Railway without a volume** — without it the key is regenerated on every deploy and every saved sign-in becomes unreadable. Keep a copy somewhere safe. |
 
 5. **Settings → Resources**: give it at least **2 GB** of memory (it runs Chrome).
@@ -87,7 +87,9 @@ there (in the `acp_files` table) and is moved over like this:
 
 1. In the app (still the old version), **Settings › Saved sign-ins › Download** — keep the file;
    it is your cookies, treat it like a password.
-2. Copy the Postgres service's `DATABASE_PUBLIC_URL` (Postgres service → Variables).
+2. Copy the Postgres **public** address: Postgres → **Connect → Public Network** (the
+   `DATABASE_PUBLIC_URL` value). This step runs on your computer, which cannot reach Railway's
+   private network.
 3. On your computer, in a checkout of this repository at the new version (`npm install` once):
 
    ```sh
@@ -111,7 +113,7 @@ Anything written between step 3 and the deploy stays in the old copy only, so do
 quiet moment.
 
 **To keep the old behaviour exactly instead**, set `DB_DRIVER=sqlite`,
-`PERSIST_DATABASE_URL=${{Postgres.DATABASE_URL}}` and `ACP_MASTER_KEY` before deploying. You
+`PERSIST_DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}` and `ACP_MASTER_KEY` before deploying. You
 can migrate later.
 
 ---
@@ -162,7 +164,14 @@ Paste that **same** value as `ACP_MASTER_KEY` into all three services below. The
 secret (for example an agent's webhook token) and the worker opens it, so the values must
 match exactly. A split service refuses to start without one.
 
-`${{Postgres.DATABASE_URL}}`, `${{Redis.REDIS_URL}}` and `${{api.RAILWAY_PUBLIC_DOMAIN}}` are
+**Always use the private network address for the services.** Open Postgres (or Redis) →
+**Connect → Private Network** and copy the reference it shows. Depending on when the database
+was created, Railway names it `DATABASE_PRIVATE_URL` or `DATABASE_URL` (and `REDIS_PRIVATE_URL`
+or `REDIS_URL`); the Connect dialog shows the right one for yours. The private address stays
+inside Railway, is faster, and costs nothing in network egress. It needs no TLS setting. The
+public address is only for connecting from your own computer (the migration in section 2).
+
+`${{Postgres.DATABASE_PRIVATE_URL}}`, `${{Redis.REDIS_URL}}` and `${{api.RAILWAY_PUBLIC_DOMAIN}}` are
 Railway *reference* variables: each service reads the value from the Postgres, Redis or api
 service, and it stays correct if that service's address changes. They are set per service
 like any other variable. If you prefer, paste the literal values instead.
@@ -172,7 +181,7 @@ like any other variable. If you prefer, paste the literal values instead.
 ```env
 ROLE=api
 RAILWAY_DOCKERFILE_PATH=Dockerfile.api
-DATABASE_URL=${{Postgres.DATABASE_URL}}
+DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the 64-character key>
 VNC_TARGET=http://browser.railway.internal:6080
@@ -194,7 +203,7 @@ domain, and then use the same value on the other two services.
 ```env
 ROLE=worker
 RAILWAY_DOCKERFILE_PATH=Dockerfile.api
-DATABASE_URL=${{Postgres.DATABASE_URL}}
+DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the same 64-character key>
 PUBLIC_URL=https://${{api.RAILWAY_PUBLIC_DOMAIN}}
@@ -213,7 +222,7 @@ if your agents' webhooks live on a private network.
 ```env
 ROLE=browser
 RAILWAY_DOCKERFILE_PATH=Dockerfile
-DATABASE_URL=${{Postgres.DATABASE_URL}}
+DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the same 64-character key>
 PUBLIC_URL=https://${{api.RAILWAY_PUBLIC_DOMAIN}}
