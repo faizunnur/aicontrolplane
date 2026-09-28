@@ -5,9 +5,13 @@
 #     or in Postgres. What Railway runs today.
 #
 #   docker compose --profile split up --build
-#     The split mode: a slim api that only enqueues and serves, a worker that executes
-#     (jobs, schedulers, the browser), Postgres as the source of truth and job queue, Redis
-#     carrying events between them. The shape that scales horizontally.
+#     The split mode: a slim api that only enqueues and serves, a worker that executes jobs
+#     and schedules, a browser service driving Chrome, Postgres as the source of truth and job
+#     queue, Redis carrying events between them. The shape that scales horizontally.
+#     Needs ACP_MASTER_KEY in .env (openssl rand -hex 32): the split services refuse to start
+#     without one shared key.
+#
+# Guides: docs/local.md (this machine), docs/railway.md, docs/self-hosted.md.
 #
 # Dashboard: http://localhost:8080   Browser screen: http://localhost:8080/vnc/
 services:

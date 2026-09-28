@@ -140,8 +140,9 @@ sending a message, running a browser action, starting a task or posting to your 
 Approve or Reject in the thread. Both are presets over a policy table (Settings › Approvals): reading a page,
 searching and looking at a tasks page always go ahead; modifying a repository asks; deploying to production and
 deleting resources always ask and cannot be relaxed. Policy is enforced on the server before anything happens,
-every request is stored, and a server restart never drops one silently: whatever was waiting is marked
-interrupted, its run needs attention, and you are told.
+and every request is stored. A run waiting for you holds nothing open: it is parked in the database with what
+it needs to continue, so it survives restarts and redeploys, and your Approve resumes it on whichever process
+picks it up. Requests nobody answers expire after 15 minutes and the run says so.
 
 ## What each provider can do
 
@@ -160,53 +161,64 @@ hides or disables the control. Provider-specific selectors and rules live in `sr
 
 ## Run it
 
-### On Railway (recommended)
+The same Docker images run everywhere; nothing in the code depends on where it is hosted.
 
-1. Create a service from this repository. The `Dockerfile` and `railway.toml` are picked up automatically.
-2. Keep your data between deploys, one of two ways:
-   - **Postgres (easiest).** Add a Postgres database to the project and, in this service's variables, add
-     `DATABASE_URL` referencing it (`${{Postgres.DATABASE_URL}}`). Sign-ins, chats and settings are mirrored
-     there and restored on every boot. No volume needed.
-   - **Volume.** Attach a volume mounted at `/data`.
-   Without either, every deploy signs you out and the Overview shows a warning.
-3. Do not set `DATA_DIR` on Railway; the image already uses `/data`.
-4. Give the service at least 2 GB of memory (it runs Chromium) and generate a domain.
-5. Open the domain. Create your password. Open the menu next to a provider on the left, press Sign in, and
-   sign in inside the browser panel. For Grok, the menu offers "Connect from this computer" instead: its sign-in
-   page refuses browsers in a datacenter, so you sign in on your own machine and the session is handed over.
+| Where | Quick start | Full guide |
+|---|---|---|
+| **Your computer** | `npm install && npx playwright install chromium && npm run dev`, then open http://localhost:8080 | [docs/local.md](docs/local.md) |
+| **Railway** | Deploy this repo, add Postgres, set `DATABASE_URL=${{Postgres.DATABASE_URL}}` and `ACP_MASTER_KEY`, 2 GB memory, generate a domain | [docs/railway.md](docs/railway.md) |
+| **Your own server** | `docker compose -f docker-compose.selfhosted.yml up -d` | [docs/self-hosted.md](docs/self-hosted.md) |
 
-Optional variables, all set in the Railway service:
+Then open the app, create your account, and sign in to each AI from the menu next to it on the left. For Grok,
+the menu offers "Connect from this computer": its sign-in page refuses browsers in a datacenter, so you sign
+in on your own machine and the session is handed over.
+
+**Upgrading a Railway deployment that set `DATABASE_URL` before this version?** `DATABASE_URL` used to be a
+backup mirror and now means "Postgres is the database". Follow
+[Upgrading an existing Railway deployment](docs/railway.md#2-upgrading-an-existing-railway-deployment) before
+you deploy, or the new version starts on empty tables.
+
+### One process or several
+
+By default everything runs in one process (`ROLE=all`): one container, SQLite or Postgres, no Redis. When one
+container is not enough, the same code runs as three services over Postgres and Redis:
+
+| Service | `ROLE` | Does |
+|---|---|---|
+| api | `api` | dashboard, API, event stream; only enqueues work, never executes it |
+| worker | `worker` | task starts, webhook deliveries, approval resumes, email, sweeps; scale freely |
+| browser | `browser` | everything that drives Chrome: chats, syncs, sign-ins, the live view |
+
+Split services need `DATABASE_URL`, `REDIS_URL` and one shared `ACP_MASTER_KEY`, and refuse to start without
+them. Every service answers `/healthz` (alive) and `/readyz` (database reachable), and Prometheus metrics at
+`/metrics`.
+
+### Settings
+
+Everything is an environment variable; the full list with defaults is in [`.env.example`](.env.example). The
+ones worth knowing:
 
 | Variable | What it does |
 |---|---|
+| `DATABASE_URL` | Postgres as the database. Without it, a SQLite file in the data folder. |
+| `ACP_MASTER_KEY` | Encrypts stored secrets (provider cookies, webhook and routine tokens). `openssl rand -hex 32`. Without it a key file is generated in the data folder — fine locally, but on Railway without a volume it is lost on every deploy. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Turns the command panel into a conversation: Claude answers you in its own words from your own state, picks which AI gets a message, and tells a question from an instruction. Uses your Claude subscription; get it with `claude setup-token`. |
 | `ANTHROPIC_API_KEY` | Same, billed per token instead. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`, or `ALERT_WEBHOOK_URL` | Get a message when something fails or an AI signs you out. |
 | `IMAP_HOST`, `IMAP_USER`, `IMAP_PASS` | Read task notification emails (for example from ChatGPT) into the registry. |
 | `ACP_ADMIN_TOKEN`, `ACP_INGEST_TOKEN` | Only if you prefer to set the password and the agent token on the server instead of in the app. |
+| `PUBLIC_URL` | The address people reach the app on (alerts, webhook report URLs, the connect command). Taken from Railway's domain when unset there; never guessed from requests. |
 | `SYNC_INTERVAL_MIN` | How often the control plane looks at each provider's tasks page. Default 20. |
-| `LOG_LEVEL` | What the server prints to Railway's log: `debug`, `info` (default), `warn` or `error`. |
+| `LOG_LEVEL` | What the server prints: `debug`, `info` (default), `warn` or `error`. |
 
-The full list with defaults is in `.env.example`. Database migrations run automatically on boot.
+Database migrations run automatically on boot.
 
-**Debugging on Railway.** Railway shows only what the server prints to its console, and the server prints at
-`LOG_LEVEL` and above. Every request that changes something, every run and step, every approval, sign-in and
-live-view connection is logged at `info`; page reads and navigation land at `debug`. You do not need Railway to
-read it: **Monitoring › Logs** in the app tails the server live, keeps the last 2000 lines at every level
-(including `debug`) since the server started, filters by level and part, and can raise what the console prints
-without a redeploy. The buffer is in memory, so a restart clears it; set `LOG_LEVEL=debug` when you want
-everything in Railway's log as well.
-
-### Locally
-
-```bash
-npm install
-npm run dev          # http://localhost:8080 with a real Chromium window on your desktop
-npm test             # unit tests (fast, no browser)
-npm run test:e2e     # spawns the server with headless Chromium against a mock provider
-```
-
-Or the exact image Railway builds: `docker compose up --build`.
+**Reading the logs.** The console (what Railway's log shows) prints at `LOG_LEVEL` and above, as one JSON
+object per line in production, each carrying the `request_id`, `run_id` and user it belongs to. Every request
+that changes something, every run and step, every approval, sign-in and live-view connection is logged at
+`info`; page reads and navigation land at `debug`. **Monitoring › Logs** in the app tails the server live, keeps
+the last 2000 lines at every level since the server started, filters by level and part, and can raise what the
+console prints without a redeploy.
 
 ## For your own agents
 
@@ -255,9 +267,17 @@ shell script, a Claude Code routine prompt block and an MCP server for Cowork.
   control plane decides and acts first; Claude is then handed that outcome, a briefing of your real state and
   the thread so far, and is told to add no facts, change no outcome and decide no approval. Every failure,
   refusal or timeout falls back to the written sentence, so the control plane never depends on a model.
-- **Live** (`src/live.ts`, `src/browser/live.ts`): server-sent events for state, a WebSocket screencast of the
-  tab the agent works in with input replayed back. Chromium keeps one persistent profile per deployment; sign-ins
-  are backed up and restored across redeploys.
+- **Durable execution** (`src/runs.ts`, `src/tasks.ts`, `src/jobs.ts`, `packages/queue`): a run moves through
+  queued → running → waiting for approval → finished by guarded database updates, so two processes can never
+  both finish it. Work travels as jobs (pg-boss in Postgres when split, in-process otherwise); submissions
+  accept an `Idempotency-Key`, so a retried request never starts a task twice. Runs whose process died are
+  found by silence and failed visibly; lost jobs are re-sent by a sweep.
+- **Data** (`packages/data`): one data layer over SQLite or Postgres. Every announced change is appended to an
+  ordered event log, which is what the live views replay from after a reconnect.
+- **Live** (`src/live.ts`, `src/browser/live.ts`): server-sent events for state (resuming from `Last-Event-ID`
+  after a dropped connection), a WebSocket screencast of the tab the agent works in with input replayed back.
+  Between split services both travel over Redis. Chromium keeps one profile; sign-ins are sealed in the
+  database and restored into a fresh profile after a redeploy.
 - **Logs** (`src/logger.ts`): one logger for every part, printing at `LOG_LEVEL` and keeping the last 2000 lines
   in memory; each line is also sent over the event stream, which is what the Logs view tails (`GET /api/logs`,
   `PUT /api/logs/level`).
@@ -265,8 +285,15 @@ shell script, a Claude Code routine prompt block and an MCP server for Cowork.
 ## Security notes
 
 - The app holds live sessions for your accounts. Keep it private: your own password, HTTPS only, don't share the link.
-- A login is a random session token in an HttpOnly cookie; logout revokes it, a password change revokes them all,
-  and tokens are never accepted in URLs. Login attempts are rate limited and audited.
+- Accounts have an email, a role (owner, admin, member) and an argon2id-hashed password. A login is a random
+  session token in an HttpOnly cookie; logout revokes it, a password change revokes them all, and tokens are
+  never accepted in URLs. Login attempts are rate limited and audited. Requests that change something from a
+  browser session must come from the app's own origin.
+- Stored secrets (provider cookies, webhook and routine tokens) are encrypted at rest under `ACP_MASTER_KEY`. A
+  leaked database dump without the key exposes no credentials.
+- Calls to URLs you or your agents configure (webhooks, routine triggers) refuse private and cloud-metadata
+  addresses in production and are pinned to the address that was checked. Webhooking something on your own
+  network? List it in `ACP_EGRESS_ALLOWLIST`.
 - The live browser socket refuses cross-origin pages; the app pages ship with a content-security policy.
 - The ingest token lets your agents register, report, ask and read their inbox. Treat it like a password; rotate it
   under Settings › Developer if it leaks. It cannot read chats, cookies or settings.

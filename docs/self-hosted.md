@@ -1,6 +1,7 @@
 # Self-hosting the AI Control Plane
 
-Everything runs on your own machine or server, packaged as Docker images. Your data, your
+Everything runs on your own machine or server, packaged as Docker images. (Just trying it on
+your laptop? [local.md](local.md) is quicker. Hosting on Railway? [railway.md](railway.md).) Your data, your
 provider sign-ins (cookies), your encryption key — none of it leaves your infrastructure,
 and nothing here depends on Railway, Kubernetes, or any hosted control plane.
 
@@ -43,8 +44,8 @@ The full reference is `.env.example`. The ones that matter first:
 
 - `ACP_MASTER_KEY` — encrypts every stored secret (provider cookies, webhook and routine
   tokens). Generate with `openssl rand -hex 32` and keep it in your secret store; the same
-  value must reach every service. Without it each service generates its own key file, which
-  only works in single-container mode.
+  value must reach every service. The split services refuse to start without it; the single
+  container generates a key file in its data volume instead.
 - `PUBLIC_URL` — the address people (and the pairing helper) reach this deployment on. It is
   never guessed from request headers.
 - `ACP_ADMIN_TOKEN` — optional; without it the first visit creates the owner account

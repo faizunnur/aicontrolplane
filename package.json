@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/bootstrap.ts",
+    "dev:env": "tsx watch --env-file=.env src/bootstrap.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/bootstrap.js",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",

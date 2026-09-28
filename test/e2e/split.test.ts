@@ -25,11 +25,13 @@ describe("split roles: api enqueues, a worker executes", { skip: !process.env.TE
     const REDIS_URL = process.env.TEST_REDIS_URL || "redis://127.0.0.1:56379";
     const mock = await startMockProvider();
     // The api serves HTTP and must NOT execute; the worker holds the browser.
-    const api = await startServer({ ROLE: "api", DATABASE_URL, REDIS_URL, BROWSER_ENABLED: "false" });
+    // One master key across the services, as a real split deployment must have.
+    const ACP_MASTER_KEY = "ab".repeat(32);
+    const api = await startServer({ ROLE: "api", DATABASE_URL, REDIS_URL, ACP_MASTER_KEY, BROWSER_ENABLED: "false" });
     // A core worker with no browser at all, and a browser worker holding Chrome: the browser.*
     // queues must land only on the latter.
-    const worker = await startWorker({ DATABASE_URL, REDIS_URL, BROWSER_ENABLED: "false" });
-    const browserWorker = await startWorker({ DATABASE_URL, REDIS_URL }, { role: "browser" });
+    const worker = await startWorker({ DATABASE_URL, REDIS_URL, ACP_MASTER_KEY, BROWSER_ENABLED: "false" });
+    const browserWorker = await startWorker({ DATABASE_URL, REDIS_URL, ACP_MASTER_KEY }, { role: "browser" });
     try {
       await api.api("/connections", { body: { name: "Mock AI", appUrl: mock.url, purpose: "testing" } });
       await api.api("/connections/mock-ai", { method: "PUT", body: { ...MOCK_SELECTORS, chatUrl: mock.url } });

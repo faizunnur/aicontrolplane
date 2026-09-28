@@ -7,6 +7,17 @@
 import { config } from "./config.js";
 import { restoreFromDatabase } from "./persist.js";
 
+// Split processes seal and open each other's secrets (a webhook token saved through the api is
+// opened by a worker). A key generated per process would make those unreadable, silently.
+if (config.role !== "all" && !process.env.ACP_MASTER_KEY) {
+  console.error(`[bootstrap] ROLE=${config.role} needs ACP_MASTER_KEY, the same value on every service (generate one with: openssl rand -hex 32)`);
+  process.exit(1);
+}
+if (config.role !== "all" && config.db.driver !== "pg") {
+  console.error(`[bootstrap] ROLE=${config.role} needs DATABASE_URL (Postgres): the job queue and shared state live there`);
+  process.exit(1);
+}
+
 try {
   await restoreFromDatabase();
 } catch (err) {

@@ -1,0 +1,10 @@
+# Split deployment: the browser service (set ROLE=browser; keep one replica). See docs/railway.md.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

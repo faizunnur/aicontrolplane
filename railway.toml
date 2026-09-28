@@ -1,5 +1,6 @@
-# Railway service config. Attach a volume mounted at /data (Service -> Volumes)
-# so the browser profile, SQLite database and screenshots survive redeploys.
+# Railway config for the single-service deployment (ROLE=all). See docs/railway.md.
+# Data: add Postgres and set DATABASE_URL=${{Postgres.DATABASE_URL}} plus ACP_MASTER_KEY,
+# or attach a volume at /data for the SQLite file. Split services use railway/*.toml.
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
