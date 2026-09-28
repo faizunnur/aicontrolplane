@@ -44,6 +44,13 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
+      - name: The compiled server serves the dashboard (what the Docker images run)
+        run: |
+          PORT=18080 BROWSER_ENABLED=false DATA_DIR=$(mktemp -d) node dist/src/bootstrap.js &
+          for i in $(seq 1 30); do curl -sf localhost:18080/healthz >/dev/null && break; sleep 1; done
+          curl -sf localhost:18080/ | grep -q "<html"
+          curl -sf -o /dev/null localhost:18080/connect.mjs
+          kill %1
       - name: Install Playwright Chromium (e2e mock-provider tests)
         run: npx playwright install --with-deps chromium
       - name: Unit tests (SQLite driver)

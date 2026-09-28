@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +27,9 @@ import { stopScheduler } from "./sync.js";
 
 const log = logger("server");
 const here = path.dirname(fileURLToPath(import.meta.url));
-const publicDir = path.resolve(here, "..", "public");
+// src/server.ts in development, dist/src/server.js once compiled: the dashboard files sit one or
+// two levels up from here.
+const publicDir = [path.resolve(here, "..", "public"), path.resolve(here, "..", "..", "public")].find((d) => fs.existsSync(path.join(d, "index.html"))) ?? path.resolve(here, "..", "public");
 
 onRunEnded(settleCommandMessage);
 
