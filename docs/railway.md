@@ -136,38 +136,101 @@ Create each from the same GitHub repo (**+ New → GitHub Repo**), then in each 
 Add **Redis** (**+ New → Database → Redis**) next to Postgres. Generate a domain for `api`
 only; the others need none.
 
-### Shared variables
+### Variables, service by service
 
-In **Project Settings → Shared Variables**, add `ACP_MASTER_KEY` (`openssl rand -hex 32`).
-Every service must have the **same** value — the api seals a webhook token, the worker opens
-it. A split service refuses to start without it.
+Every variable is set on the service itself (**service → Variables → Raw Editor**, paste the
+block). No project-level shared variables are used.
 
-### Per-service variables
+First generate one encryption key on your computer and keep it somewhere safe:
 
-| Variable | api | worker | browser |
-|---|---|---|---|
-| `ROLE` | `api` | `worker` | `browser` |
-| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | same | same |
-| `REDIS_URL` | `${{Redis.REDIS_URL}}?family=0` | same | same |
-| `ACP_MASTER_KEY` | `${{shared.ACP_MASTER_KEY}}` | same | same |
-| `PUBLIC_URL` | (automatic) | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` | same as worker |
-| `VNC_TARGET` | `http://browser.railway.internal:6080` | | |
-| `VNC_BIND` | | | `::` |
-| `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` | `15` | `30` | `30` |
+```sh
+openssl rand -hex 32
+```
 
-Notes:
+Paste that **same** value as `ACP_MASTER_KEY` into all three services below. The api seals a
+secret (for example an agent's webhook token) and the worker opens it, so the values must
+match exactly. A split service refuses to start without one.
+
+`${{Postgres.DATABASE_URL}}`, `${{Redis.REDIS_URL}}` and `${{api.RAILWAY_PUBLIC_DOMAIN}}` are
+Railway *reference* variables: each service reads the value from the Postgres, Redis or api
+service, and it stays correct if that service's address changes. They are set per service
+like any other variable. If you prefer, paste the literal values instead.
+
+#### `api` service
+
+```env
+ROLE=api
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+REDIS_URL=${{Redis.REDIS_URL}}?family=0
+ACP_MASTER_KEY=<the 64-character key>
+VNC_TARGET=http://browser.railway.internal:6080
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15
+```
+
+Optional, only on the api:
+
+| Variable | Why here |
+|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | The command chat and AI routing run on the api. |
+| `ACP_ADMIN_TOKEN`, `ACP_INGEST_TOKEN` | Sign-in and agent authentication happen on the api. |
+
+`PUBLIC_URL` is not needed here: the api reads its own Railway domain. Set it only for a custom
+domain, and then use the same value on the other two services.
+
+#### `worker` service
+
+```env
+ROLE=worker
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+REDIS_URL=${{Redis.REDIS_URL}}?family=0
+ACP_MASTER_KEY=<the same 64-character key>
+PUBLIC_URL=https://${{api.RAILWAY_PUBLIC_DOMAIN}}
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
+```
+
+`PUBLIC_URL` is required: the worker puts the api's address into the report link it sends
+your agents when it starts their tasks.
+
+Optional on the worker: `IMAP_HOST`, `IMAP_USER`, `IMAP_PASS` (and the other `IMAP_*` /
+`EMAIL_*` settings) for reading task emails, and `ACP_EGRESS_POLICY` / `ACP_EGRESS_ALLOWLIST`
+if your agents' webhooks live on a private network.
+
+#### `browser` service
+
+```env
+ROLE=browser
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+REDIS_URL=${{Redis.REDIS_URL}}?family=0
+ACP_MASTER_KEY=<the same 64-character key>
+PUBLIC_URL=https://${{api.RAILWAY_PUBLIC_DOMAIN}}
+VNC_BIND=::
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
+```
+
+Optional on the browser: `SYNC_INTERVAL_MIN` (and the other `SYNC_*` settings), which control
+how often each AI's tasks page is checked, and `DESKTOP_SIGNIN_TIMEOUT_MIN`. Optionally attach
+a volume at `/data` so the Chrome profile stays warm across deploys (not required).
+
+#### Settings that go on more than one service
+
+| Variable | api | worker | browser | Why |
+|---|:-:|:-:|:-:|---|
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALERT_WEBHOOK_URL`, `ALERT_COOLDOWN_MIN` | ✓ | ✓ | ✓ | Any of the three can raise an alert: the api when an agent reports a failure (and for the "send a test alert" button), the worker for email problems, the browser when an AI signs you out. |
+| `IMAP_*`, `EMAIL_*` | ✓ | ✓ | | The worker polls on a schedule; the "check email now" button runs on the api. |
+| `LOG_LEVEL`, `LOG_FORMAT` | ✓ | ✓ | ✓ | Each service prints its own log. |
+
+#### Notes
 
 - `?family=0` lets the Redis client resolve Railway's private network addresses (IPv4 or
   IPv6); without it, connections to `*.railway.internal` can fail.
-- `VNC_TARGET` / `VNC_BIND` carry the "cloud desktop" sign-in screen (`/vnc`) from the
-  browser service through the api. The live view of the agent's tab does not need them — it
-  travels over Redis. This pair has not yet been exercised on Railway; if the desktop sign-in
-  screen does not load, check the browser service's log for the noVNC bind line first.
-- Optional variables (`TELEGRAM_*`, `IMAP_*`, `CLAUDE_CODE_OAUTH_TOKEN`, `LOG_LEVEL`…) are
-  simplest as shared variables referenced from all three services; each process uses only
-  what applies to it.
-- Optionally attach a volume at `/data` to `browser` so the Chrome profile stays warm across
-  deploys. Not required.
+- `VNC_TARGET` (api) and `VNC_BIND` (browser) carry the "cloud desktop" sign-in screen
+  (`/vnc`) from the browser service through the api. The live view of the agent's tab does not
+  need them; it travels over Redis. This pair has not yet been exercised on Railway. If the
+  desktop sign-in screen does not load, check the browser service's log for the noVNC bind
+  line first.
+- `browser.railway.internal` assumes the browser service is named `browser`. If you named it
+  differently, use `<name>.railway.internal`, and change `api` in
+  `${{api.RAILWAY_PUBLIC_DOMAIN}}` to the api service's name.
 
 ### Scaling
 
