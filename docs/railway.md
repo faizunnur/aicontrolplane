@@ -19,21 +19,23 @@ longer enough.
 
 ### Create it
 
-1. **New project → Deploy from GitHub repo**, pick this repository. Railway finds
-   `railway.toml` and builds the root `Dockerfile` (Chrome, a virtual display and noVNC are
-   inside the image).
-2. **Add Postgres**: in the project, **+ New → Database → PostgreSQL**.
-3. In the app service's **Variables**, add:
+1. **New project → Deploy from GitHub repo**, pick this repository. Railway finds the root
+   `Dockerfile` and builds it (Chrome, a virtual display and noVNC are inside the image). No
+   config file is involved: every setting below is made in the dashboard.
+2. **Settings → Deploy → Healthcheck Path**: `/healthz`. (While you are there, set the restart
+   policy to "On failure".)
+3. **Add Postgres**: in the project, **+ New → Database → PostgreSQL**.
+4. In the app service's **Variables**, add:
 
    | Variable | Value | Why |
    |---|---|---|
    | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Postgres becomes the database: chats, runs, approvals, settings, sealed sign-ins. |
    | `ACP_MASTER_KEY` | output of `openssl rand -hex 32` | Encrypts stored secrets (provider cookies, webhook and routine tokens). **Required on Railway without a volume** — without it the key is regenerated on every deploy and every saved sign-in becomes unreadable. Keep a copy somewhere safe. |
 
-4. **Settings → Resources**: give it at least **2 GB** of memory (it runs Chrome).
-5. **Settings → Networking → Generate Domain**. The app picks the address up by itself
+5. **Settings → Resources**: give it at least **2 GB** of memory (it runs Chrome).
+6. **Settings → Networking → Generate Domain**. The app picks the address up by itself
    (`RAILWAY_PUBLIC_DOMAIN`); set `PUBLIC_URL` only if you use a custom domain.
-6. Deploy. Open the domain, create your account (email + password), then sign in to each AI
+7. Deploy. Open the domain, create your account (email + password), then sign in to each AI
    from the menu next to it on the left. For Grok, choose **Connect from this computer**.
 
 No volume is needed: everything that matters lives in Postgres. The browser profile on disk
@@ -41,7 +43,7 @@ is only a cache — sign-ins are restored from the database into a fresh profile
 deploy. (A volume at `/data` still works and keeps the profile warm; if you attach one, Railway
 mounts it and the app uses it automatically.)
 
-**Alternative without Postgres:** skip step 2 and `DATABASE_URL`, attach a volume
+**Alternative without Postgres:** skip step 3 and `DATABASE_URL`, attach a volume
 (**Settings → Volumes**, mount path `/data`). Everything is kept in a SQLite file on the
 volume. Fine for one person; it cannot be split into several services later without the
 migration below.
@@ -62,7 +64,7 @@ The full list is in [`.env.example`](../.env.example). Migrations run on boot.
 
 ### Check it is healthy
 
-- Railway's health check calls `/healthz` (configured in `railway.toml`).
+- Railway's health check calls `/healthz` (the path you set in step 2).
 - `https://<your-domain>/readyz` returns `200` once the database answers.
 - **Monitoring › Logs** in the app shows the last 2000 log lines at every level, even ones
   Railway's log does not print.
@@ -124,14 +126,23 @@ migration in section 2 first if you are coming from SQLite.
 
 ### Services
 
-Create each from the same GitHub repo (**+ New → GitHub Repo**), then in each service's
-**Settings → Config-as-code**, set the config file path:
+Create each from the same GitHub repo (**+ New → GitHub Repo**) and name them exactly `api`,
+`worker` and `browser` (the variables below refer to those names). Everything is set in the
+dashboard; no config file is used. (Railway's "Config-as-code" file setting is deprecated, so
+this guide does not rely on it.)
 
-| Service name | Config file | Image | Memory |
-|---|---|---|---|
-| `api` | `/railway/api.toml` | `Dockerfile.api` (slim, non-root) | 512 MB |
-| `worker` | `/railway/worker.toml` | `Dockerfile.api` | 512 MB |
-| `browser` | `/railway/browser.toml` | `Dockerfile` (Chrome + display) | 2 GB+ |
+| Service | Which image (`RAILWAY_DOCKERFILE_PATH` variable) | Memory |
+|---|---|---|
+| `api` | `Dockerfile.api`: slim, no Chrome, non-root | 512 MB |
+| `worker` | `Dockerfile.api` | 512 MB |
+| `browser` | `Dockerfile`: Chrome + virtual display (the default, so the variable is optional) | 2 GB+ |
+
+The image is chosen by the `RAILWAY_DOCKERFILE_PATH` variable in each service's block below.
+Without it Railway builds the root `Dockerfile` (the Chrome image). That works for any role,
+but it is a much bigger image for the api and worker to carry.
+
+In **each** service, also set **Settings → Deploy → Healthcheck Path** to `/healthz`, and the
+restart policy to "On failure".
 
 Add **Redis** (**+ New → Database → Redis**) next to Postgres. Generate a domain for `api`
 only; the others need none.
@@ -160,6 +171,7 @@ like any other variable. If you prefer, paste the literal values instead.
 
 ```env
 ROLE=api
+RAILWAY_DOCKERFILE_PATH=Dockerfile.api
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the 64-character key>
@@ -181,6 +193,7 @@ domain, and then use the same value on the other two services.
 
 ```env
 ROLE=worker
+RAILWAY_DOCKERFILE_PATH=Dockerfile.api
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the same 64-character key>
@@ -199,6 +212,7 @@ if your agents' webhooks live on a private network.
 
 ```env
 ROLE=browser
+RAILWAY_DOCKERFILE_PATH=Dockerfile
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the same 64-character key>
@@ -244,4 +258,4 @@ a volume at `/data` so the Chrome profile stays warm across deploys (not require
 ### Health
 
 Each service answers `/healthz` (process alive) and `/readyz` (database reachable) on its
-`PORT`; the config files point Railway's health check at `/healthz`.
+`PORT`; point each service's Healthcheck Path at `/healthz` as described above.
