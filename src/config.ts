@@ -106,6 +106,18 @@ export const config = {
    */
   publicUrlSource: (fromEnv ? "env" : fromHost ? "host" : "none") as "env" | "host" | "none",
 
+  /**
+   * How Chrome serves workspaces. "legacy": one persistent profile, one workspace — exactly
+   * the single-container behaviour. "ephemeral": one headless Chromium, one ephemeral context
+   * per (workspace, provider) seeded from its sealed session blob — the multi-workspace fleet.
+   */
+  fleet: {
+    mode: (process.env.BROWSER_FLEET === "ephemeral" ? "ephemeral" : "legacy") as "legacy" | "ephemeral",
+    maxContexts: num(process.env.BROWSER_MAX_CONTEXTS, 4),
+    orgMaxContexts: num(process.env.BROWSER_ORG_MAX_CONTEXTS, 2),
+    contextIdleMs: num(process.env.BROWSER_CONTEXT_IDLE_MS, 5 * 60_000),
+  },
+
   browser: {
     enabled: bool(process.env.BROWSER_ENABLED, true),
     headless: bool(process.env.HEADLESS, false),

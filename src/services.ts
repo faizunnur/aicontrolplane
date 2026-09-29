@@ -1,4 +1,5 @@
 import { backfillAgents } from "./agents.js";
+import { config } from "./config.js";
 import { browser } from "./browser/manager.js";
 import { pruneOutbox, withOrg } from "./db.js";
 import { startEmailPoller } from "./ingest/email.js";
@@ -53,8 +54,9 @@ export async function startExecutionServices(scope: HandlerScope): Promise<void>
   if (scope === "browser" || scope === "all") {
     // The sync scheduler drives the browser, so it lives with it; the queue cron replaces it in split mode.
     if (queue.kind !== "boss") startScheduler();
-    if (browser.enabled) {
-      // Warm the browser so the VNC screen shows something immediately.
+    if (browser.enabled && config.fleet.mode !== "ephemeral") {
+      // Warm the browser so the VNC screen shows something immediately. Fleet contexts open
+      // on demand instead - an idle fleet worker holds no Chrome at all.
       browser.getContext().catch((err) => log.error("browser failed to launch", err));
     }
   }

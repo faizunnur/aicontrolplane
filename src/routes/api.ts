@@ -88,7 +88,7 @@ import { beginRun, endRun, requestCancel, runForMessage, RunTracker } from "../r
 import { listTaskViews, startTask, taskView } from "../tasks.js";
 import { connectionCard, expandMessage } from "../view.js";
 import { emailStatus, pollOnce } from "../ingest/email.js";
-import { deletePlatformOverride, getPlatform, getPlatforms, savePlatformOverride, visiblePlatforms } from "../platforms.js";
+import { deletePlatformOverride, getPlatform, getPlatforms, refreshPlatformsNow, savePlatformOverride, visiblePlatforms } from "../platforms.js";
 import {
   adminFromEnv,
   changeAdminPassword,
@@ -330,7 +330,12 @@ api.post("/pairing/exchange", pairingLimit, async (req, res) => {
   const found = code ? await exchangePairing(code, clientIp(req)) : null;
   // One answer for unknown, expired and used codes alike: nothing to enumerate.
   if (!found) return bad(res, "That code is not valid or has expired. Make a new one in the app.", 404);
-  const p = getPlatform(found.row.platform);
+  // No login here; the code is the capability. The provider's configuration lives in the
+  // workspace that made the pairing, so resolve it there (refreshing a cold cache once).
+  const p = await withOrg(found.row.org_id, async () => {
+    if (!getPlatform(found.row.platform)) await refreshPlatformsNow();
+    return getPlatform(found.row.platform);
+  });
   if (!p) return bad(res, "That provider no longer exists.", 404);
   res.json({
     ok: true,

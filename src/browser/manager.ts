@@ -9,6 +9,7 @@ import { persistStatus, saveToDatabase } from "../persist.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
 import { browserSessionUpdatedAt, currentOrgId, withOrg } from "../db.js";
 import { chromeInstallCandidates } from "./executable.js";
+import { FleetManager } from "./fleet.js";
 import { loadSessionState, saveSessionState } from "./session-store.js";
 
 const log = logger("browser");
@@ -571,7 +572,13 @@ export async function storageInfo(): Promise<{
   return { dataDir: config.dataDir, persistent, mount, backupAt, persistedBy, database };
 }
 
-export const browser = new BrowserManager();
+/**
+ * Which browser serves this process: the legacy single persistent profile (today's
+ * single-workspace behaviour, byte for byte), or the multi-workspace fleet of ephemeral
+ * per-connection contexts (BROWSER_FLEET=ephemeral).
+ */
+export type BrowserFacade = BrowserManager | FleetManager;
+export const browser: BrowserFacade = config.fleet.mode === "ephemeral" ? new FleetManager() : new BrowserManager();
 
 /** Small shared counter so the sync loop can yield while someone is using the VNC screen. */
 export const vncState = { connections: 0, lastActivityAt: 0 };

@@ -20,14 +20,14 @@ const challengePage = `<!doctype html><html><head><meta charset="utf-8"><title>S
 <h1>Log in with your email</h1><input id="email" /><div class="cf-turnstile"><iframe src="https://challenges.cloudflare.com/turnstile/v0/stub" title="Widget"></iframe></div>
 <p id="challenge-error-text">Verification failed. Please refresh the page and try again.</p><button>Login</button></body></html>`;
 
-const page = (signedIn: boolean) => `<!doctype html><html><head><meta charset="utf-8"><title>Mock AI</title>
+const page = (signedIn: boolean, who = "tester") => `<!doctype html><html><head><meta charset="utf-8"><title>Mock AI</title>
 <style>body{font-family:system-ui;background:#f6f7f9;margin:0;padding:24px;color:#111}
 .wrap{max-width:720px;margin:0 auto}.msg{padding:12px 16px;border-radius:12px;margin:10px 0;max-width:80%}
 .user{background:#dbeafe;margin-left:auto}.assistant{background:#fff;border:1px solid #ddd}
 textarea{width:100%;height:80px;font:inherit;padding:10px;border-radius:10px;border:1px solid #bbb}
 button{font:inherit;padding:10px 18px;border-radius:10px;border:0;background:#2563eb;color:#fff;margin-top:8px}
 .busy{display:none;color:#666}h1{font-size:20px}</style></head><body><div class="wrap">
-<h1>Mock AI <small style="color:#888;font-weight:400">${signedIn ? "signed in as tester" : "signed out"}</small></h1>
+<h1>Mock AI <small style="color:#888;font-weight:400">${signedIn ? `signed in as ${who}` : "signed out"}</small></h1>
 ${signedIn ? "" : '<a id="login" href="/login">Log in</a>'}
 <div id="log"></div>
 <textarea id="box" placeholder="Ask me anything"></textarea>
@@ -37,7 +37,7 @@ try{localStorage.setItem('mock_seen','1')}catch(e){}
 const log=document.getElementById('log'),box=document.getElementById('box'),stop=document.getElementById('stop');
 function add(cls,t){const d=document.createElement('div');d.className='msg '+cls;d.textContent=t;log.appendChild(d);return d}
 document.getElementById('send').onclick=()=>{const t=box.value.trim();if(!t)return;box.value='';add('user',t);stop.style.display='inline';
- const r=add('assistant','');let i=0;const full='You said: '+t+'. Here is a considered answer with three points: first, second, third.';
+ const r=add('assistant','');let i=0;const full='[${who}] You said: '+t+'. Here is a considered answer with three points: first, second, third.';
  const iv=setInterval(()=>{i+=8;r.textContent=full.slice(0,i);if(i>=full.length){clearInterval(iv);stop.style.display='none'}},80)};
 box.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.getElementById('send').click()}});
 </script></div></body></html>`;
@@ -61,8 +61,10 @@ export function startMockProvider(): Promise<MockProvider> {
   let cookieGate = false;
   let autoLogin = false;
   const server = http.createServer((req, res) => {
-    const hasSession = /(^|;\s*)mock_session=ok(;|$)/.test(String(req.headers.cookie ?? ""));
-    const authed = cookieGate ? hasSession : signedIn;
+    // The cookie VALUE names the session ("ok", or whichever workspace imported it): the
+    // page and every reply echo it, so a test can prove whose session a browser carried.
+    const who = /(?:^|;\s*)mock_session=([^;]+)/.exec(String(req.headers.cookie ?? ""))?.[1];
+    const authed = cookieGate ? !!who : signedIn;
     if (req.url?.startsWith("/login")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       // In auto mode the page "signs in" by itself after a moment, standing in for a person at the keyboard.
@@ -78,7 +80,7 @@ export function startMockProvider(): Promise<MockProvider> {
       return res.end();
     }
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(page(true));
+    res.end(page(true, who ?? "tester"));
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {

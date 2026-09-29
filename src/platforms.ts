@@ -25,11 +25,30 @@ type Overrides = Record<string, Partial<PlatformConfig>>;
 const KEY = "platform_overrides";
 const REFRESH_MS = 5_000;
 
-let cache: Overrides = {};
-let loadedAt = 0;
-let loading: Promise<void> | null = null;
-/** Bumped on every local write; a refresh that started before a write must not clobber it. */
-let generation = 0;
+/** One cached override set per workspace: each workspace configures its own providers. */
+interface OrgCache {
+  overrides: Overrides;
+  loadedAt: number;
+  loading: Promise<void> | null;
+  /** Bumped on every local write; a refresh that started before a write must not clobber it. */
+  generation: number;
+}
+const caches = new Map<number, OrgCache>();
+const orgOf = () => currentOrgId() ?? 1;
+
+function entry(org = orgOf()): OrgCache {
+  let e = caches.get(org);
+  if (!e) {
+    e = { overrides: {}, loadedAt: 0, loading: null, generation: 0 };
+    caches.set(org, e);
+    if (caches.size > 200) {
+      // Plain LRU-ish trim: drop the stalest workspace's copy; it reloads on next touch.
+      const oldest = [...caches.entries()].sort((a, b) => a[1].loadedAt - b[1].loadedAt)[0];
+      if (oldest && oldest[0] !== org) caches.delete(oldest[0]);
+    }
+  }
+  return e;
+}
 
 function parseOverrides(raw: string | undefined | null): Overrides {
   try {
@@ -40,17 +59,18 @@ function parseOverrides(raw: string | undefined | null): Overrides {
   }
 }
 
-async function loadFromDb(): Promise<void> {
-  const gen = generation;
+async function loadFromDb(org = orgOf()): Promise<void> {
+  const e = entry(org);
+  const gen = e.generation;
   let next: Overrides;
-  const raw = await inHomeOrg(() => getSetting(KEY));
+  const raw = await withOrg(org, () => getSetting(KEY));
   if (raw !== undefined) {
     next = parseOverrides(raw);
-  } else if (fs.existsSync(config.platformsFile)) {
-    // One-time import of the legacy file, then the database is the source.
+  } else if (org === 1 && fs.existsSync(config.platformsFile)) {
+    // One-time import of the legacy file (a founding-workspace artefact), then the database is the source.
     try {
       next = parseOverrides(fs.readFileSync(config.platformsFile, "utf8"));
-      await inHomeOrg(() => setSetting(KEY, JSON.stringify(next)));
+      await withOrg(1, () => setSetting(KEY, JSON.stringify(next)));
       log.info(`imported platform overrides from ${config.platformsFile} into the database`);
     } catch (err) {
       log.warn("platforms.json unreadable, ignoring", err);
@@ -59,9 +79,9 @@ async function loadFromDb(): Promise<void> {
   } else {
     next = {};
   }
-  if (gen !== generation) return; // a write landed while this read was in flight; it wins
-  cache = next;
-  loadedAt = Date.now();
+  if (gen !== e.generation) return; // a write landed while this read was in flight; it wins
+  e.overrides = next;
+  e.loadedAt = Date.now();
 }
 
 /** Load the overrides before serving. Called at boot; reads before it see only the defaults. */
@@ -75,15 +95,18 @@ export async function refreshPlatformsNow(): Promise<void> {
 }
 
 /** Reads stay synchronous; a stale copy quietly refreshes in the background. */
-function maybeRefresh() {
-  if (Date.now() - loadedAt < REFRESH_MS || loading) return;
-  loading = loadFromDb()
+function maybeRefresh(org: number) {
+  const e = entry(org);
+  if (Date.now() - e.loadedAt < REFRESH_MS || e.loading) return;
+  e.loading = loadFromDb(org)
     .catch((err) => log.warn("platform override refresh failed", err))
-    .finally(() => (loading = null));
+    .finally(() => (e.loading = null));
 }
 
 export function getPlatforms(): Record<string, PlatformConfig> {
-  maybeRefresh();
+  const org = orgOf();
+  maybeRefresh(org);
+  const cache = entry(org).overrides;
   const out: Record<string, PlatformConfig> = {};
   const ids = new Set([...Object.keys(DEFAULT_PLATFORMS), ...Object.keys(cache)]);
   for (const id of ids) {
@@ -107,25 +130,27 @@ export function visiblePlatforms(): PlatformConfig[] {
 }
 
 export async function savePlatformOverride(id: string, patch: Partial<PlatformConfig>): Promise<PlatformConfig> {
-  const cleaned: Record<string, unknown> = { ...(cache[id] ?? {}) };
+  const e = entry();
+  const cleaned: Record<string, unknown> = { ...(e.overrides[id] ?? {}) };
   for (const [k, v] of Object.entries(patch)) {
     if (k === "id") continue;
     cleaned[k] = v;
   }
-  cache = { ...cache, [id]: cleaned as Partial<PlatformConfig> };
-  generation++;
-  loadedAt = Date.now();
-  await inHomeOrg(() => setSetting(KEY, JSON.stringify(cache)));
+  e.overrides = { ...e.overrides, [id]: cleaned as Partial<PlatformConfig> };
+  e.generation++;
+  e.loadedAt = Date.now();
+  await inHomeOrg(() => setSetting(KEY, JSON.stringify(e.overrides)));
   return getPlatform(id)!;
 }
 
 export async function deletePlatformOverride(id: string): Promise<void> {
-  const next = { ...cache };
+  const e = entry();
+  const next = { ...e.overrides };
   delete next[id];
-  cache = next;
-  generation++;
-  loadedAt = Date.now();
-  await inHomeOrg(() => setSetting(KEY, JSON.stringify(cache)));
+  e.overrides = next;
+  e.generation++;
+  e.loadedAt = Date.now();
+  await inHomeOrg(() => setSetting(KEY, JSON.stringify(e.overrides)));
 }
 
 /** Providers that have a tasks page and can therefore be looked at through the browser. */
