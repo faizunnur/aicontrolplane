@@ -1,7 +1,8 @@
 # Self-hosted production: the complete Control Plane on your own machine or server.
 #
-#   1. cp .env.example .env    — set at least ACP_ADMIN_TOKEN (or leave it to first-run setup),
-#                                 ACP_MASTER_KEY (openssl rand -hex 32) and PUBLIC_URL.
+#   1. cp .env.example .env    — set at least POSTGRES_PASSWORD, ACP_MASTER_KEY
+#                                 (openssl rand -hex 32) and PUBLIC_URL; leave the admin
+#                                 token to first-run setup.
 #   2. docker compose -f docker-compose.selfhosted.yml up --build -d
 #   3. open http://localhost:8080 (or your PUBLIC_URL)
 #
@@ -9,6 +10,17 @@
 # Redis carries events between the services, the browser worker holds the signed-in sessions.
 # No Railway account, no Kubernetes, no external control plane. Scale a service with
 # `--scale worker=2`; the queue shares the work. Full guide: docs/self-hosted.md
+#
+# Only the api publishes a port. Never publish the worker or browser ports: they trust their
+# network neighbours (the queue, the VNC bridge) and have no login of their own.
+#
+# Backups: the `backup` service pg_dumps the database into the acp-backups volume every 24h
+# and keeps 14 days. To restore into a fresh db:
+#   docker compose -f docker-compose.selfhosted.yml exec -T db \
+#     pg_restore -U postgres -d acp --clean --if-exists /backups/<file>.dump
+# (mount the acp-backups volume into db first, or `docker cp` the file in). The dumps contain
+# SEALED secrets: without the ACP_MASTER_KEY that sealed them they cannot be opened. Escrow
+# that key with the backups — a copy in your password manager, not only in .env on this host.
 #
 # Prefer one container? The plain `docker compose up` in docker-compose.yml runs the same
 # code as a single all-in-one process instead.
@@ -20,6 +32,8 @@ services:
       POSTGRES_DB: acp
     volumes:
       - acp-pg:/var/lib/postgresql/data
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -31,6 +45,7 @@ services:
     image: redis:7-alpine
     volumes:
       - acp-redis:/data
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -52,7 +67,16 @@ services:
       ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-}
       ACP_MASTER_KEY: ${ACP_MASTER_KEY:?set ACP_MASTER_KEY in .env (openssl rand -hex 32)}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      TRUST_PROXY: ${TRUST_PROXY:-}
       VNC_TARGET: http://browser:6080
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
@@ -60,6 +84,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # No ports here or on the browser: internal services stay internal.
   worker:
     build:
       context: .
@@ -77,6 +102,14 @@ services:
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
@@ -97,6 +130,16 @@ services:
     volumes:
       - acp-browser:/data
     shm_size: "1g"
+    mem_limit: 3g
+    # Chrome's sandbox needs setuid/userns, so the browser gets the tailored seccomp profile
+    # (docker/seccomp_profile.json) instead of no-new-privileges.
+    security_opt: ["seccomp:./docker/seccomp_profile.json"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     depends_on:
       db:
         condition: service_healthy
@@ -104,7 +147,33 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Nightly-ish pg_dump into the acp-backups volume, 14 days kept. See the header comment
+  # for the restore command and why ACP_MASTER_KEY must be escrowed with the dumps.
+  backup:
+    image: postgres:17-alpine
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          pg_dump -h db -U postgres -d acp -Fc -f "/backups/acp-$$(date +%Y%m%d-%H%M%S).dump" \
+            && echo "backup written" \
+            || echo "backup FAILED"
+          find /backups -name 'acp-*.dump' -mtime +14 -delete
+          sleep 86400
+        done
+    volumes:
+      - acp-backups:/backups
+    mem_limit: 512m
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   acp-pg:
   acp-redis:
   acp-browser:
+  acp-backups:

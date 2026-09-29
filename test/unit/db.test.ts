@@ -10,7 +10,7 @@ describe("schema", () => {
   it("applies every migration to a fresh database", async () => {
     const applied = (await db.schemaVersion()).map((m) => m.id);
     // SQLite replays its historical chain; Postgres starts from its own baseline (id 100+).
-    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     else assert.ok(applied.includes(100), "postgres baseline applied");
     if (db.db) {
       const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
@@ -35,6 +35,7 @@ describe("conversations and messages", () => {
   });
 
   it("announces message changes on the bus", async () => {
+    await db.flushNotifications(); // drain earlier tests' buffered announcements first
     const seen: number[] = [];
     const h = (row: { id: number }) => seen.push(row.id);
     bus.on("message:row", h);

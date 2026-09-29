@@ -7,7 +7,7 @@ import { logger } from "./logger.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import type { ProviderAdapter, TaskRef } from "./providers/types.js";
-import { beginRun, endRun, finishParked, isCancelled, RunTracker } from "./runs.js";
+import { beginRun, endRun, enforceRunQuotas, finishParked, isCancelled, QuotaExceededError, RunTracker, withRunLease } from "./runs.js";
 import type { Run, RunTrigger } from "../packages/core/src/index.js";
 
 const log = logger("tasks");
@@ -115,13 +115,26 @@ export async function startTask(taskId: number, opts: { text?: string; trigger?:
 
 /** The queued half: claim the run, pass the gate, start it. Any executing process runs this. */
 export async function executeTaskRun(runId: number): Promise<void> {
+  // Quotas are checked BEFORE the claim, while the run is still queued: over the concurrency
+  // cap the job throws and retries on its backoff (the queue is the waiting room); over the
+  // daily cap the run fails now with a message that says why — a retry cannot help today.
+  try {
+    await enforceRunQuotas({ selfCounted: true });
+  } catch (err) {
+    if (err instanceof QuotaExceededError && !err.retryable) {
+      const run = await getRun(runId);
+      if (run && (run.status === "queued" || run.status === "retrying")) await finishParked(run, "failed", { error: err.message });
+      return;
+    }
+    throw err;
+  }
   const claimed = await transitionRun(runId, ["queued", "retrying"], "running", { started_at: new Date().toISOString() });
   if (!claimed) return; // someone else has it, or it was cancelled while queued
   const inputs = checkpointInputs(claimed);
   const task = claimed.task_id ? await getTask(claimed.task_id) : undefined;
   const adapter = task ? getProvider(task.platform) : undefined;
   const track = new RunTracker(claimed.id, claimed.message_id);
-  await withLogContext({ run_id: claimed.id }, async () => {
+  await withRunLease(claimed.id, () => withLogContext({ run_id: claimed.id }, async () => {
     if (!task || !adapter) {
       await endRun(claimed.id, { status: "failed", error: "the task behind this run is gone" });
       return;
@@ -144,7 +157,7 @@ export async function executeTaskRun(runId: number): Promise<void> {
       throw err;
     }
     await performTaskStart(claimed.id, track, task.id, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined });
-  });
+  }));
 }
 
 /**
@@ -207,7 +220,9 @@ registerResumer("task", async (run) => {
     return;
   }
   const inputs = checkpointInputs(run);
-  await withLogContext({ run_id: run.id }, () =>
-    performTaskStart(run.id, new RunTracker(run.id, run.message_id), run.task_id!, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined }),
+  await withRunLease(run.id, () =>
+    withLogContext({ run_id: run.id }, () =>
+      performTaskStart(run.id, new RunTracker(run.id, run.message_id), run.task_id!, { text: inputs.text ?? undefined, trigger: inputs.trigger, messageId: inputs.message_id ?? undefined }),
+    ),
   );
 });

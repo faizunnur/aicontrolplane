@@ -11,6 +11,7 @@
 
   /* ---------- state ---------- */
   let home = null;
+  let me = null; // { email, role } — who is signed in; members get the read-only dashboard
   let connections = [];
   let conversations = [];
   let current = null; // conversation summary, or null for a fresh chat
@@ -101,6 +102,17 @@
   const statusOf = (c) => c.status === "logged_in" ? { dot: "ok", label: "Connected" } : c.status === "needs_login" ? { dot: "warn", label: "Signed out" } : c.status === "error" ? { dot: "bad", label: "Problem" } : { dot: "", label: "Not connected" };
   const isRunning = (m) => m.status === "assigned" || m.status === "delivered";
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  // Leading-edge: the first event refreshes at once; while they keep coming, at most one
+  // refresh per window — under fleet activity the SSE payloads carry the liveness in between.
+  const throttled = (fn, ms) => {
+    let timer = null, queued = false;
+    return (...a) => {
+      if (timer) { queued = true; return; }
+      fn(...a);
+      timer = setTimeout(() => { timer = null; if (queued) { queued = false; fn(...a); } }, ms);
+    };
+  };
+  const isMember = () => me?.role === "member";
 
   /* ---------- gate ---------- */
   let gateMode = "login";
@@ -203,6 +215,7 @@
   async function load(conversationId) {
     const h = await api(`/home${conversationId ? `?conversation_id=${conversationId}` : ""}`);
     home = h;
+    if (h.user) me = h.user;
     connections = h.connections;
     conversations = h.conversations;
     approvalMode = h.approvalMode;
@@ -329,7 +342,7 @@
     $("#custom-agents-sub").textContent = custom.length ? `${custom.length} registered${custom.some((a) => a.running) ? " · working" : ""}` : "none registered";
     document.title = (c.running ? `(${c.running}) ` : "") + "AI Control Plane";
   }
-  const refreshOverview = debounce(async () => {
+  const refreshOverview = throttled(async () => {
     try {
       overview = await api("/overview");
       runningRuns.clear();
@@ -338,20 +351,29 @@
       renderLiveContext();
       if (view === "overview") renderView();
     } catch (err) { fail(err); }
-  }, 400);
+  }, 3000);
   // The logs view tails the stream itself; re-rendering it on every run event would lose the reader's place.
-  const refreshView = debounce(() => { if (view !== "chat" && view !== "logs") renderView(); }, 500);
+  const refreshView = throttled(() => { if (view !== "chat" && view !== "logs") renderView(); }, 1500);
   const logFilter = () => ({ level: store.get("acp-log-level", "info"), scope: store.get("acp-log-scope", "") });
 
   /* ---------- live updates (server-sent events) ---------- */
   let es = null;
   let streamOpenedBefore = false;
+  let lastResyncAt = 0;
   function connectStream() {
     if (es) es.close();
     es = new EventSource("/api/stream");
     es.addEventListener("hello", () => {
       if (streamOpenedBefore) load(current ? current.id : null).catch(fail); // catch up on what we missed
       streamOpenedBefore = true;
+    });
+    // The server says the stream fell behind (its event log moved on): refetch state rather
+    // than trusting what arrived. Guarded so a burst of resyncs costs one reload.
+    es.addEventListener("resync", () => {
+      const now = Date.now();
+      if (now - lastResyncAt < 5000) return;
+      lastResyncAt = now;
+      load(current ? current.id : null).catch(fail);
     });
     es.addEventListener("msg", (e) => onMessage(JSON.parse(e.data)));
     es.addEventListener("msg-deleted", (e) => {
@@ -409,17 +431,30 @@
     });
     es.addEventListener("run", (e) => {
       const r = JSON.parse(e.data);
-      if (r.status === "running") runningRuns.set(r.id, { ...(runningRuns.get(r.id) || {}), ...r });
+      // The payload is the run row itself (incl. current_step): patch what is on screen
+      // from it, and let the throttled refetch pick up the structural changes.
+      if (r.status === "running") { runningRuns.set(r.id, { ...(runningRuns.get(r.id) || {}), ...r }); patchRunRow(runningRuns.get(r.id)); }
       else runningRuns.delete(r.id);
-      renderLiveContext(); refreshOverview(); refreshView();
+      renderCounts(); renderLiveContext(); refreshOverview(); refreshView();
     });
     es.addEventListener("run-event", (e) => {
       const ev = JSON.parse(e.data);
       const r = runningRuns.get(ev.run_id);
-      if (r && ev.type === "step" && (ev.status === "running" || ev.status === "waiting")) { r.current_step = ev.label; r.current_step_status = ev.status; renderLiveContext(); }
-      if (view === "activity" || view === "runs") refreshView();
+      if (r && ev.type === "step" && (ev.status === "running" || ev.status === "waiting")) { r.current_step = ev.label; r.current_step_status = ev.status; renderLiveContext(); patchRunRow(r); }
+      // The activity feed appends rows, which a patch cannot fake; the runs/overview lists
+      // stay live through the patched step label between (throttled) refetches.
+      if (view === "activity") refreshView();
     });
     for (const k of ["approval", "task", "agent", "agent-deleted", "task-deleted", "notification"]) es.addEventListener(k, () => { refreshOverview(); refreshView(); if (k === "agent" || k === "agent-deleted") api("/agents").then((a) => { agents = a; renderCounts(); }).catch(() => null); });
+  }
+  /** Update a running run's line in the open view from an SSE payload — no refetch needed. */
+  function patchRunRow(r) {
+    if (!r || (view !== "runs" && view !== "overview")) return;
+    const row = $(`#view [data-open-run="${r.id}"]`);
+    if (!row) { refreshView(); return; } // a run not on screen yet: let the throttled refetch add it
+    const sub = row.querySelector(".sub");
+    if (sub && r.status === "running") sub.innerHTML = `${esc(r.current_step || "working")} · <span class="elapsed" data-since="${esc(r.started_at || r.created_at || "")}"></span>`;
+    tickTimers();
   }
   function onMessage(m) {
     if (!current || m.conversation_id !== current.id) return;
@@ -518,7 +553,7 @@
     return { name: name || "chat", filter: filter ? decodeURIComponent(filter) : "" };
   }
   window.addEventListener("hashchange", () => { const h = viewFromHash(); if (h.name !== view || h.filter !== viewFilter) setView(h.name, h.filter); });
-  const viewCtx = { api, esc, icon, rel, dur, aiName, conn, store, get filter() { return viewFilter; }, set filter(v) { viewFilter = v; }, overview: null };
+  const viewCtx = { api, esc, icon, rel, dur, aiName, conn, store, get filter() { return viewFilter; }, set filter(v) { viewFilter = v; }, get role() { return me?.role || null; }, overview: null };
   let viewSeq = 0;
   async function renderView() {
     const root = $("#view");
@@ -645,7 +680,13 @@
     try { current = await api(`/conversations/${current.id}`, { method: "PATCH", body: { title: title.trim() } }); renderHeader(); renderChatList(); } catch (err) { fail(err); }
   });
   function renderMode() {
-    for (const b of $$(".mode-btn")) { b.classList.toggle("active", b.dataset.mode === approvalMode); b.setAttribute("aria-checked", String(b.dataset.mode === approvalMode)); }
+    for (const b of $$(".mode-btn")) {
+      b.classList.toggle("active", b.dataset.mode === approvalMode);
+      b.setAttribute("aria-checked", String(b.dataset.mode === approvalMode));
+      // Members may look but not flip the switch; the server would 403 the change anyway.
+      b.disabled = isMember() && b.dataset.mode !== approvalMode;
+      if (isMember()) b.title = "Only owners and admins can change this.";
+    }
   }
   $("#mode").addEventListener("click", async (e) => {
     const b = e.target.closest("[data-mode]");
@@ -1030,6 +1071,28 @@
 
   /* ---------- settings ---------- */
   let settings = null;
+  // The server only says whether an ingest token EXISTS; the plaintext is shown once, from
+  // the rotate response, and lives nowhere but this variable until the page closes.
+  let ingestTokenPlain = null;
+  function renderIngestToken() {
+    const known = !!ingestTokenPlain;
+    $("#ingest-token").textContent = ingestTokenPlain
+      || (settings?.ingest_token_set ? "•••• a token is set — it is only shown once, when you create a new one" : "no token yet — create one so your agents can report in");
+    $("#btn-copy-token").hidden = !known;
+    const base = home?.publicUrl || location.origin;
+    const shown = ingestTokenPlain || "$ACP_INGEST_TOKEN";
+    $("#ingest-example").textContent = `# register your agent once
+curl -X POST ${base}/api/agents/register \\
+  -H "Authorization: Bearer ${shown}" -H "Content-Type: application/json" \\
+  -d '{ "key": "scanner-bot", "name": "Scanner bot", "description": "watches repositories" }'
+
+# report a finished run of one of its tasks
+curl -X POST ${base}/api/ingest \\
+  -H "Authorization: Bearer ${shown}" -H "Content-Type: application/json" \\
+  -d '{ "agent": { "key": "nightly-audit", "platform": "custom", "name": "Nightly audit", "schedule": "daily 02:00" },
+        "profile": { "key": "scanner-bot" },
+        "run": { "status": "success", "summary": "0 issues found" } }'`;
+  }
   async function openSettings(tab = "general", aiId = null) {
     try {
       settings = await api("/settings");
@@ -1044,20 +1107,9 @@
         : st.persistedBy === "volume" ? `Sign-ins are saved on a persistent disk${st.backupAt ? ` and were backed up ${rel(st.backupAt)}` : ""}.`
         : st.persistedBy === "none" ? `Warning: nothing keeps ${st.dataDir} between deploys. Add a Postgres database (reference DATABASE_URL in this service) or attach a volume there. Download a copy of your sign-ins to be safe.`
         : `Sign-ins are saved under ${st.dataDir}${st.backupAt ? `, backed up ${rel(st.backupAt)}` : ""}.`;
-      $("#ingest-token").textContent = settings.ingestToken;
-      $("#btn-rotate-token").hidden = settings.ingestTokenFromEnv;
-      const base = home?.publicUrl || location.origin;
-      $("#ingest-example").textContent = `# register your agent once
-curl -X POST ${base}/api/agents/register \\
-  -H "Authorization: Bearer ${settings.ingestToken}" -H "Content-Type: application/json" \\
-  -d '{ "key": "scanner-bot", "name": "Scanner bot", "description": "watches repositories" }'
-
-# report a finished run of one of its tasks
-curl -X POST ${base}/api/ingest \\
-  -H "Authorization: Bearer ${settings.ingestToken}" -H "Content-Type: application/json" \\
-  -d '{ "agent": { "key": "nightly-audit", "platform": "custom", "name": "Nightly audit", "schedule": "daily 02:00" },
-        "profile": { "key": "scanner-bot" },
-        "run": { "status": "success", "summary": "0 issues found" } }'`;
+      renderIngestToken();
+      $("#btn-rotate-token").hidden = settings.ingestTokenFromEnv || isMember();
+      $("#btn-rotate-token").textContent = settings.ingest_token_set ? "New token" : "Create token";
       if (settings.signups?.canToggle) {
         $("#signups-block").hidden = false;
         $("#signups-enabled").checked = settings.signups.reason !== "disabled";
@@ -1066,7 +1118,15 @@ curl -X POST ${base}/api/ingest \\
           : settings.signups.reason === "browser" ? "Needs BROWSER_FLEET=ephemeral on the server first: the classic browser keeps one shared sign-in profile, which must not be shared between workspaces."
           : "Each sign-up gets its own private workspace, isolated from yours.";
       }
-      await renderPolicies();
+      // Members see the workspace read-only: operator-only controls stay out of reach
+      // (the server refuses them anyway; this keeps the page honest about it).
+      const member = isMember();
+      $('[data-stab="policies"]').hidden = member;
+      $("#btn-download").hidden = member;
+      $('label[for="sessions-file"]').hidden = member;
+      for (const el of $$("#ai-form input, #ai-form textarea, #ai-form select, #ai-form button")) el.disabled = member;
+      if (member && tab === "policies") tab = "general";
+      if (!member) await renderPolicies();
       const sel = $("#ai-select");
       sel.innerHTML = connections.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
       sel.value = aiId || connections[0]?.id || "";
@@ -1134,8 +1194,15 @@ curl -X POST ${base}/api/ingest \\
   });
   $("#btn-copy-token").addEventListener("click", async () => { await navigator.clipboard.writeText($("#ingest-token").textContent).catch(() => null); toast("Copied.", "ok"); });
   $("#btn-rotate-token").addEventListener("click", async () => {
-    if (!confirm("Make a new token? Agents using the old one will stop reporting until you update them.")) return;
-    try { const r = await api("/settings/ingest-token/rotate", { method: "POST", body: {} }); $("#ingest-token").textContent = r.ingestToken; toast("New token created.", "ok"); } catch (err) { fail(err); }
+    if (settings?.ingest_token_set && !confirm("Make a new token? Agents using the old one will stop reporting until you update them.")) return;
+    try {
+      const r = await api("/settings/ingest-token/rotate", { method: "POST", body: {} });
+      ingestTokenPlain = r.ingestToken;
+      if (settings) settings.ingest_token_set = true;
+      $("#btn-rotate-token").textContent = "New token";
+      renderIngestToken();
+      toast("New token created. Copy it now — it will not be shown again.", "ok");
+    } catch (err) { fail(err); }
   });
   $("#signups-enabled").addEventListener("change", async (e) => {
     try {
@@ -1283,7 +1350,9 @@ curl -X POST ${base}/api/ingest \\
       }
       const s = await fetch("/api/setup").then((r) => r.json());
       if (s.setupRequired) return showGate("setup");
-      const ok = await fetch("/api/session", { credentials: "same-origin" }).then((r) => r.ok);
+      const sess = await fetch("/api/session", { credentials: "same-origin" });
+      const ok = sess.ok;
+      if (ok) me = (await sess.json().catch(() => ({}))).user || me;
       if (!ok) {
         showGate("login");
         if (params.get("verify") === "failed") {

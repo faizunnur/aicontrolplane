@@ -58,6 +58,31 @@ const adminToken = process.env.ACP_ADMIN_TOKEN || "";
 const ingestToken = process.env.ACP_INGEST_TOKEN || "";
 void randomBytes;
 
+// A placeholder credential is worse than none: none means first-visit setup takes over, a
+// placeholder means anyone who has read the old compose file owns the install. Refuse to boot.
+const SENTINEL_TOKENS = new Set(["change-me-admin", "change-me-ingest", "change-me", "changeme", "admin", "password"]);
+for (const [name, value] of [["ACP_ADMIN_TOKEN", adminToken], ["ACP_INGEST_TOKEN", ingestToken]] as const) {
+  if (value && SENTINEL_TOKENS.has(value.toLowerCase())) {
+    throw new Error(`[config] ${name} is set to the placeholder "${value}". Unset it (first-visit setup will create a real one) or set a strong secret of your own.`);
+  }
+}
+
+/**
+ * Whether X-Forwarded-* headers are believed. Off by default: on a deployment reached
+ * directly, a spoofed X-Forwarded-For would let anyone pick their own rate-limit bucket.
+ * TRUST_PROXY=true trusts the chain and takes the leftmost hop; a number trusts exactly
+ * that many proxies in front (1 = one load balancer, the usual Railway/ingress shape).
+ */
+function trustProxyConfig(): boolean | number {
+  const raw = (process.env.TRUST_PROXY || "").trim().toLowerCase();
+  if (!raw || raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+  if (raw === "true" || raw === "yes" || raw === "on") return true;
+  const n = Number(raw);
+  if (Number.isInteger(n) && n > 0) return n;
+  console.warn(`[config] TRUST_PROXY "${raw}" is not true/false or a hop count; leaving it off`);
+  return false;
+}
+
 /**
  * Which engine holds the rows. DATABASE_URL selects Postgres (the source of truth for any
  * deployment with more than one process); without it, the local SQLite file serves the
@@ -88,6 +113,7 @@ function roleConfig(): "all" | "api" | "worker" | "browser" {
 export const config = {
   isProd,
   port: num(process.env.PORT, 8080),
+  trustProxy: trustProxyConfig(),
   dataDir,
   role: roleConfig(),
   redisUrl: process.env.REDIS_URL || "",
@@ -133,6 +159,29 @@ export const config = {
     initialDelayMs: num(process.env.SYNC_INITIAL_DELAY_MS, 30_000),
   },
 
+  /**
+   * Per-workspace run ceilings, enforced when a run starts executing. These are the install's
+   * defaults; a workspace's orgs.quotas JSON (maxConcurrentRuns / maxRunsPerDay) overrides
+   * them per workspace. 0 means unlimited.
+   */
+  quotas: {
+    maxConcurrentRuns: num(process.env.ORG_MAX_CONCURRENT_RUNS, 10),
+    maxRunsPerDay: num(process.env.ORG_MAX_RUNS_PER_DAY, 0),
+  },
+
+  /**
+   * How long history is kept, in days, pruned by the maintenance sweep per workspace.
+   * 0 disables that table's pruning. "raw" strips the raw provider payload off long-settled
+   * runs; the run rows themselves are never deleted.
+   */
+  retention: {
+    runEventsDays: num(process.env.RETAIN_RUN_EVENTS_DAYS, 90),
+    eventsDays: num(process.env.RETAIN_EVENTS_DAYS, 180),
+    auditDays: num(process.env.RETAIN_AUDIT_DAYS, 365),
+    syncLogDays: num(process.env.RETAIN_SYNC_LOG_DAYS, 30),
+    rawDays: num(process.env.RETAIN_RAW_DAYS, 30),
+  },
+
   vnc: {
     target: process.env.VNC_TARGET || "http://127.0.0.1:6080",
   },
@@ -167,6 +216,22 @@ export const config = {
     ingestAll: bool(process.env.EMAIL_INGEST_ALL, false),
   },
 };
+
+/*
+  An honest refusal beats a quiet lie. ROLE=all runs the inline queue and the local timers,
+  and those serve the founding workspace only (sync.ts hard-codes workspace 1 on the timer
+  path; delayed inline jobs die with the process). The sign-up-capable configuration —
+  Postgres, outbound mail, the ephemeral fleet — implies strangers' workspaces, whose syncs
+  and jobs a ROLE=all process would silently never run. Refuse the combination at boot:
+  split the roles (ROLE=api / worker / browser) to host sign-ups, or drop one of the three
+  ingredients to stay single-process.
+*/
+if (config.role === "all" && config.fleet.mode === "ephemeral" && config.db.driver === "pg" && config.smtp.host && config.smtp.host !== "stub") {
+  throw new Error(
+    "[config] ROLE=all cannot host public sign-ups: the inline queue and local sync timer serve the founding workspace only, so other workspaces would silently never sync. " +
+      "Run split roles (ROLE=api + ROLE=worker + ROLE=browser) for a multi-workspace deployment, or make this a single-workspace one (set BROWSER_FLEET=legacy or unset SMTP_HOST).",
+  );
+}
 
 export type RouterProvider = "api" | "claude-code" | "none";
 

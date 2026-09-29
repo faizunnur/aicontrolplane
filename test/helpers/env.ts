@@ -13,6 +13,10 @@ process.env.BROWSER_ENABLED = "false";
 process.env.SYNC_ENABLED = "false";
 process.env.ROUTER_PROVIDER = "none";
 process.env.NODE_ENV = "test";
+// Quotas off by default: suites accumulate active runs across cases, and the point of a unit
+// test is never the install-wide default ceiling. Quota tests set orgs.quotas explicitly.
+process.env.ORG_MAX_CONCURRENT_RUNS = "0";
+process.env.ORG_MAX_RUNS_PER_DAY = "0";
 process.env.LOG_LEVEL = process.env.LOG_LEVEL || "error";
 delete process.env.DATABASE_URL;
 delete process.env.RAILWAY_VOLUME_MOUNT_PATH;

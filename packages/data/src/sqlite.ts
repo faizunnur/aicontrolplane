@@ -1,4 +1,6 @@
 import Database from "better-sqlite3";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { RunResult, SqlDriver } from "./driver.js";
@@ -30,39 +32,60 @@ export function openSqlite(dbPath: string): { driver: SqlDriver; raw: Database.D
     return s;
   };
 
+  // One connection means one transaction at a time: an interleaved statement from another
+  // async task would silently join (and its failure roll back) an open BEGIN. Transactions
+  // therefore take a promise mutex, statements inside fn recognise their own transaction via
+  // an ALS flag, and plain statements from anywhere else queue behind the open bracket.
+  const inTx = new AsyncLocalStorage<true>();
+  let txDone: Promise<void> = Promise.resolve();
+  // A timer scheduled inside a transaction inherits its async context after the COMMIT, so
+  // membership means the flag AND an actually-open transaction, never the flag alone.
+  const inOwnTx = () => !!inTx.getStore() && db.inTransaction;
+  const barrier = () => (inOwnTx() ? Promise.resolve() : txDone);
+
   const driver: SqlDriver = {
     kind: "sqlite",
     async all<T>(sql: string, params: unknown[] = []) {
+      await barrier();
       return prep(sql).all(...params) as T[];
     },
     async get<T>(sql: string, params: unknown[] = []) {
       // better-sqlite3 refuses .get() on statements that return no rows (plain INSERT/UPDATE);
       // those come through run(). Statements with RETURNING report reads=true and work here.
+      await barrier();
       return prep(sql).get(...params) as T | undefined;
     },
     async run(sql: string, params: unknown[] = []): Promise<RunResult> {
+      await barrier();
       const res = prep(sql).run(...params);
       return { changes: res.changes };
     },
     async exec(sql: string) {
+      await barrier();
       db.exec(sql);
     },
     async transaction<T>(fn: () => Promise<T>): Promise<T> {
-      // One connection, one writer: BEGIN/COMMIT brackets are enough as long as the awaited
-      // work inside is this driver's own (synchronous underneath). Used by migrations and
-      // the outbox write path.
-      db.exec("BEGIN");
+      if (inOwnTx()) return fn(); // nested: join the open transaction
+      const prev = txDone;
+      let release!: () => void;
+      txDone = new Promise((r) => (release = r));
+      await prev;
       try {
-        const out = await fn();
-        db.exec("COMMIT");
-        return out;
-      } catch (err) {
+        db.exec("BEGIN");
         try {
-          db.exec("ROLLBACK");
-        } catch {
-          /* already rolled back */
+          const out = await inTx.run(true, fn);
+          db.exec("COMMIT");
+          return out;
+        } catch (err) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            /* already rolled back */
+          }
+          throw err;
         }
-        throw err;
+      } finally {
+        release();
       }
     },
     async schemaVersion() {
@@ -603,6 +626,41 @@ const MIGRATIONS: { id: number; name: string; up: (db: Database.Database) => voi
         expires_at TEXT NOT NULL,
         used_at TEXT
       )`);
+    },
+  },
+  {
+    id: 13,
+    name: "list indexes, the run's current step, provider claims",
+    up: (db) => {
+      ensureColumn(db, "runs", "current_step", "current_step TEXT");
+      db.exec("CREATE INDEX IF NOT EXISTS runs_org_task_created ON runs(org_id, task_id, created_at DESC, id DESC)");
+      db.exec("CREATE INDEX IF NOT EXISTS runs_agent ON runs(agent_id)");
+      db.exec("CREATE INDEX IF NOT EXISTS events_org_occurred ON events(org_id, occurred_at DESC)");
+      db.exec("CREATE INDEX IF NOT EXISTS run_events_org_id ON run_events(org_id, id DESC)");
+      db.exec("CREATE INDEX IF NOT EXISTS audit_org_id ON audit_log(org_id, id DESC)");
+      db.exec("CREATE INDEX IF NOT EXISTS outbox_created ON outbox(created_at)");
+      db.exec(`CREATE TABLE IF NOT EXISTS provider_claims (
+        org_id INTEGER NOT NULL,
+        platform_id TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY (org_id, platform_id)
+      )`);
+    },
+  },
+  {
+    id: 14,
+    name: "ingest tokens stored hashed, looked up by index",
+    up: (db) => {
+      // The token is a bearer credential; at rest it becomes its sha256, and the lookup
+      // hashes its input. Values that already look hashed (64 hex) are left alone, so
+      // re-runs and half-migrated installs converge.
+      const rows = db.prepare("SELECT org_id, value FROM settings WHERE key = 'ingest_token'").all() as { org_id: number; value: string }[];
+      for (const r of rows) {
+        if (/^[0-9a-f]{64}$/.test(r.value)) continue;
+        db.prepare("UPDATE settings SET value = ? WHERE key = 'ingest_token' AND org_id = ?").run(createHash("sha256").update(r.value).digest("hex"), r.org_id);
+      }
+      db.exec("CREATE INDEX IF NOT EXISTS settings_key_value ON settings(key, value)");
     },
   },
 ];

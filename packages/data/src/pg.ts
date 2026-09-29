@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import pg from "pg";
 import type { RunResult, SqlDriver } from "./driver.js";
 
@@ -32,7 +33,20 @@ function sslConfig(): pg.PoolConfig["ssl"] {
 }
 
 export async function openPg(databaseUrl: string): Promise<{ driver: SqlDriver; pool: pg.Pool }> {
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: Number(process.env.PG_POOL_MAX || 10), ssl: sslConfig() });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    max: Number(process.env.PG_POOL_MAX || 10),
+    ssl: sslConfig(),
+    connectionTimeoutMillis: 5000,
+    keepAlive: true,
+    // A stuck statement times out instead of holding a pool slot forever.
+    statement_timeout: Number(process.env.ACP_PG_STATEMENT_TIMEOUT_MS || 30_000),
+  });
+  // An idle client whose backend dies emits 'error' on the pool; without a listener that
+  // crashes the process. The pool already discards the dead client — log and carry on.
+  pool.on("error", (err) => {
+    console.error("[data] idle postgres client error (client discarded):", err.message);
+  });
   const txClient = new AsyncLocalStorage<pg.PoolClient>();
   const q = (sql: string, params: unknown[] = []) => {
     const client = txClient.getStore();
@@ -83,7 +97,7 @@ export async function openPg(databaseUrl: string): Promise<{ driver: SqlDriver; 
     },
   };
 
-  await migratePg(driver);
+  await migratePg(driver, pool);
   return { driver, pool };
 }
 
@@ -489,14 +503,71 @@ PG_MIGRATIONS.push({
   },
 });
 
-async function migratePg(d: SqlDriver): Promise<void> {
-  await d.exec("CREATE TABLE IF NOT EXISTS schema_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
-  const applied = new Set((await d.all<{ id: number }>("SELECT id FROM schema_migrations")).map((r) => r.id));
-  for (const m of PG_MIGRATIONS) {
-    if (applied.has(m.id)) continue;
-    await d.transaction(async () => {
-      await m.up(d);
-      await d.run("INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)", [m.id, m.name, now()]);
-    });
+PG_MIGRATIONS.push({
+  id: 107,
+  name: "list indexes, the run's current step, provider claims",
+  up: async (d) => {
+    await d.exec(`
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS current_step TEXT;
+CREATE INDEX IF NOT EXISTS runs_org_task_created ON runs(org_id, task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS runs_agent ON runs(agent_id);
+CREATE INDEX IF NOT EXISTS events_org_occurred ON events(org_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS run_events_org_id ON run_events(org_id, id DESC);
+CREATE INDEX IF NOT EXISTS audit_org_id ON audit_log(org_id, id DESC);
+CREATE INDEX IF NOT EXISTS outbox_created ON outbox(created_at);
+CREATE TABLE IF NOT EXISTS provider_claims (
+  org_id BIGINT NOT NULL REFERENCES orgs(id),
+  platform_id TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (org_id, platform_id)
+);
+`);
+  },
+});
+
+PG_MIGRATIONS.push({
+  id: 108,
+  name: "ingest tokens stored hashed, looked up by index",
+  up: async (d) => {
+    // The token is a bearer credential; at rest it becomes its sha256, and the lookup hashes
+    // its input. Values that already look hashed (64 hex) are left alone, so re-runs and
+    // half-migrated installs converge.
+    const rows = await d.all<{ org_id: number; value: string }>("SELECT org_id, value FROM settings WHERE key = 'ingest_token'");
+    for (const r of rows) {
+      if (/^[0-9a-f]{64}$/.test(r.value)) continue;
+      await d.run("UPDATE settings SET value = ? WHERE key = 'ingest_token' AND org_id = ?", [createHash("sha256").update(r.value).digest("hex"), r.org_id]);
+    }
+    await d.exec("CREATE INDEX IF NOT EXISTS settings_ingest_value ON settings(value) WHERE key = 'ingest_token'");
+  },
+});
+
+// One fixed key for the whole install: api, worker and browser-worker all migrate on boot,
+// and only one of them may run the chain at a time.
+const MIGRATION_LOCK_KEY = 727_100;
+
+async function migratePg(d: SqlDriver, pool: pg.Pool): Promise<void> {
+  // The lock lives on its own client for the whole pass — the pooled queries the migrations
+  // themselves make must not be the session that holds it. Applied ids are read only after
+  // the lock is ours: the loser of a simultaneous boot sees the winner's finished chain.
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_KEY]);
+    await d.exec("CREATE TABLE IF NOT EXISTS schema_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
+    const applied = new Set((await d.all<{ id: number }>("SELECT id FROM schema_migrations")).map((r) => r.id));
+    for (const m of PG_MIGRATIONS) {
+      if (applied.has(m.id)) continue;
+      await d.transaction(async () => {
+        await m.up(d);
+        await d.run("INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)", [m.id, m.name, now()]);
+      });
+    }
+  } finally {
+    try {
+      await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY]);
+    } catch {
+      /* session teardown releases it anyway */
+    }
+    client.release();
   }
 }

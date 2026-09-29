@@ -10,8 +10,13 @@ import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/i
  *   3. a "Log in / Sign up" element is visible        → signed out
  *   4. a session cookie whose name starts with the    → signed in
  *      configured name (sites chunk cookies into .0 .1)
- *   5. we are on the app page and nothing says otherwise → signed in
- * Cookies never vote "signed out" on their own: names change, pages don't lie.
+ *   5. the configured composer is on the page          → signed in
+ *   6. signed-in markers are configured but absent     → unknown
+ *   7. nothing is configured to judge by              → signed in
+ * Cookies never vote "signed out" on their own: names change, pages don't lie. And a page
+ * missing every marker the provider promised never votes "signed in": an unrecognised
+ * logged-out page masquerading as a session dies later as a generic chat timeout instead
+ * of an honest needs_login.
  */
 export async function detectLoginState(p: PlatformConfig, page: Page, extra: { unauthorized?: boolean } = {}): Promise<SessionStatus> {
   const url = page.url();
@@ -34,6 +39,11 @@ export async function detectLoginState(p: PlatformConfig, page: Page, extra: { u
     const cookies = await browser.cookies(p.cookieDomain || undefined);
     if (cookies.some((c) => c.name === p.sessionCookie || c.name.startsWith(p.sessionCookie + "."))) return "logged_in";
   }
+  if (p.composerSelector) {
+    const n = await page.locator(p.composerSelector).count().catch(() => 0);
+    if (n > 0) return "logged_in";
+  }
+  if (p.loggedInSelector || p.composerSelector) return "unknown";
   return "logged_in";
 }
 

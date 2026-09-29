@@ -21,6 +21,13 @@ describe("approval policy", () => {
     await policy.setApprovalMode("auto");
     assert.equal((await policy.policyFor("send_message")).mode, "auto");
     assert.equal((await policy.policyFor("deploy_production")).mode, "always");
+    // Reaching beyond a chat box asks even under the easy-going preset...
+    assert.equal((await policy.policyFor("run_action")).mode, "ask");
+    assert.equal((await policy.policyFor("dispatch_webhook")).mode, "ask");
+    // ...though an explicit override may still relax either to auto (their floor).
+    await policy.setPolicy("dispatch_webhook", "auto");
+    assert.equal((await policy.policyFor("dispatch_webhook")).mode, "auto");
+    await policy.setPolicy("dispatch_webhook", null);
     await policy.setApprovalMode("manual");
     assert.equal((await policy.policyFor("send_message")).mode, "ask");
     assert.equal((await policy.policyFor("run_action")).mode, "ask");

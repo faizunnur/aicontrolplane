@@ -7,8 +7,8 @@ import { addAudit, withOrg } from "../db.js";
 import { logger } from "../logger.js";
 import { liveViewers as liveViewersGauge } from "../metrics.js";
 import { browser, type BrowserSnapshot } from "./manager.js";
-import { acquireStream, applyCommand, lastFrame, refreshLevel, releaseStream, LEVEL_ORDER, QUALITY, type Level, type Meta, type Sink } from "./live-stream.js";
-import { LIVE_CTL_CHANNEL, LIVE_FRAME_CHANNEL } from "./live-relay.js";
+import { acquireStream, applyCommand, refreshLevel, releaseStream, LEVEL_ORDER, QUALITY, type Level, type Meta, type Sink } from "./live-stream.js";
+import { LIVE_CTL_CHANNEL, LIVE_STATE_CHANNEL } from "./live-relay.js";
 
 /*
   The live browser view. One WebSocket per open UI (`/live`).
@@ -16,7 +16,8 @@ import { LIVE_CTL_CHANNEL, LIVE_FRAME_CHANNEL } from "./live-relay.js";
   Frames come from Chromium's screencast: a JPEG for every repaint, nothing when the page is
   still, sent as binary messages. Everything else is small JSON (see the protocol below).
   When this process holds the browser the frames come straight from live-stream.ts; when it
-  is a bare api, they arrive over Redis from the browser worker's relay, and viewer commands
+  is a bare api, they arrive over Redis from the browser worker's relay — one channel per
+  (workspace, tab), subscribed only while someone here is watching it — and viewer commands
   travel the other way. The socket's owner never needs to know which.
 
     server → client
@@ -36,6 +37,8 @@ const log = logger("live-view");
 
 /** Frames are dropped for a client whose socket already holds this many bytes unsent. */
 const MAX_BUFFERED = 1_500_000;
+/** Viewer sockets are pinged this often; a missed pong means a dead peer and the socket is cut. */
+const PING_MS = 30_000;
 
 const localBrowser = config.role === "all" || config.role === "browser";
 const remote = !localBrowser && !!config.redisUrl;
@@ -53,22 +56,48 @@ interface Client {
   attached: string | null;
   sink: Sink | null;
   lastMetaKey: string | null;
+  /** Answered the last ping. */
+  alive: boolean;
 }
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 const clients = new Set<Client>();
 
-/** The browser state as this process knows it: local snapshots, or mirrored ones from the worker. */
-let snapshot: BrowserSnapshot | null = null;
-bus.on("browser", (snap: BrowserSnapshot) => {
-  snapshot = snap;
+/**
+ * The browser state as this process knows it. Local mode recomputes per viewer so each sees
+ * exactly their workspace's tabs. Remote mode keeps one mirrored snapshot PER WORKSPACE —
+ * they arrive org-tagged over the relay's state channel — and a viewer only ever gets their
+ * own workspace's; a workspace the worker has said nothing about sees an empty one.
+ */
+const remoteSnapshots = new Map<number, BrowserSnapshot>();
+const EMPTY_SNAPSHOT: BrowserSnapshot = { seq: 0, active: null, pages: [], busy: null, signIn: null, enabled: true, running: false, headless: true };
+
+let deliveringRemoteState = false;
+bus.on("browser", (snap: BrowserSnapshot, _id?: number, org?: number) => {
+  if (localBrowser) {
+    for (const c of clients) {
+      sendJson(c, { t: "state", browser: currentSnapshotFor(c) });
+      if (c.follow && targetOf(c) !== c.attached) void attach(c);
+    }
+    return;
+  }
+  // Remote: the state channel below is the org-tagged source; its own re-emit is already
+  // handled. Anything else that lands here without an org is fail-closed to the founding
+  // workspace rather than shown to everyone.
+  if (deliveringRemoteState) return;
+  acceptRemoteSnapshot(org ?? 1, snap);
+});
+
+function acceptRemoteSnapshot(org: number, snap: BrowserSnapshot) {
+  const prev = remoteSnapshots.get(org);
+  if (prev && typeof snap.seq === "number" && typeof prev.seq === "number" && snap.seq < prev.seq) return;
+  remoteSnapshots.set(org, snap);
   for (const c of clients) {
-    // Local mode recomputes per viewer so each sees exactly their workspace's tabs; the
-    // mirrored remote snapshot is a founding-workspace concern until the relay carries orgs.
-    sendJson(c, { t: "state", browser: currentSnapshotFor(c) });
+    if (c.orgId !== org) continue;
+    sendJson(c, { t: "state", browser: snap });
     if (c.follow && targetOf(c) !== c.attached) void attach(c);
   }
-});
+}
 
 export function liveViewers() {
   return clients.size;
@@ -84,16 +113,35 @@ function sendJson(c: Client, msg: unknown) {
 
 function currentSnapshotFor(c: Client): BrowserSnapshot {
   if (localBrowser) return withOrg(c.orgId, () => browser.snapshot());
-  return snapshot ?? { seq: 0, active: null, pages: [], busy: null, signIn: null, enabled: true, running: false, headless: true };
+  return remoteSnapshots.get(c.orgId) ?? EMPTY_SNAPSHOT;
 }
 
 function onConnect(ws: WebSocket, orgId: number) {
-  const client: Client = { ws, orgId, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null };
+  const client: Client = { ws, orgId, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null, alive: true };
   clients.add(client);
   liveViewersGauge.set(clients.size);
   log.info(`live view connected (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
   sendJson(client, { t: "state", browser: currentSnapshotFor(client) });
   void attach(client);
+
+  // A peer that vanished without a FIN (sleeping laptop, dead NAT entry) would otherwise
+  // hold its stream attachment — and its frame subscription — forever.
+  ws.on("pong", () => (client.alive = true));
+  const heartbeat = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    if (!client.alive) {
+      log.info("live view peer stopped answering pings; cutting it");
+      ws.terminate();
+      return;
+    }
+    client.alive = false;
+    try {
+      ws.ping();
+    } catch {
+      /* closing */
+    }
+  }, PING_MS);
+  heartbeat.unref?.();
 
   ws.on("message", (data, isBinary) => {
     if (isBinary) return;
@@ -106,9 +154,12 @@ function onConnect(ws: WebSocket, orgId: number) {
     handle(client, msg).catch((err: unknown) => log.warn("live command failed", err));
   });
   ws.on("close", () => {
+    clearInterval(heartbeat);
     clients.delete(client);
     liveViewersGauge.set(clients.size);
     detach(client);
+    // The last viewer of a workspace takes its mirrored snapshot with them.
+    if (remote && ![...clients].some((c) => c.orgId === client.orgId)) remoteSnapshots.delete(client.orgId);
     log.info(`live view left (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
   });
   ws.on("error", (err) => log.warn("live socket error", err));
@@ -155,8 +206,10 @@ async function attach(c: Client) {
     c.attached = platform;
     return;
   }
-  // Remote: count the want; the heartbeat tells the relay, frames arrive on the shared channel.
+  // Remote: count the want; the heartbeat tells the relay, and the stream's own frame
+  // channel is subscribed for as long as anyone here watches it.
   c.attached = platform;
+  retainFrames(c.orgId, platform);
   const cached = remoteLast.get(`${c.orgId}:${platform}`);
   if (cached) deliverTo(c, cached.frame, cached.meta, true);
   publishWants();
@@ -165,6 +218,7 @@ async function attach(c: Client) {
 function detach(c: Client) {
   if (!c.attached) return;
   if (localBrowser && c.sink) releaseStream(c.orgId, c.attached, c.sink);
+  if (remote) releaseFrames(c.orgId, c.attached);
   c.attached = null;
   c.sink = null;
   c.lastMetaKey = null;
@@ -174,10 +228,46 @@ function detach(c: Client) {
 /* ---------- the remote transport (api process without a browser) ---------- */
 
 import type { Redis } from "ioredis";
-import { keepSubscribed, resilientRedis } from "../../packages/realtime/src/index.js";
+import { liveFrameChannel, resilientRedis, unpackEnvelope } from "../../packages/realtime/src/index.js";
 
+/** Last frame per remote stream, so a fresh viewer sees something before the next repaint. Held only while the stream has a subscription. */
 const remoteLast = new Map<string, { frame: Buffer; meta: Meta }>();
+/** Viewers attached per remote stream key "org:platform" — the frame-channel refcount. */
+const frameWants = new Map<string, number>();
+/** Channels this process wants subscribed; re-asserted after every reconnect. */
+const desiredChannels = new Set<string>();
 let ctlPub: Redis | null = null;
+let remoteSub: Redis | null = null;
+
+function subscribeNow(channels: string[]) {
+  if (remoteSub && remoteSub.status === "ready" && channels.length) remoteSub.subscribe(...channels).catch(() => undefined);
+}
+
+function retainFrames(org: number, platform: string) {
+  const key = `${org}:${platform}`;
+  const n = (frameWants.get(key) ?? 0) + 1;
+  frameWants.set(key, n);
+  if (n === 1) {
+    const ch = liveFrameChannel(org, platform);
+    desiredChannels.add(ch);
+    subscribeNow([ch]);
+  }
+}
+
+function releaseFrames(org: number, platform: string) {
+  const key = `${org}:${platform}`;
+  const n = (frameWants.get(key) ?? 0) - 1;
+  if (n > 0) {
+    frameWants.set(key, n);
+    return;
+  }
+  frameWants.delete(key);
+  const ch = liveFrameChannel(org, platform);
+  desiredChannels.delete(ch);
+  remoteSub?.unsubscribe(ch).catch(() => undefined);
+  // The cached frame goes with the subscription: nothing keeps stale tabs in heap.
+  remoteLast.delete(key);
+}
 
 function wantedNow(): { org: number; platform: string; level: Level }[] {
   const byKey = new Map<string, { org: number; platform: string; level: Level }>();
@@ -199,26 +289,60 @@ function publishWants() {
 if (remote) {
   const onError = (err: unknown) => log.warn("live remote transport error", err);
   ctlPub = resilientRedis(config.redisUrl, onError);
-  const frameSub = resilientRedis(config.redisUrl, onError);
-  void keepSubscribed(frameSub, LIVE_FRAME_CHANNEL, onError);
-  frameSub.on("message", (_ch: string, raw: string) => {
+  const sub = resilientRedis(config.redisUrl, onError);
+  remoteSub = sub;
+  desiredChannels.add(LIVE_STATE_CHANNEL);
+  sub.on("ready", () => subscribeNow([...desiredChannels]));
+  subscribeNow([...desiredChannels]);
+
+  // One buffer-mode handler for both kinds of message: the state channel carries small
+  // JSON, a frame channel carries a header line plus the raw JPEG bytes.
+  sub.on("messageBuffer", (channel: Buffer, raw: Buffer) => {
     try {
-      const msg = JSON.parse(raw) as { org?: number; platform: string; meta?: Meta; metaChanged?: boolean; data?: string; error?: string };
-      const org = Number(msg.org) || 1;
-      if (msg.error) {
-        for (const c of clients) if (c.orgId === org && c.attached === msg.platform) sendJson(c, { t: "error", message: msg.error });
+      const ch = channel.toString();
+      if (ch === LIVE_STATE_CHANNEL) {
+        const { org, snap } = JSON.parse(raw.toString()) as { org?: number; snap?: BrowserSnapshot };
+        if (!snap) return;
+        const orgId = Number(org) || 1;
+        acceptRemoteSnapshot(orgId, snap);
+        // Re-announce on the local bus, org and all, so the SSE stream delivers the
+        // snapshot to that workspace's dashboards too. The flag stops our own handler
+        // above from treating the echo as a second, org-less source.
+        deliveringRemoteState = true;
+        try {
+          bus.emit("browser", snap, undefined, orgId);
+        } finally {
+          deliveringRemoteState = false;
+        }
         return;
       }
-      if (!msg.data || !msg.meta) return;
-      const frame = Buffer.from(msg.data, "base64");
-      remoteLast.set(`${org}:${msg.platform}`, { frame, meta: msg.meta });
-      for (const c of clients) if (c.orgId === org && c.attached === msg.platform) deliverTo(c, frame, msg.meta, !!msg.metaChanged);
+      const { header, body } = unpackEnvelope(raw);
+      const platform = String(header.platform ?? "");
+      const org = Number(header.org) || 1;
+      if (!platform) return;
+      if (typeof header.error === "string") {
+        for (const c of clients) if (c.orgId === org && c.attached === platform) sendJson(c, { t: "error", message: header.error });
+        return;
+      }
+      const meta = header.meta as Meta | undefined;
+      if (!body.length || !meta) return;
+      const key = `${org}:${platform}`;
+      if (frameWants.has(key)) remoteLast.set(key, { frame: body, meta });
+      for (const c of clients) if (c.orgId === org && c.attached === platform) deliverTo(c, body, meta, !!header.metaChanged);
     } catch (err) {
       onError(err);
     }
   });
+
   const beat = setInterval(publishWants, 3_000);
   beat.unref?.();
+
+  // Belt and braces: a cached frame whose subscription is gone (an unsubscribe raced an
+  // in-flight message) must not sit in heap forever.
+  const sweep = setInterval(() => {
+    for (const key of remoteLast.keys()) if (!frameWants.has(key)) remoteLast.delete(key);
+  }, 15_000);
+  sweep.unref?.();
 }
 
 /* ---------- commands from the UI ---------- */

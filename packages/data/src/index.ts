@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
+import { hostname } from "node:os";
 import type Database from "better-sqlite3";
 import type {
   AgentDelivery,
@@ -25,7 +27,7 @@ import type {
   Task,
   TaskSource,
 } from "../../core/src/index.js";
-import { TERMINAL_RUN_STATUSES } from "../../core/src/index.js";
+import { ACTIVE_RUN_STATUSES, TERMINAL_RUN_STATUSES } from "../../core/src/index.js";
 import type { SqlDriver } from "./driver.js";
 import { openSqlite } from "./sqlite.js";
 import { openPg } from "./pg.js";
@@ -90,9 +92,10 @@ function oid(): number {
   if (!sc) {
     // Unit tests drive this layer directly and node:test re-enters its own async scope, so an
     // ALS entered at file top level never reaches the callbacks. The spawned-server e2e suite
-    // does NOT set this, so fail-closed stays proven where it matters: end to end.
+    // does NOT set this, so fail-closed stays proven where it matters: end to end. A stray
+    // env var must never open this door in production.
     const t = process.env.ACP_TEST_DEFAULT_ORG;
-    if (t) return Number(t);
+    if (t && process.env.NODE_ENV !== "production") return Number(t);
     throw new Error("tenant query outside a workspace scope (wrap the caller in withOrg)");
   }
   if ("system" in sc) throw new Error("tenant query under systemScope: use the *All variant and adopt the row's org");
@@ -111,40 +114,109 @@ export function enterOrgScopeForTests(orgId: number): void {
  * Every announced change is first appended to the outbox — the durable, ordered event log
  * with a monotonic id (the replay cursor for reconnecting clients, and what a relay tails
  * to carry events across instances) — then handed to the wired announcer (the in-process
- * bus today). A log append failing must never break the write it describes.
+ * bus today). A log append failing must never break the write it describes, but it is
+ * never silent either: the failure is logged and the bus still hears the event (without a
+ * replay cursor). published_at stays NULL on insert; nothing publishes downstream yet.
  */
+type OutboxEntry = { topic: string; payload: unknown; orgId: number };
+const OUTBOX_FLUSH_MS = 20;
+const OUTBOX_FLUSH_COUNT = 100;
+const OUTBOX_BUFFER_MAX = 5000;
+const outboxBuffer: OutboxEntry[] = [];
+let outboxTimer: NodeJS.Timeout | null = null;
 let outboxChain: Promise<void> = Promise.resolve();
+
 const notify: Notify = (topic, payload) => {
-  // Appends and emits are chained so events keep their write order — outbox ids are the
-  // replay cursor, and an inversion (finish logged before start) would corrupt every
-  // reconnecting client's view. The org is captured HERE, synchronously: the chained
-  // continuation runs outside the caller's scope. Announcements from org-less paths (boot,
-  // maintenance) belong to the founding workspace.
+  // The org is captured HERE, synchronously: the flush runs outside the caller's scope.
+  // Announcements from org-less paths (boot, maintenance) belong to the founding workspace.
+  // Buffered entries flush as one batched insert — every ~20ms, or sooner when enough pile
+  // up — and flushes are chained, so ids keep the write order (an inversion, finish logged
+  // before start, would corrupt every reconnecting client's view).
   const orgId = currentOrgId() ?? 1;
-  outboxChain = outboxChain.then(async () => {
-    const id = await appendOutbox(topic, payload, orgId).catch(() => undefined);
-    try {
-      _notify(topic, payload, id ?? undefined, orgId);
-    } catch {
-      /* an announcement failing must never break the write it announces */
+  outboxBuffer.push({ topic, payload, orgId });
+  if (outboxBuffer.length > OUTBOX_BUFFER_MAX) {
+    // A consumer this far behind cannot be replayed to honestly; drop the oldest and tell
+    // each affected workspace's clients to refetch instead of trusting the stream.
+    const dropped = outboxBuffer.splice(0, outboxBuffer.length - OUTBOX_BUFFER_MAX);
+    console.warn(`[data] outbox buffer overflow: dropped ${dropped.length} oldest entr${dropped.length === 1 ? "y" : "ies"}`);
+    for (const org of new Set(dropped.map((e) => e.orgId))) {
+      try {
+        _notify("resync", { org }, undefined, org);
+      } catch {
+        /* an announcement failing must never break the write it announces */
+      }
     }
-  });
+  }
+  if (outboxBuffer.length >= OUTBOX_FLUSH_COUNT) {
+    if (outboxTimer) {
+      clearTimeout(outboxTimer);
+      outboxTimer = null;
+    }
+    queueOutboxFlush();
+  } else if (!outboxTimer) {
+    outboxTimer = setTimeout(() => {
+      outboxTimer = null;
+      queueOutboxFlush();
+    }, OUTBOX_FLUSH_MS);
+    outboxTimer.unref?.(); // a pending flush must not keep a test or a draining process alive
+  }
 };
+
+function queueOutboxFlush(): void {
+  outboxChain = outboxChain.then(flushOutboxBuffer);
+}
+
+async function flushOutboxBuffer(): Promise<void> {
+  while (outboxBuffer.length) {
+    const batch = outboxBuffer.splice(0, OUTBOX_FLUSH_COUNT);
+    const rows = batch.map((e) => {
+      let body: string | null = null;
+      try {
+        body = e.payload === undefined ? null : JSON.stringify(e.payload);
+      } catch {
+        body = null;
+      }
+      return { ...e, body };
+    });
+    // Insert the whole batch in one statement (pg) or one transaction (sqlite); either way
+    // each entry learns its own id, in order — outbox ids ARE the SSE replay cursor.
+    let ids: (number | undefined)[] = rows.map(() => undefined);
+    const ts = now();
+    try {
+      if (!q) throw new Error("data layer not initialised");
+      if (q.kind === "pg") {
+        const placeholders = rows.map(() => "(?, ?, ?, ?)").join(", ");
+        const params = rows.flatMap((r) => [r.orgId, r.topic, r.body, ts]);
+        const returned = await q.all<{ id: number }>(`INSERT INTO outbox (org_id, topic, payload, created_at) VALUES ${placeholders} RETURNING id`, params);
+        ids = returned.map((r) => r.id).sort((a, b) => a - b);
+      } else {
+        ids = await q.transaction(async () => {
+          const out: number[] = [];
+          for (const r of rows) out.push((await q.get<{ id: number }>("INSERT INTO outbox (org_id, topic, payload, created_at) VALUES (?, ?, ?, ?) RETURNING id", [r.orgId, r.topic, r.body, ts]))!.id);
+          return out;
+        });
+      }
+    } catch (err) {
+      console.error("[data] outbox append failed; events emitted without replay ids:", err instanceof Error ? err.message : err);
+    }
+    for (let i = 0; i < rows.length; i++) {
+      try {
+        _notify(rows[i].topic, rows[i].payload, ids[i], rows[i].orgId);
+      } catch {
+        /* an announcement failing must never break the write it announces */
+      }
+    }
+  }
+}
 
 /** Settles once every announcement queued so far has been logged and emitted (tests, shutdown drains). */
 export async function flushNotifications(): Promise<void> {
-  await outboxChain;
-}
-
-async function appendOutbox(topic: string, payload: unknown, orgId: number): Promise<number | undefined> {
-  let body: string | null = null;
-  try {
-    body = payload === undefined ? null : JSON.stringify(payload);
-  } catch {
-    body = null;
+  if (outboxTimer) {
+    clearTimeout(outboxTimer);
+    outboxTimer = null;
   }
-  const row = await q.get<{ id: number }>("INSERT INTO outbox (org_id, topic, payload, created_at, published_at) VALUES (?, ?, ?, ?, ?) RETURNING id", [orgId, topic, body, now(), now()]);
-  return row?.id;
+  queueOutboxFlush();
+  await outboxChain;
 }
 
 /** One workspace's outbox entries after a cursor, oldest first — the replay path for reconnecting consumers. */
@@ -194,6 +266,7 @@ export async function initData(opts: InitDataOptions): Promise<void> {
 }
 
 export async function closeData(): Promise<void> {
+  await flushNotifications(); // the unref'd timer may still owe a flush
   if (q) await q.close();
 }
 
@@ -277,12 +350,16 @@ export async function listTasks(opts: { platform?: string; agent_id?: number; in
   const limit = Math.min(Math.max(opts.limit ?? 500, 1), 2000);
   const sql = `SELECT t.* FROM tasks t ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY t.platform, t.name LIMIT ?`;
   const tasks = await q.all<Task>(sql, [...params, limit]);
-  const out: TaskWithLastRun[] = [];
-  for (const t of tasks) {
-    const last = await q.get<Run>(`SELECT * FROM runs WHERE task_id = ? AND org_id = ? ORDER BY COALESCE(finished_at, started_at, created_at) DESC LIMIT 1`, [t.id, oid()]);
-    out.push({ ...t, last_run: last ?? null });
-  }
-  return out;
+  if (!tasks.length) return [];
+  // One window-function pass for every task's newest run, not a query per task. Newest by
+  // (created_at, id), which the runs_org_task_created index serves directly.
+  const lastRuns = await q.all<Run & { rn: number }>(
+    `SELECT * FROM (SELECT r.*, ROW_NUMBER() OVER (PARTITION BY r.task_id ORDER BY r.created_at DESC, r.id DESC) AS rn FROM runs r WHERE r.org_id = ? AND r.task_id IS NOT NULL) ranked WHERE rn = 1`,
+    [oid()],
+  );
+  const byTask = new Map<number, Run>();
+  for (const { rn: _rn, ...run } of lastRuns) byTask.set(run.task_id!, run as Run);
+  return tasks.map((t) => ({ ...t, last_run: byTask.get(t.id) ?? null }));
 }
 
 export async function getTask(id: number): Promise<Task | undefined> {
@@ -343,31 +420,40 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
     notify("task", t);
     return t;
   }
-  const row = await q.get<{ id: number }>(
-    `INSERT INTO tasks (org_id, platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, keywords, delivery, agent_id, prompt, next_run, configuration, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-    [
-      oid(),
-      input.platform,
-      input.key,
-      input.name ?? input.key,
-      input.source ?? "registry",
-      input.purpose ?? null,
-      input.schedule ?? null,
-      input.native_url ?? null,
-      input.status ?? null,
-      input.enabled === false ? 0 : 1,
-      meta ?? null,
-      input.keywords ?? null,
-      sealedDelivery ? JSON.stringify(sealedDelivery) : null,
-      input.agent_id ?? null,
-      input.prompt ?? null,
-      input.next_run ?? null,
-      conf ?? null,
-      ts,
-      ts,
-    ],
-  );
+  let row: { id: number } | undefined;
+  try {
+    row = await q.get<{ id: number }>(
+      `INSERT INTO tasks (org_id, platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, keywords, delivery, agent_id, prompt, next_run, configuration, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      [
+        oid(),
+        input.platform,
+        input.key,
+        input.name ?? input.key,
+        input.source ?? "registry",
+        input.purpose ?? null,
+        input.schedule ?? null,
+        input.native_url ?? null,
+        input.status ?? null,
+        input.enabled === false ? 0 : 1,
+        meta ?? null,
+        input.keywords ?? null,
+        sealedDelivery ? JSON.stringify(sealedDelivery) : null,
+        input.agent_id ?? null,
+        input.prompt ?? null,
+        input.next_run ?? null,
+        conf ?? null,
+        ts,
+        ts,
+      ],
+    );
+  } catch (err) {
+    // Two simultaneous upserts of one (platform, key): the unique index lets one insert in;
+    // the loser re-reads and takes the update path it would have taken a moment later.
+    const raced = await findTask(input.platform, input.key);
+    if (raced) return upsertTask(input);
+    throw err;
+  }
   const t = (await getTask(row!.id))!;
   notify("task", t);
   return t;
@@ -454,30 +540,41 @@ export async function recordRun(input: RecordRunInput): Promise<{ run: Run; crea
       return { run, created: false };
     }
   }
-  const row = await q.get<{ id: number }>(
-    `INSERT INTO runs (org_id, task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-    [
-      oid(),
-      input.task_id,
-      input.agent_id ?? task?.agent_id ?? null,
-      provider,
-      input.kind ?? "external",
-      input.trigger ?? "push",
-      label,
-      input.external_id ?? null,
-      input.status,
-      input.started_at ?? null,
-      input.finished_at ?? null,
-      input.summary ?? null,
-      input.details ?? null,
-      input.output_url ?? null,
-      input.error ?? null,
-      input.source,
-      raw,
-      now(),
-    ],
-  );
+  let row: { id: number } | undefined;
+  try {
+    row = await q.get<{ id: number }>(
+      `INSERT INTO runs (org_id, task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      [
+        oid(),
+        input.task_id,
+        input.agent_id ?? task?.agent_id ?? null,
+        provider,
+        input.kind ?? "external",
+        input.trigger ?? "push",
+        label,
+        input.external_id ?? null,
+        input.status,
+        input.started_at ?? null,
+        input.finished_at ?? null,
+        input.summary ?? null,
+        input.details ?? null,
+        input.output_url ?? null,
+        input.error ?? null,
+        input.source,
+        raw,
+        now(),
+      ],
+    );
+  } catch (err) {
+    // Two simultaneous reports of one (task, external_id): the unique index lets one insert
+    // in; the loser re-reads and takes the update path it would have taken a moment later.
+    if (input.external_id && input.task_id) {
+      const raced = await q.get<Run>("SELECT id FROM runs WHERE task_id = ? AND external_id = ? AND org_id = ?", [input.task_id, input.external_id, oid()]);
+      if (raced) return recordRun(input);
+    }
+    throw err;
+  }
   const run = (await getRun(row!.id))!;
   notify("run", run);
   return { run, created: true };
@@ -692,7 +789,9 @@ export async function listRuns(opts: { limit?: number; task_id?: number; status?
     params.push(opts.since);
   }
   const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
-  return q.all<RunRow>(`${RUN_SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY COALESCE(r.finished_at, r.started_at, r.created_at) DESC LIMIT ?`, [...params, limit]);
+  // Newest by (created_at, id) rather than by COALESCE over three timestamps: the same list
+  // for anything but long-lived backfills, and one the runs indexes can actually serve.
+  return q.all<RunRow>(`${RUN_SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY r.created_at DESC, r.id DESC LIMIT ?`, [...params, limit]);
 }
 
 /* ---------- run events (the timeline) ---------- */
@@ -719,6 +818,9 @@ export async function addRunEvent(runId: number, input: RunEventInput): Promise<
     input.detail ?? null,
     input.metadata === undefined ? null : JSON.stringify(input.metadata),
   ]);
+  // Denormalized for lists: the run row itself carries the step it is on, so a page of many
+  // runs never folds every timeline.
+  if (input.type === "step" && input.label) await q.run("UPDATE runs SET current_step = ? WHERE id = ? AND org_id = ?", [input.label, runId, oid()]);
   const ev = (await q.get<RunEvent>("SELECT * FROM run_events WHERE id = ?", [row!.id]))!;
   notify("run-event", ev);
   return ev;
@@ -805,11 +907,12 @@ export interface EventInput {
 
 /** Returns the event, or null when dedupe_key already exists. */
 export async function addEvent(input: EventInput): Promise<EventRow | null> {
-  if (input.dedupe_key) {
-    const dup = await q.get("SELECT id FROM events WHERE dedupe_key = ? AND org_id = ?", [input.dedupe_key, oid()]);
-    if (dup) return null;
-  }
-  const row = await q.get<{ id: number }>(`INSERT INTO events (org_id, platform, kind, title, body, link, read, occurred_at, created_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?) RETURNING id`, [
+  // Dedupe in the insert itself: under concurrency a SELECT-then-INSERT lets both writers
+  // through, and the loser used to surface a unique violation. On conflict no row returns.
+  const row = await q.get<{ id: number }>(
+    `INSERT INTO events (org_id, platform, kind, title, body, link, read, occurred_at, created_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+     ON CONFLICT (org_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING id`,
+    [
     oid(),
     input.platform ?? null,
     input.kind,
@@ -820,7 +923,8 @@ export async function addEvent(input: EventInput): Promise<EventRow | null> {
     now(),
     input.dedupe_key ?? null,
   ]);
-  const ev = (await q.get<EventRow>("SELECT * FROM events WHERE id = ?", [row!.id]))!;
+  if (!row) return null;
+  const ev = (await q.get<EventRow>("SELECT * FROM events WHERE id = ?", [row.id]))!;
   notify("notification", ev);
   return ev;
 }
@@ -923,10 +1027,27 @@ export async function setSetting(key: string, value: string): Promise<void> {
   settingCache.delete(`${oid()}:${key}`);
 }
 
-/** Which workspace an agent's ingest token belongs to. Global by nature: the token IS the lookup key. */
+/** sha256 hex — how bearer credentials in this layer are stored and looked up. */
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/**
+ * Which workspace an agent's ingest token belongs to. Global by nature: the token IS the
+ * lookup key. Stored as sha256 hex (migration 14/108), so the presented plaintext is hashed
+ * before the indexed lookup — the database never holds or scans the secret itself.
+ */
 export async function findOrgIdByIngestToken(token: string): Promise<number | undefined> {
-  const r = await q.get<{ org_id: number }>("SELECT org_id FROM settings WHERE key = 'ingest_token' AND value = ?", [token]);
+  const r = await q.get<{ org_id: number }>("SELECT org_id FROM settings WHERE key = 'ingest_token' AND value = ?", [sha256(token)]);
   return r?.org_id;
+}
+
+/** Store this workspace's ingest token — hashed; the plaintext is the caller's to show once. */
+export async function setIngestToken(plaintext: string): Promise<void> {
+  await setSetting("ingest_token", sha256(plaintext));
+}
+
+/** Whether this workspace has an ingest token at all. The secret itself is never readable back. */
+export async function hasIngestToken(): Promise<boolean> {
+  return (await getSetting("ingest_token")) !== undefined;
 }
 
 /**
@@ -1631,10 +1752,114 @@ export async function runStats(days = 14): Promise<DayStat[]> {
   return out;
 }
 
+/* ---------- operational helpers (leases, quotas, provider claims, retention) ---------- */
+
+/** Renew a running run's lease: lease_expires_at moves ttlMs into the future and locked_by names the holder (this host by default). */
+export async function heartbeatRun(id: number, ttlMs: number, owner: string = hostname()): Promise<void> {
+  await q.run("UPDATE runs SET lease_expires_at = ?, locked_by = ? WHERE id = ? AND org_id = ? AND status = 'running'", [new Date(Date.now() + ttlMs).toISOString(), owner, id, oid()]);
+}
+
+/** Messages stuck mid-flight: still needs_assignment/assigned past the cutoff with no run, or a run that is no longer running/queued. */
+export async function stuckMessages(cutoffIso: string): Promise<MessageRow[]> {
+  return q.all<MessageRow>(
+    `SELECT m.* FROM messages m LEFT JOIN runs r ON r.id = m.run_id
+     WHERE m.org_id = ? AND m.status IN ('needs_assignment', 'assigned') AND m.created_at < ?
+       AND (m.run_id IS NULL OR r.status NOT IN ('running', 'queued'))`,
+    [oid(), cutoffIso],
+  );
+}
+
+/** How many of this workspace's runs are still in a non-terminal status — the concurrency-quota gate. */
+export async function activeRunCount(): Promise<number> {
+  return (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE org_id = ? AND status IN (${ACTIVE_RUN_STATUSES.map(() => "?").join(",")})`, [oid(), ...ACTIVE_RUN_STATUSES]))!.n;
+}
+
+/** How many runs this workspace has created since the timestamp — the daily-quota gate. */
+export async function runCountSince(iso: string): Promise<number> {
+  return (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM runs WHERE org_id = ? AND created_at >= ?", [oid(), iso]))!.n;
+}
+
+/** This workspace's quota limits, from orgs.quotas JSON. Absent, null or unparseable means unlimited. */
+export async function orgQuotas(): Promise<{ maxConcurrentRuns?: number; maxRunsPerDay?: number }> {
+  const row = await q.get<{ quotas: string | null }>("SELECT quotas FROM orgs WHERE id = ?", [oid()]);
+  if (!row?.quotas) return {};
+  try {
+    const parsed = JSON.parse(row.quotas) as Record<string, unknown>;
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+    return { maxConcurrentRuns: num(parsed.maxConcurrentRuns), maxRunsPerDay: num(parsed.maxRunsPerDay) };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Take the per-(workspace, platform) claim that lets exactly one browser worker drive a
+ * provider session. One atomic upsert: it succeeds when no claim exists, the claim expired,
+ * or this owner already holds it — and then carries the new expiry. Returns whether the
+ * claim is now this owner's.
+ */
+export async function claimProvider(platformId: string, owner: string, ttlMs: number): Promise<boolean> {
+  const res = await q.run(
+    `INSERT INTO provider_claims (org_id, platform_id, owner, expires_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (org_id, platform_id) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
+     WHERE provider_claims.owner = excluded.owner OR provider_claims.expires_at <= ?`,
+    [oid(), platformId, owner, new Date(Date.now() + ttlMs).toISOString(), now()],
+  );
+  return res.changes > 0;
+}
+
+/** Push the claim's expiry forward — only while this owner still holds it. */
+export async function renewProviderClaim(platformId: string, owner: string, ttlMs: number): Promise<boolean> {
+  return (await q.run("UPDATE provider_claims SET expires_at = ? WHERE org_id = ? AND platform_id = ? AND owner = ?", [new Date(Date.now() + ttlMs).toISOString(), oid(), platformId, owner])).changes > 0;
+}
+
+/** Give the claim up — only when it is still this owner's to give. */
+export async function releaseProviderClaim(platformId: string, owner: string): Promise<void> {
+  await q.run("DELETE FROM provider_claims WHERE org_id = ? AND platform_id = ? AND owner = ?", [oid(), platformId, owner]);
+}
+
+/**
+ * Age out this workspace's history: timeline events of settled runs, notifications, audit
+ * and sync-log rows past their window, and the raw provider payload on long-settled runs.
+ * Every delete works in bounded batches (id IN a LIMITed subquery) so no pass ever holds a
+ * long transaction. Returns how many rows each table lost (and how many runs lost raw).
+ */
+export async function pruneRetention(opts: { runEventsDays?: number; eventsDays?: number; auditDays?: number; syncLogDays?: number; stripRawDays?: number }): Promise<Record<string, number>> {
+  const org = oid();
+  const cutoff = (days: number) => new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
+  const terminal = TERMINAL_RUN_STATUSES.map(() => "?").join(",");
+  const BATCH = 500;
+  const batched = async (sql: string, params: unknown[]): Promise<number> => {
+    let total = 0;
+    for (;;) {
+      const n = (await q.run(sql, params)).changes;
+      total += n;
+      if (n < BATCH) return total;
+    }
+  };
+  const out: Record<string, number> = {};
+  if (opts.runEventsDays !== undefined) {
+    out.run_events = await batched(
+      `DELETE FROM run_events WHERE id IN (SELECT e.id FROM run_events e JOIN runs r ON r.id = e.run_id WHERE e.org_id = ? AND e.at < ? AND r.status IN (${terminal}) LIMIT ${BATCH})`,
+      [org, cutoff(opts.runEventsDays), ...TERMINAL_RUN_STATUSES],
+    );
+  }
+  if (opts.eventsDays !== undefined) out.events = await batched(`DELETE FROM events WHERE id IN (SELECT id FROM events WHERE org_id = ? AND created_at < ? LIMIT ${BATCH})`, [org, cutoff(opts.eventsDays)]);
+  if (opts.auditDays !== undefined) out.audit_log = await batched(`DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE org_id = ? AND at < ? LIMIT ${BATCH})`, [org, cutoff(opts.auditDays)]);
+  if (opts.syncLogDays !== undefined) out.sync_log = await batched(`DELETE FROM sync_log WHERE id IN (SELECT id FROM sync_log WHERE org_id = ? AND started_at < ? LIMIT ${BATCH})`, [org, cutoff(opts.syncLogDays)]);
+  if (opts.stripRawDays !== undefined) {
+    out.runs_raw_stripped = await batched(
+      `UPDATE runs SET raw = NULL WHERE id IN (SELECT id FROM runs WHERE org_id = ? AND raw IS NOT NULL AND status IN (${terminal}) AND finished_at < ? LIMIT ${BATCH})`,
+      [org, ...TERMINAL_RUN_STATUSES, cutoff(opts.stripRawDays)],
+    );
+  }
+  return out;
+}
+
 /** Last few run statuses per task, newest first, for the history dots on the tasks table. */
 export async function recentStatusesByTask(limit = 6): Promise<Record<number, string[]>> {
   const rows = await q.all<{ task_id: number; status: string }>(
-    `SELECT task_id, status FROM (SELECT task_id, status, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY COALESCE(finished_at, started_at, created_at) DESC) AS rn FROM runs WHERE task_id IS NOT NULL AND org_id = ?) ranked WHERE rn <= ?`,
+    `SELECT task_id, status FROM (SELECT task_id, status, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY created_at DESC, id DESC) AS rn FROM runs WHERE task_id IS NOT NULL AND org_id = ?) ranked WHERE rn <= ?`,
     [oid(), limit],
   );
   const out: Record<number, string[]> = {};

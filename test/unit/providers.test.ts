@@ -1,8 +1,11 @@
 import "../helpers/env.js";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { Page } from "playwright";
+import type { PlatformConfig } from "../../packages/core/src/index.js";
 
 const { getProvider, listProviders, providerView } = await import("../../src/providers/registry.js");
+const { detectLoginState } = await import("../../src/providers/browser/login.js");
 const { UnsupportedOperationError } = await import("../../src/providers/types.js");
 const { savePlatformOverride, deletePlatformOverride } = await import("../../src/platforms.js");
 const { normalizePayloads } = await import("../../src/providers/browser/normalize.js");
@@ -96,5 +99,37 @@ describe("provider registry", () => {
     assert.equal(withHook.runs[0].output_url, "https://chatgpt.com/c/zzz");
     const without = normalizePayloads(getProvider("claude")!.config(), [payload]);
     assert.equal(without.runs[0].output_url, null);
+  });
+});
+
+describe("login detection", () => {
+  // A page is its answers to the selectors the detector asks about; nothing else matters here.
+  const fakePage = (opts: { url?: string; present?: string[] } = {}): Page =>
+    ({
+      url: () => opts.url ?? "https://muse.example/app",
+      locator: (sel: string) => ({
+        count: async () => (opts.present?.includes(sel) ? 1 : 0),
+        first: () => ({ isVisible: async () => opts.present?.includes(sel) ?? false }),
+      }),
+    }) as unknown as Page;
+  const platform = (over: Partial<PlatformConfig> = {}): PlatformConfig =>
+    ({ loginUrlPatterns: ["/login"], loggedInSelector: "nav .me", loggedOutSelector: "", sessionCookie: "", cookieDomain: "", composerSelector: "textarea" as string, ...over }) as unknown as PlatformConfig;
+
+  it("believes the page's own signed-in evidence", async () => {
+    assert.equal(await detectLoginState(platform(), fakePage({ present: ["nav .me"] })), "logged_in");
+    assert.equal(await detectLoginState(platform(), fakePage({ present: ["textarea"] })), "logged_in", "the configured composer is signed-in evidence too");
+    assert.equal(await detectLoginState(platform(), fakePage({ url: "https://muse.example/login" })), "needs_login");
+  });
+
+  it("a page missing every configured signed-in marker is unknown, never logged_in", async () => {
+    // The old default answered logged_in here, so an unrecognised logged-out page masqueraded
+    // as a session and the chat died with a generic timeout instead of needs_login.
+    assert.equal(await detectLoginState(platform(), fakePage()), "unknown");
+    assert.equal(await detectLoginState(platform({ composerSelector: "" }), fakePage()), "unknown");
+    assert.equal(await detectLoginState(platform({ loggedInSelector: "" }), fakePage()), "unknown");
+  });
+
+  it("a provider with no markers at all keeps the benefit of the doubt", async () => {
+    assert.equal(await detectLoginState(platform({ loggedInSelector: "", composerSelector: "" }), fakePage()), "logged_in");
   });
 });

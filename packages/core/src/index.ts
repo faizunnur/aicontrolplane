@@ -213,6 +213,8 @@ export interface Run {
   label: string | null;
   external_id: string | null;
   status: RunStatus;
+  /** Denormalized label of the step the run is on (written on step events), so lists never fold timelines. */
+  current_step: string | null;
   started_at: string | null;
   finished_at: string | null;
   summary: string | null;

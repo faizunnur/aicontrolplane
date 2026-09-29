@@ -1,15 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import { hostname } from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Cookie, type Page } from "playwright";
 import { bus } from "../bus.js";
 import { config } from "../config.js";
-import { currentOrgId, withOrg } from "../db.js";
+import { claimProvider, currentOrgId, releaseProviderClaim, renewProviderClaim, withOrg } from "../db.js";
 import { logger } from "../logger.js";
 import { browserContextsOpen, browserContextWaiters } from "../metrics.js";
 import { getPlatform } from "../platforms.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
-import { GPU_ARGS, resolveExecutable, stopChild, type BrowserSnapshot, type BusyTask, type DesktopSignIn } from "./manager.js";
+import { GPU_ARGS, launchWithSandboxFallback, resolveExecutable, sandboxArgs, stopChild, type BrowserSnapshot, type BusyTask, type DesktopSignIn } from "./manager.js";
 import { loadConnectionState, saveConnectionState, sliceStateForPlatform, type StorageStateLike } from "./session-store.js";
 
 const DESKTOP_SIGNIN_TIMEOUT_MS = Math.max(1, Number(process.env.DESKTOP_SIGNIN_TIMEOUT_MIN) || 10) * 60_000;
@@ -35,12 +36,43 @@ const log = logger("fleet");
 */
 
 const keyOf = (org: number, platform: string) => `${org}:${platform}`;
-const ambientOrg = () => currentOrgId() ?? 1;
+
+/*
+  The cross-worker session claim. The chains map serialises jobs INSIDE one process; with
+  several browser workers, the provider_claims row is what stops two of them driving one
+  workspace's logged-in account at once and clobbering each other's session blobs. A claim
+  is taken before a job touches the connection, renewed on a timer while the connection is
+  open, and released when the connection seals or closes. With one worker the claim always
+  succeeds (it is ours or free) — one upsert per job.
+*/
+const CLAIM_TTL_MS = 5 * 60_000;
+const CLAIM_RENEW_MS = 60_000;
+const claimOwner = `${hostname()}#${process.pid}`;
+
+/** Another worker holds this (workspace, provider) session. Deliver handlers rethrow it so the job retries per policy. */
+export class ProviderBusyError extends Error {
+  readonly code = "PROVIDER_BUSY";
+  constructor(platform: string) {
+    super(`${platform} is busy on another worker right now — it will be retried`);
+    this.name = "ProviderBusyError";
+  }
+}
+/**
+ * The ambient workspace. No scope means no browser: a silent default here would hand one
+ * workspace's browser view to another, so it fails closed exactly like the data layer —
+ * with the same unit-test escape hatch (node:test callbacks run outside any async scope).
+ */
+const ambientOrg = () => {
+  const org = currentOrgId();
+  if (org !== undefined) return org;
+  const t = process.env.ACP_TEST_DEFAULT_ORG;
+  if (t) return Number(t);
+  throw new Error("browser call outside a workspace scope (wrap the caller in withOrg)");
+};
 
 class FleetConnection {
   page: Page | null = null;
   title = "";
-  queue: Promise<unknown> = Promise.resolve();
   busy: BusyTask | null = null;
   lastUsed = Date.now();
   sealing = false;
@@ -97,7 +129,11 @@ export class FleetManager {
   private announce() {
     browserContextsOpen.set(this.connections.size);
     browserContextWaiters.set(this.waiters.length);
-    bus.emit("browser", this.snapshot());
+    // The bus payload doubles as the split-mode mirror, a founding-workspace concern until the
+    // relay carries orgs (src/browser/live.ts); unscoped paths (sweeper, shutdown) emit that
+    // view explicitly rather than borrowing whatever scope happens to be ambient.
+    const snap = currentOrgId() !== undefined ? this.snapshot() : withOrg(1, () => this.snapshot());
+    bus.emit("browser", snap);
   }
 
   canDesktopSignIn(): { ok: boolean; reason?: string } {
@@ -124,12 +160,13 @@ export class FleetManager {
     const job = (async () => {
       const tmpDir = path.join(config.dataDir, "desktop-tmp", `${org}-${platformId}-${Date.now()}`);
       let child: ChildProcess | null = null;
+      let ownedScreen = false; // the one shared display changed hands and must be handed back
       try {
         // Seed the throw-away profile with this workspace's cookies for the provider.
         fs.mkdirSync(tmpDir, { recursive: true });
         const raw = await withOrg(org, () => loadConnectionState(platformId));
         if (raw) {
-          const seedCtx = await chromium.launchPersistentContext(tmpDir, { headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage", "--password-store=basic"] });
+          const seedCtx = await launchWithSandboxFallback((sandbox) => chromium.launchPersistentContext(tmpDir, { headless: true, args: [...sandbox, "--disable-dev-shm-usage", "--password-store=basic"] }));
           try {
             const state = JSON.parse(raw) as StorageStateLike;
             const cookies = (state.cookies ?? []).filter((c) => c && c.name && c.domain);
@@ -150,13 +187,18 @@ export class FleetManager {
           `--window-size=${w},${h}`,
           "--window-position=0,0",
           "--lang=en-US",
-          ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage", ...GPU_ARGS] : []),
+          ...sandboxArgs(),
+          ...(process.platform === "linux" ? ["--disable-dev-shm-usage", ...GPU_ARGS] : []),
           url,
         ];
         log.info(`desktop sign-in for workspace ${org} / ${platformId}: opening ${exe.path} on ${process.env.DISPLAY ?? "the desktop"} (throw-away profile)`);
         child = spawn(exe.path, args, { stdio: "ignore", env: process.env });
         const state: DesktopSignIn = { platform: platformId, url, since: new Date().toISOString(), pid: child.pid ?? null };
         this.desktop = { org, state, done, job: job! };
+        ownedScreen = true;
+        // The screen changed hands: established VNC viewer sockets of the previous owner must
+        // not watch this workspace type a password. The server tears them down on this signal.
+        bus.emit("vnc-owner", { org });
         this.announce();
         child.on("exit", () => {
           if (this.desktop?.state === state) done.resolve("finished");
@@ -172,7 +214,7 @@ export class FleetManager {
         await stopChild(child, outcome === "finished" ? 10_000 : 4_000);
         if (outcome === "finished") {
           // Export what the person signed in to, keep only this provider's slice, seal it.
-          const outCtx = await chromium.launchPersistentContext(tmpDir, { headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage", "--password-store=basic"] });
+          const outCtx = await launchWithSandboxFallback((sandbox) => chromium.launchPersistentContext(tmpDir, { headless: true, args: [...sandbox, "--disable-dev-shm-usage", "--password-store=basic"] }));
           try {
             const state2 = (await outCtx.storageState()) as StorageStateLike;
             const p = withOrg(org, () => getPlatform(platformId));
@@ -186,6 +228,7 @@ export class FleetManager {
           if (conn) {
             this.connections.delete(keyOf(org, platformId));
             await conn.ctx.close().catch(() => undefined);
+            await this.releaseClaim(org, platformId);
             this.releaseSlot();
           }
         }
@@ -194,6 +237,8 @@ export class FleetManager {
         throw err;
       } finally {
         this.desktop = null;
+        // Ownership reverts to the founding workspace; whoever just watched must go too.
+        if (ownedScreen) bus.emit("vnc-owner", { org: 1 });
         this.announce();
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -227,14 +272,20 @@ export class FleetManager {
     if (this.launching) return this.launching;
     this.launching = (async () => {
       log.info(`launching fleet Chromium (max ${config.fleet.maxContexts} contexts, ${config.fleet.orgMaxContexts}/workspace)`);
-      const b = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-dev-shm-usage", "--password-store=basic", "--disable-blink-features=AutomationControlled"],
-      });
+      // Every workspace's pages render in this one process tree: the renderer sandbox is the
+      // wall between a compromised page and the other tenants' cookies. Never drop it lightly.
+      const b = await launchWithSandboxFallback((sandbox) =>
+        chromium.launch({
+          headless: true,
+          args: [...sandbox, "--disable-dev-shm-usage", "--password-store=basic", "--disable-blink-features=AutomationControlled"],
+        }),
+      );
       b.on("disconnected", () => {
         log.warn("fleet Chromium exited");
         this.browser = null;
         this.connections.clear();
+        // Nothing to renew for: the claims themselves lapse on their TTL.
+        for (const key of [...this.claimRenewers.keys()]) this.stopClaimRenewal(key);
         this.announce();
       });
       this.browser = b;
@@ -267,8 +318,15 @@ export class FleetManager {
       }
       if (Date.now() > deadline) throw Object.assign(new Error("every browser slot is busy; try again in a moment"), { status: 429 });
       await new Promise<void>((resolve) => {
-        this.waiters.push(resolve);
-        setTimeout(resolve, 2_000).unref?.();
+        // The timeout path must take its waiter with it, or the dead entry eats a real
+        // release later and a genuine waiter sleeps its whole 2s for nothing.
+        const wake = () => {
+          const i = this.waiters.indexOf(wake);
+          if (i >= 0) this.waiters.splice(i, 1);
+          resolve();
+        };
+        this.waiters.push(wake);
+        setTimeout(wake, 2_000).unref?.();
       });
     }
   }
@@ -311,6 +369,43 @@ export class FleetManager {
     return conn;
   }
 
+  /* ---------- the cross-worker session claim (see the note above ProviderBusyError) ---------- */
+
+  private claimRenewers = new Map<string, NodeJS.Timeout>();
+
+  /** Take (or keep) the claim for this job, and keep it renewed while the connection stays open. */
+  private async acquireClaim(org: number, platform: string): Promise<void> {
+    const ok = await withOrg(org, () => claimProvider(platform, claimOwner, CLAIM_TTL_MS));
+    if (!ok) throw new ProviderBusyError(platform);
+    const key = keyOf(org, platform);
+    if (this.claimRenewers.has(key)) return;
+    const timer = setInterval(() => {
+      void withOrg(org, () => renewProviderClaim(platform, claimOwner, CLAIM_TTL_MS))
+        .then((held) => {
+          if (!held) {
+            // Only possible after the TTL lapsed (a long stall); the next job re-takes it.
+            log.warn(`the ${key} session claim lapsed and moved on; stopping its renewal`);
+            this.stopClaimRenewal(key);
+          }
+        })
+        .catch(() => undefined);
+    }, CLAIM_RENEW_MS);
+    timer.unref?.();
+    this.claimRenewers.set(key, timer);
+  }
+
+  private stopClaimRenewal(key: string): void {
+    const timer = this.claimRenewers.get(key);
+    if (timer) clearInterval(timer);
+    this.claimRenewers.delete(key);
+  }
+
+  /** Give the claim back — when the connection it protected is gone. */
+  private async releaseClaim(org: number, platform: string): Promise<void> {
+    this.stopClaimRenewal(keyOf(org, platform));
+    await withOrg(org, () => releaseProviderClaim(platform, claimOwner)).catch(() => undefined);
+  }
+
   /** Export, seal and close a connection. Its session survives; the context's RAM does not. */
   private async seal(conn: FleetConnection, why: string): Promise<void> {
     const key = keyOf(conn.org, conn.platform);
@@ -324,6 +419,7 @@ export class FleetManager {
       log.warn(`sealing ${key} failed (${why}); its last saved session stands`, err);
     }
     await conn.ctx.close().catch(() => undefined);
+    await this.releaseClaim(conn.org, conn.platform);
     log.info(`sealed connection ${key} (${why})`);
     this.releaseSlot();
     this.announce();
@@ -338,32 +434,47 @@ export class FleetManager {
 
   /* ---------- the public surface the adapters drive ---------- */
 
+  /*
+    One job at a time per (workspace, provider). The chain is keyed in a map that OUTLIVES
+    connection objects: a connection can be sealed or evicted while jobs still queue behind
+    it, and a chain hanging off the dead object would let the next caller open a fresh
+    connection and drive two pages at once. Each queued job re-resolves the live connection
+    when its turn comes, so it always works in the context that actually exists then.
+  */
   withLock<T>(fn: () => Promise<T>, task?: { label: string; platform?: string | null; messageId?: number | null }): Promise<T> {
     const org = ambientOrg();
-    const run = async (): Promise<T> => {
-      const conn = task?.platform ? await this.connection(task.platform) : null;
-      const chainOn: { queue: Promise<unknown> } = conn ?? this.hostChain;
-      const job = async () => {
-        const busy: BusyTask = { label: task?.label ?? "Working", platform: task?.platform ?? null, messageId: task?.messageId ?? null, since: new Date().toISOString() };
-        if (conn) conn.busy = busy;
-        this.announce();
-        try {
-          return await withOrg(org, fn);
-        } finally {
-          if (conn) {
-            conn.busy = null;
-            conn.lastUsed = Date.now();
-          }
-          this.announce();
+    const platform = task?.platform ?? null;
+    const key = platform ? keyOf(org, platform) : "#host"; // the rare platform-less job; never collides with `${org}:${platform}`
+    const job = async (): Promise<T> => {
+      // The cross-worker claim comes BEFORE the context: held elsewhere, this throws the
+      // retryable busy error without opening anything.
+      if (platform) await this.acquireClaim(org, platform);
+      const conn = platform ? await withOrg(org, () => this.connection(platform)) : null;
+      const busy: BusyTask = { label: task?.label ?? "Working", platform, messageId: task?.messageId ?? null, since: new Date().toISOString() };
+      if (conn) conn.busy = busy;
+      this.announce();
+      try {
+        return await withOrg(org, fn);
+      } finally {
+        if (conn) {
+          conn.busy = null;
+          conn.lastUsed = Date.now();
         }
-      };
-      const next = chainOn.queue.then(job, job);
-      chainOn.queue = next.catch(() => undefined);
-      return next;
+        this.announce();
+      }
     };
-    return run();
+    const prev = this.chains.get(key) ?? Promise.resolve();
+    const next = prev.then(job, job);
+    const tail: Promise<unknown> = next
+      .catch(() => undefined)
+      .finally(() => {
+        // The map only holds live tails; a settled chain no one queued behind is garbage.
+        if (this.chains.get(key) === tail) this.chains.delete(key);
+      });
+    this.chains.set(key, tail);
+    return next;
   }
-  private hostChain: { queue: Promise<unknown> } = { queue: Promise.resolve() }; // for the rare platform-less job
+  private chains = new Map<string, Promise<unknown>>(); // per-(workspace, provider) serialisation, surviving evictions
 
   pageOf(platformId: string): Page | undefined {
     const conn = this.connections.get(keyOf(ambientOrg(), platformId));
@@ -477,6 +588,7 @@ export class FleetManager {
       cleared = (await existing.ctx.cookies().catch(() => [] as Cookie[])).filter((c) => cookieMatchesDomain(c.domain, domains)).length;
       this.connections.delete(keyOf(org, p.id));
       await existing.ctx.close().catch(() => undefined);
+      await this.releaseClaim(org, p.id);
       this.releaseSlot();
     } else {
       const raw = await loadConnectionState(p.id);
@@ -499,14 +611,16 @@ export class FleetManager {
 
   async backupSessions(): Promise<number> {
     // Seal-in-place for every open connection, whatever its workspace (shutdown path).
+    // Busy ones included: storageState() is safe on a live context, and the busiest session
+    // is exactly the one whose newest cookies a crash would otherwise lose.
     let cookies = 0;
     for (const conn of [...this.connections.values()]) {
-      if (conn.busy || conn.sealing) continue;
+      if (conn.sealing) continue;
       try {
         const state = await conn.ctx.storageState();
         cookies += state.cookies.length;
         await withOrg(conn.org, () => saveConnectionState(conn.platform, JSON.stringify(state)));
-        conn.lastUsed = Date.now();
+        if (!conn.busy) conn.lastUsed = Date.now();
       } catch (err) {
         log.warn(`backup of ${keyOf(conn.org, conn.platform)} failed`, err);
       }

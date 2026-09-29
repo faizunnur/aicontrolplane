@@ -1,4 +1,6 @@
-import { addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, listStaleRunningRunsAll, runEvents, setCancelRequested, startRun, systemScope, transitionRun, updateMessage, withOrg, type StartRunInput } from "./db.js";
+import { hostname } from "node:os";
+import { activeRunCount, addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, heartbeatRun, listStaleRunningRunsAll, orgQuotas, rawAll, rawRun, runCountSince, runEvents, setCancelRequested, startRun, systemScope, transitionRun, updateMessage, withOrg, type StartRunInput } from "./db.js";
+import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { runsSettled } from "./metrics.js";
 import type { Run, RunStatus, Step, StepStatus } from "../packages/core/src/index.js";
@@ -106,6 +108,70 @@ export class RunTracker {
   }
 }
 
+/* ---------- the executor's lease: how "worker died" becomes minutes, not half an hour ---------- */
+
+export const RUN_LEASE_TTL_MS = 5 * 60_000;
+export const RUN_HEARTBEAT_MS = 60_000;
+/** Who holds a lease: this process, named so two workers on one host stay distinct. */
+export const leaseOwner = `${hostname()}#${process.pid}`;
+
+/**
+ * Run fn with a heartbeat on the run's lease: renewed every minute while the executor works,
+ * five minutes of slack before the reaper may call it dead. On the way out the lease is
+ * cleared IF the run is still "running" — a run left open on purpose (waiting for an agent's
+ * report or a webhook ack) has no local executor anymore, so the legacy 30-minute silence
+ * rule judges it instead of a lease nobody renews.
+ */
+export async function withRunLease<T>(runId: number, fn: () => Promise<T>): Promise<T> {
+  await heartbeatRun(runId, RUN_LEASE_TTL_MS, leaseOwner).catch(() => undefined);
+  const timer = setInterval(() => void heartbeatRun(runId, RUN_LEASE_TTL_MS, leaseOwner).catch((err) => log.warn(`heartbeat for run #${runId} failed`, err)), RUN_HEARTBEAT_MS);
+  timer.unref?.();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(timer);
+    // Direct SQL until packages/data grows a clearRunLease(); the run id is a global key.
+    await rawRun("UPDATE runs SET lease_expires_at = NULL, locked_by = NULL WHERE id = ? AND status = 'running' AND locked_by = ?", [runId, leaseOwner]).catch(() => undefined);
+  }
+}
+
+/* ---------- workspace quotas, checked where runs start executing ---------- */
+
+/** A run refused by quota. retryable: the queue should try again later (concurrency); not retryable: fail now (daily cap). */
+export class QuotaExceededError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = "QuotaExceededError";
+  }
+}
+
+/**
+ * Enforce the ambient workspace's run quotas: org row overrides first, env defaults second,
+ * 0 meaning unlimited. selfCounted says the run being started already has its own row in an
+ * active status (a queued task run), so it must not block itself. Concurrency over the cap
+ * throws retryable — the queue's backoff becomes natural queueing; the daily cap throws
+ * non-retryable — tomorrow is the only fix.
+ */
+export async function enforceRunQuotas(opts: { selfCounted?: boolean } = {}): Promise<void> {
+  const org = await orgQuotas();
+  const maxConcurrent = org.maxConcurrentRuns ?? config.quotas.maxConcurrentRuns;
+  const maxDaily = org.maxRunsPerDay ?? config.quotas.maxRunsPerDay;
+  const self = opts.selfCounted ? 1 : 0;
+  if (maxConcurrent > 0 && (await activeRunCount()) - self >= maxConcurrent) {
+    throw new QuotaExceededError("workspace concurrency limit reached — try again shortly", true);
+  }
+  if (maxDaily > 0) {
+    const midnight = new Date();
+    midnight.setUTCHours(0, 0, 0, 0);
+    if ((await runCountSince(midnight.toISOString())) - self >= maxDaily) {
+      throw new QuotaExceededError(`workspace daily run limit (${maxDaily}) reached — it resets at midnight UTC`, false);
+    }
+  }
+}
+
 /** Start a run and its tracker in one go. */
 export async function beginRun(input: StartRunInput): Promise<{ run: Run; track: RunTracker }> {
   const run = await startRun(input);
@@ -174,21 +240,35 @@ export async function runForMessage(messageId: number): Promise<Run | undefined>
 }
 
 /**
- * Fail running runs that show no sign of life. With several executors, no process may fail
- * everything "running" at its own boot — another worker may be mid-chat. Instead, a run whose
- * timeline has been silent past the threshold (far beyond any legitimate quiet stretch, like
- * the two-minute reply wait) is declared dead, wherever its executor went. External runs are
- * never touched: their agents report in on their own schedule.
+ * Fail running runs whose executor died — in two tiers. A run WITH a lease is declared dead
+ * the moment its lease expires unrenewed (heartbeats come every minute with five minutes of
+ * slack, so "worker died" is caught in ~5 minutes). A run with NO lease — an open-on-purpose
+ * run waiting for an agent's report, or one from before leases — keeps the legacy rule: a
+ * timeline silent past the threshold, far beyond any legitimate quiet stretch. External runs
+ * are never touched: their agents report in on their own schedule.
  */
 export const STALE_RUN_MS = 30 * 60_000;
 export async function reapStaleRuns(staleMs = STALE_RUN_MS): Promise<number> {
+  const nowIso = new Date().toISOString();
   const cutoff = new Date(Date.now() - staleMs).toISOString();
+  // Direct SQL until packages/data grows a listExpiredLeaseRunsAll(); ids are global keys.
+  const leaseDead = await rawAll<Run & { org_id: number }>("SELECT * FROM runs WHERE status = 'running' AND kind != 'external' AND lease_expires_at IS NOT NULL AND lease_expires_at < ? LIMIT 100", [nowIso]);
+  // The silence rule applies only where no lease speaks: an actively leased run may sit
+  // quietly for ages (a long reply wait) without being anyone's leftovers.
+  const silent = (await systemScope(() => listStaleRunningRunsAll(cutoff))).filter((r) => !r.lease_expires_at);
+  const seen = new Set<number>();
   let reaped = 0;
   // The worklist spans every workspace; each run is then repaired inside its own, so the
   // failure event and message update land where they belong.
-  for (const run of await systemScope(() => listStaleRunningRunsAll(cutoff))) {
+  for (const run of [...leaseDead, ...silent]) {
+    if (seen.has(run.id)) continue;
+    seen.add(run.id);
     reaped += await withOrg(run.org_id, async () => {
-      const error = "Its process stopped answering; the run was abandoned.";
+      // One more look before the kill: the worker may have heartbeat between list and now.
+      const fresh = await getRun(run.id);
+      if (!fresh || fresh.status !== "running") return 0;
+      if (fresh.lease_expires_at && fresh.lease_expires_at >= nowIso) return 0; // renewed — alive after all
+      const error = run.lease_expires_at ? "Its worker stopped heartbeating; the run was abandoned." : "Its process stopped answering; the run was abandoned.";
       const failed = await transitionRun(run.id, ["running"], "failed", { error });
       if (!failed) return 0; // it moved on its own — alive after all
       await addRunEvent(run.id, { type: "error", label: "Abandoned", detail: error });

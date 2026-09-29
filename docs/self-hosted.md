@@ -10,6 +10,7 @@ and nothing here depends on Railway, Kubernetes, or any hosted control plane.
 **One container** — simplest, fine for one person:
 
 ```sh
+cp .env.example .env   # set POSTGRES_PASSWORD (compose insists on it even here) 
 docker compose up --build -d
 ```
 
@@ -50,9 +51,16 @@ The full reference is `.env.example`. The ones that matter first:
   never guessed from request headers.
 - `ACP_ADMIN_TOKEN` — optional; without it the first visit creates the owner account
   (email + password, argon2id-hashed).
-- `ACP_EGRESS_POLICY` — outbound calls to agent webhooks are `strict` in production (private
-  addresses refused, connections pinned to checked IPs). Webhooking your own LAN? Add hosts
-  to `ACP_EGRESS_ALLOWLIST=host1,host2` or set `permissive`.
+- `ACP_EGRESS` — outbound calls to agent webhooks are `strict` whenever the install is
+  production or multi-tenant (Postgres configured): private addresses refused, connections
+  pinned to checked IPs. Webhooking your own LAN? Add hosts to
+  `ACP_EGRESS_ALLOWLIST=host1,host2` or set `ACP_EGRESS=permissive` (logged loudly at boot).
+- `TRUST_PROXY` — off by default; every client IP is the socket address, so a forged
+  `X-Forwarded-For` cannot dodge login rate limits. Behind nginx/Traefik/a load balancer,
+  set `TRUST_PROXY=1` (the hop count) or the limits will key on your proxy's address.
+- `ACP_BROWSER_SANDBOX` — `auto` (default) keeps Chromium's sandbox on; the browser image
+  runs as `pwuser` with `docker/seccomp_profile.json` so this works out of the box. Tenant
+  isolation depends on it; only set `off` on a single-workspace install you trust end to end.
 
 ## Operations
 
@@ -61,8 +69,12 @@ The full reference is `.env.example`. The ones that matter first:
 - **Metrics**: Prometheus text at `/metrics` — admin-gated on the api, open on the workers'
   internal ports (request durations, queue depth, active runs, settled runs, failures,
   connected clients).
-- **Backups**: `pg_dump` the `acp` database. Secrets inside it are sealed; a leaked dump
-  without `ACP_MASTER_KEY` exposes no credentials.
+- **Backups**: the split compose runs a `backup` service — a daily `pg_dump -Fc` into the
+  `acp-backups` volume, 14-day retention. Restore with
+  `pg_restore -d acp --clean --if-exists <file>` against a stopped stack, then start the
+  services. Secrets inside a dump are sealed; a leaked dump without `ACP_MASTER_KEY` exposes
+  no credentials — which also means **escrow `ACP_MASTER_KEY` somewhere safe**: backups
+  cannot decrypt sign-ins without it. Test the restore once before you rely on it.
 - **Moving from SQLite** (an older single-container install):
   `DATABASE_URL=... npx tsx scripts/migrate-sqlite-to-pg.ts /data/acp.sqlite` with the
   server stopped, then start with `DATABASE_URL` set.

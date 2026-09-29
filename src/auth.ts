@@ -14,6 +14,8 @@ import {
   findSession,
   getSetting,
   getSettingCached,
+  hasIngestToken,
+  setIngestToken,
   getUser,
   getUserByEmail,
   insertSession,
@@ -98,7 +100,8 @@ export async function createAdminPassword(password: string, email = "admin@local
   // First run: the owner of the founding workspace, trusted by construction (no email round-trip).
   await withOrg(1, async () => {
     await createUser({ email, password_hash: await hashPassword(password), role: "owner" });
-    if (!envIngest && !(await getSetting("ingest_token"))) await setSetting("ingest_token", randomBytes(24).toString("hex"));
+    // No ingest token is minted here: only its hash is ever stored, so a token minted
+    // now could never be shown. The rotate route is the mint — it returns the plaintext once.
   });
   return true;
 }
@@ -127,17 +130,53 @@ export async function verifyUser(password: string, email?: string): Promise<Auth
 /**
  * Which account a bare password (bearer credential) belongs to — with ITS OWN role, never
  * more. Successful matches are cached briefly (by token hash) and failures are counted per
- * caller, because argon2id is deliberate work and this path guards every API route.
+ * caller AND per token, because argon2id is deliberate work and this path guards every API
+ * route: with the IP alone, a spoofable header (or a botnet) buys unlimited CPU.
  */
 const bearerHits = new Map<string, { at: number; user: AuthUser }>();
 const bearerFails = new Map<string, { count: number; resetAt: number }>();
+/** Install-wide ceiling on argon2-verifying bearer attempts. Keyed on nothing: it caps the CPU, not a caller. */
+const argonBudget = { count: 0, resetAt: 0 };
+const ARGON_ATTEMPTS_PER_MINUTE = 120;
+
+function overLimit(key: string): boolean {
+  const f = bearerFails.get(key);
+  return !!f && f.resetAt > Date.now() && f.count > 20;
+}
+function countFail(key: string) {
+  const now = Date.now();
+  const f = bearerFails.get(key);
+  const fresh = f && f.resetAt > now ? f : { count: 0, resetAt: now + 60_000 };
+  fresh.count++;
+  if (bearerFails.size > 5000) bearerFails.clear();
+  bearerFails.set(key, fresh);
+}
+
+/**
+ * Drop cached bearer matches for one user (or all). Called on password change, password
+ * reset and account deletion, so the old password stops working the moment it is replaced
+ * instead of up to 30 seconds later.
+ */
+export function invalidateBearerCache(userId?: number) {
+  if (userId === undefined) return bearerHits.clear();
+  for (const [k, v] of bearerHits) if (v.user.id === userId) bearerHits.delete(k);
+}
 
 export async function matchUserByPassword(password: string, callerIp = "unknown"): Promise<AuthUser | null> {
   const key = tokenHash(password);
   const hit = bearerHits.get(key);
   if (hit && Date.now() - hit.at < 30_000) return hit.user;
-  const fails = bearerFails.get(callerIp);
-  if (fails && fails.resetAt > Date.now() && fails.count > 20) return null; // guessing costs nothing further
+  // Two narrow gates (this caller, this token), then the wide one (the whole install):
+  // beyond it every attempt is refused outright rather than burning argon2 time.
+  if (overLimit(`ip:${callerIp}`) || overLimit(`tok:${key.slice(0, 16)}`)) return null; // guessing costs nothing further
+  const now = Date.now();
+  if (argonBudget.resetAt <= now) {
+    argonBudget.count = 0;
+    argonBudget.resetAt = now + 60_000;
+  }
+  if (++argonBudget.count > ARGON_ATTEMPTS_PER_MINUTE) {
+    throw Object.assign(new Error("Too many credential attempts on this deployment. Try again in a minute."), { status: 429 });
+  }
   // O(all accounts on the install) argon2 checks — tolerable now, the reason per-workspace
   // API keys are the successor to password-as-bearer.
   for (const u of await listAllUsers()) {
@@ -149,10 +188,8 @@ export async function matchUserByPassword(password: string, callerIp = "unknown"
       return user;
     }
   }
-  const now = Date.now();
-  const f = fails && fails.resetAt > now ? fails : { count: 0, resetAt: now + 60_000 };
-  f.count++;
-  bearerFails.set(callerIp, f);
+  countFail(`ip:${callerIp}`);
+  countFail(`tok:${key.slice(0, 16)}`);
   return null;
 }
 
@@ -171,6 +208,7 @@ export async function changeAdminPassword(current: string, next: string, user?: 
     await updateUser(target.id, { password_hash: await hashPassword(next) });
     const { deleteSessionsForUser } = await import("./db.js");
     await deleteSessionsForUser(target.id);
+    invalidateBearerCache(target.id);
     await addAudit({ actor: target.email, action: "auth.password_changed" });
     return true;
   }
@@ -179,23 +217,20 @@ export async function changeAdminPassword(current: string, next: string, user?: 
   if (!who || who.id === 0) return false;
   await updateUser(who.id, { password_hash: await hashPassword(next) });
   await deleteAllSessions();
+  invalidateBearerCache(who.id);
   await addAudit({ actor: who.email, action: "auth.password_changed" });
   return true;
 }
 
-export async function ingestToken(): Promise<string> {
-  if (envIngest) return envIngest;
-  let t = await getSettingCached("ingest_token");
-  if (!t) {
-    t = randomBytes(24).toString("hex");
-    await setSetting("ingest_token", t);
-  }
-  return t;
+/** Whether an ingest token exists at all — what the settings page may say. The token itself never travels with it. */
+export async function ingestTokenSet(): Promise<boolean> {
+  if (envIngest) return true;
+  return hasIngestToken();
 }
 export async function rotateIngestToken(): Promise<string> {
   if (envIngest) return envIngest;
   const t = randomBytes(24).toString("hex");
-  await setSetting("ingest_token", t);
+  await setIngestToken(t);
   await addAudit({ actor: "you", action: "auth.ingest_token_rotated" });
   return t;
 }
@@ -223,10 +258,24 @@ export function bearer(req: IncomingMessage): string | undefined {
 
 /* ---------- sessions ---------- */
 
+/**
+ * The address requests are counted and audited by. X-Forwarded-For is anyone's to write,
+ * so it is only believed under TRUST_PROXY: a hop count takes the entry that many proxies
+ * from the right (what the trusted proxy itself saw), true takes the leftmost. Off — the
+ * default — means the socket's own address, which cannot be spoofed.
+ */
 export function clientIp(req: IncomingMessage): string {
+  const trust = config.trustProxy;
+  const socketAddr = req.socket?.remoteAddress || "unknown";
+  if (trust === false) return socketAddr;
   const fwd = req.headers["x-forwarded-for"];
-  const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim();
-  return first || req.socket?.remoteAddress || "unknown";
+  const hops = (Array.isArray(fwd) ? fwd.join(",") : (fwd ?? ""))
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!hops.length) return socketAddr;
+  if (trust === true) return hops[0];
+  return hops[Math.max(0, hops.length - trust)];
 }
 
 /** Start a session for this user. Returns the raw token to put in the cookie; only its hash is stored. */
@@ -377,5 +426,3 @@ export function crossOrigin(req: IncomingMessage): boolean {
   }
 }
 
-// Keep config in sync for modules that only need to know whether an env token exists.
-void config;

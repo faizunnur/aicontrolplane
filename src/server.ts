@@ -3,14 +3,15 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import compression from "compression";
 import express from "express";
 import httpProxy from "http-proxy";
 import { settleCommandMessage } from "./answers.js";
-import { authUser, crossOrigin, isAdmin } from "./auth.js";
+import { authUser, crossOrigin } from "./auth.js";
 import { bus } from "./bus.js";
 import { startRedisBridge } from "../packages/realtime/src/index.js";
 import { handleLiveUpgrade } from "./browser/live.js";
-import { browser, storageInfo, vncState } from "./browser/manager.js";
+import { browser, storageInfo, sweepDesktopTmp, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
 import { dbReady, flushNotifications } from "./db.js";
@@ -35,14 +36,39 @@ onRunEnded(settleCommandMessage);
 
 const app = express();
 app.disable("x-powered-by");
-app.set("trust proxy", true);
-app.use(express.json({ limit: "5mb" }));
+// X-Forwarded-* is only believed when TRUST_PROXY says whose proxy stands in front (see
+// config.ts). Unconditional trust let any direct caller choose their own rate-limit bucket.
+app.set("trust proxy", config.trustProxy);
+
+// Responses are compressed — except the event stream, which must flush each message the
+// moment it happens; a gzip buffer in front of it would hold the UI's updates hostage.
+app.use(
+  compression({
+    filter: (req, res) => {
+      if (req.path === "/api/stream") return false;
+      if (String(res.getHeader("content-type") ?? "").includes("text/event-stream")) return false;
+      return compression.filter(req, res);
+    },
+  }),
+);
+
+// Bodies are small — except the two session-import routes, which carry a whole cookie jar.
+// Everything else at 5MB was an invitation to fill memory with junk.
+const jsonSmall = express.json({ limit: "256kb" });
+const jsonLarge = express.json({ limit: "5mb" });
+app.use((req, res, next) => {
+  const large = req.path === "/api/browser/import-state" || /^\/api\/connections\/[^/]+\/import-session$/.test(req.path);
+  (large ? jsonLarge : jsonSmall)(req, res, next);
+});
 
 // Security headers. The app pages get a content-security policy; the noVNC pages under /vnc keep their own.
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  // Only when the request really arrived over https (directly, or via a TRUST_PROXY-declared
+  // proxy): telling a plain-http self-hosted install to insist on https would lock it out.
+  if (req.secure) res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
   if (!req.path.startsWith("/vnc")) {
     res.setHeader("X-Frame-Options", "DENY");
     if (req.path === "/" || req.path.endsWith(".html")) {
@@ -93,9 +119,12 @@ app.get("/readyz", async (_req, res) => {
 });
 
 app.use("/api", metricsMiddleware, api);
-// Operators scrape this; it is admin-gated because the api faces the internet.
+// Operators scrape this. The numbers are install-wide (every workspace's traffic), so only
+// the founding workspace's owner/admin — the people running the deployment — may read them.
 app.get("/metrics", async (req, res) => {
-  if (!(await isAdmin(req))) return res.status(401).end();
+  const scraper = await authUser(req);
+  if (!scraper) return res.status(401).end();
+  if (scraper.orgId !== 1 || (scraper.role !== "owner" && scraper.role !== "admin")) return res.status(403).end();
   res.setHeader("content-type", "text/plain; version=0.0.4");
   res.end(await metricsText());
 });
@@ -109,6 +138,28 @@ proxy.on("error", (err, _req, res) => {
     res.end("The browser screen is not available. Is the service running with HEADLESS=false inside the Docker image?");
   }
 });
+/*
+  Every socket streaming the desktop is remembered with the workspace watching through it.
+  The check at connect time is not enough on its own: ownership moves (a desktop sign-in
+  claims the display for another workspace), and an already-established stream would keep
+  showing that workspace typing its passwords. When the browser announces a new owner,
+  every socket belonging to anyone else is cut on the spot.
+*/
+const vncSockets = new Map<import("node:net").Socket, number>();
+function watchVncSocket(socket: import("node:net").Socket, org: number) {
+  vncSockets.set(socket, org);
+  socket.once("close", () => vncSockets.delete(socket));
+}
+bus.on("vnc-owner", (msg: { org: number }) => {
+  for (const [socket, org] of vncSockets) {
+    if (org !== msg.org) {
+      log.info(`vnc: cutting a workspace-${org} viewer; the desktop now belongs to workspace ${msg.org}`);
+      socket.destroy();
+      vncSockets.delete(socket);
+    }
+  }
+});
+
 app.use("/vnc", async (req, res) => {
   const vncUser = await authUser(req);
   if (!vncUser) {
@@ -126,6 +177,7 @@ app.use("/vnc", async (req, res) => {
     return res.redirect("/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify&reconnect=1");
   }
   vncState.lastActivityAt = Date.now();
+  watchVncSocket(req.socket, vncUser.orgId);
   proxy.web(req, res);
 });
 
@@ -176,6 +228,7 @@ server.on("upgrade", async (req, socket, head) => {
   req.url = req.url!.replace(/^\/vnc/, "") || "/";
   vncState.connections++;
   vncState.lastActivityAt = Date.now();
+  watchVncSocket(socket as import("node:net").Socket, wsUser.orgId);
   socket.on("close", () => {
     vncState.connections = Math.max(0, vncState.connections - 1);
     vncState.lastActivityAt = Date.now();
@@ -185,6 +238,10 @@ server.on("upgrade", async (req, socket, head) => {
 
 server.listen(config.port, async () => {
   log.info(`AI Control Plane listening on :${config.port} (data: ${config.dataDir})`);
+  // Outlive the load balancer's idle timeout (usually 60s), or it reuses a connection the
+  // moment this server closes it and the request dies with a blank 502.
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 70_000;
   if (config.publicUrl) log.info(`public url: ${config.publicUrl} (from ${config.publicUrlSource === "env" ? "PUBLIC_URL" : "the host's own domain"})`);
   else log.warn("PUBLIC_URL is not set: alerts and agent report URLs will have no address, and pairing commands fall back to each request's Host header. Set PUBLIC_URL (or run where RAILWAY_PUBLIC_DOMAIN is provided) to pin it.");
   const st = await storageInfo();
@@ -206,6 +263,8 @@ server.listen(config.port, async () => {
   }
   if (config.role === "all") {
     // Single-container mode: this process also executes everything it accepts.
+    // A crash can leave desktop sign-in profiles (cookies) under DATA_DIR — sweep them first.
+    sweepDesktopTmp();
     await startExecutionServices("all");
     await queue.start();
   } else {

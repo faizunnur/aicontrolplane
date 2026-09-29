@@ -99,7 +99,8 @@ describe("workspaces: sign-up, verification, isolation", { skip: !process.env.TE
       // Alice furnishes her workspace: a chat message and an agent-reported task run.
       const conv = await alice.api<{ id: number }>("/conversations", { body: {} });
       await alice.api("/messages", { body: { text: "hello from alice", conversation_id: conv.id } });
-      const aliceToken = (await alice.api<{ ingestToken: string }>("/settings")).ingestToken;
+      // Settings only says a token exists; rotation is where the plaintext is handed out.
+      const aliceToken = (await alice.api<{ ingestToken: string }>("/settings/ingest-token/rotate", { method: "POST" })).ingestToken;
       const ingest = await fetch(`${server.base}/api/ingest`, {
         method: "POST",
         headers: { authorization: `Bearer ${aliceToken}`, "content-type": "application/json" },
@@ -121,7 +122,7 @@ describe("workspaces: sign-up, verification, isolation", { skip: !process.env.TE
       assert.equal(await bob.status(`/tasks/${aliceTask!.id}`), 404, "alice's task is a 404 for bob");
 
       // Bob's ingest token is his own workspace's, not alice's.
-      const bobToken = (await bob.api<{ ingestToken: string }>("/settings")).ingestToken;
+      const bobToken = (await bob.api<{ ingestToken: string }>("/settings/ingest-token/rotate", { method: "POST" })).ingestToken;
       assert.notEqual(bobToken, aliceToken, "each workspace has its own agent token");
       await fetch(`${server.base}/api/ingest`, {
         method: "POST",

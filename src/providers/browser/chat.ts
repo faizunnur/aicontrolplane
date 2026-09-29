@@ -1,3 +1,4 @@
+import type { Page } from "playwright";
 import { browser } from "../../browser/manager.js";
 import { cleanError, isStall, PageController } from "../../browser/page.js";
 import { setPlatformState } from "../../db.js";
@@ -5,12 +6,16 @@ import { logger } from "../../logger.js";
 import { CancelledError, isCancelled, type RunTracker } from "../../runs.js";
 import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ChatResult } from "../types.js";
-import { detectLoginState } from "./login.js";
+import { detectChallenge, detectLoginState } from "./login.js";
 
 const log = logger("browser-chat");
 
 const REPLY_TIMEOUT_MS = 120_000;
 const STABLE_POLLS = 3; // reply text unchanged for this many 1s polls => finished
+const MAX_REPLY_CHARS = 8_000;
+
+/** A reply is cut, never silently: the cut is marked so the reader knows there was more. */
+const clipReply = (s: string) => (s.length > MAX_REPLY_CHARS ? s.slice(0, MAX_REPLY_CHARS) + "\n…[truncated]" : s);
 
 /**
  * Send a message to a provider exactly the way you would: open a new conversation, type it,
@@ -52,6 +57,18 @@ const hostOf = (url: string) => {
   }
 };
 
+/**
+ * The page is behind a bot check: say so honestly instead of dying as a generic timeout. The
+ * platform state has no dedicated "challenge" status, so the closest honest one — needs_login,
+ * with the challenge named in last_error — carries it, and the desktop sign-in flow (which
+ * passes these checks) is the way back in.
+ */
+async function challengeFailure(p: PlatformConfig, page: Page, step: RunTracker | undefined, key: string): Promise<ChatResult> {
+  await setPlatformState(p.id, { session_status: "needs_login", last_error: `${p.name} is showing a human-verification challenge` });
+  await step?.fail(key, "human-verification challenge");
+  return { ok: false, error: `${p.name} is showing a human-verification challenge — open the live view or re-run sign-in.`, url: page.url() };
+}
+
 async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Promise<ChatResult> {
   const pc = new PageController(p.id, p.name);
   const url = p.chatUrl || p.appUrl;
@@ -61,16 +78,31 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
   await step?.done("open", hostOf(url));
 
   await step?.start("check", "Checking the sign-in");
-  if ((await detectLoginState(p, page)) === "needs_login") {
+  const login = await detectLoginState(p, page);
+  if (login === "needs_login") {
     await setPlatformState(p.id, { session_status: "needs_login" });
     await step?.fail("check", "signed out");
     return { ok: false, error: `${p.name} needs you to sign in again`, url: page.url() };
   }
-  await step?.done("check", "signed in");
+  if (login === "unknown") {
+    // None of the provider's markers answered either way. Look for a bot check before
+    // trusting the page, then proceed-but-verify: the composer wait below is the verdict.
+    if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "check");
+    await step?.done("check", "no sign-in markers answered; proceeding carefully");
+  } else {
+    await step?.done("check", "signed in");
+  }
 
   await step?.start("type", "Typing your message");
   const composer = page.locator(p.composerSelector).first();
-  await composer.waitFor({ state: "visible", timeout: 20_000 });
+  try {
+    await composer.waitFor({ state: "visible", timeout: 20_000 });
+  } catch (err) {
+    // The composer never appeared — the classic face of a Cloudflare interstitial. Name it
+    // when it IS one; otherwise the timeout is real and flows to the ordinary handling.
+    if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "type");
+    throw err;
+  }
   const before = p.replySelector ? await page.locator(p.replySelector).count().catch(() => 0) : 0;
   await composer.click({ timeout: 10_000 });
   try {
@@ -122,7 +154,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
       await step?.start("read", "Reading the answer");
       await pc.screenshot(page);
       await step?.done("read", `${lastText.length} characters`);
-      return { ok: true, reply: lastText.slice(0, 8_000), url: page.url() };
+      return { ok: true, reply: clipReply(lastText), url: page.url() };
     }
   }
   await pc.screenshot(page);
@@ -130,8 +162,11 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
     await step?.done("wait", "still writing after 120s");
     await step?.start("read", "Reading the answer");
     await step?.done("read", `${lastText.length} characters so far`);
-    return { ok: true, reply: lastText.slice(0, 8_000), partial: true, url: page.url() };
+    return { ok: true, reply: clipReply(lastText), partial: true, url: page.url() };
   }
+  // Nothing ever answered. A bot check that appeared after the send is the likeliest silent
+  // culprit; name it instead of blaming the provider's speed.
+  if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "wait");
   await step?.fail("wait", "no answer in 120s");
   return { ok: false, error: `${p.name} did not answer within ${Math.round(REPLY_TIMEOUT_MS / 1000)}s`, url: page.url() };
 }
@@ -145,9 +180,13 @@ export async function checkSignIn(p: PlatformConfig): Promise<Exclude<SessionSta
       try {
         // A single-page app needs a moment after load to decide what to render.
         const page = await pc.open(p.appUrl, { networkIdleMs: 10_000, settleMs: 1_000 });
-        const status = (await detectLoginState(p, page)) === "needs_login" ? "needs_login" : "logged_in";
+        const login = await detectLoginState(p, page);
+        // "unknown" (no marker answered) counts as signed in ONLY after a bot check is ruled
+        // out — an interstitial shows none of the provider's markers either.
+        const challenged = login === "unknown" && (await detectChallenge(page)).challenge !== null;
+        const status = login === "needs_login" || challenged ? "needs_login" : "logged_in";
         await pc.screenshot(page);
-        await setPlatformState(p.id, { session_status: status, last_error: null });
+        await setPlatformState(p.id, { session_status: status, last_error: challenged ? `${p.name} is showing a human-verification challenge` : null });
         if (status === "logged_in") void browser.backupSessions();
         return status;
       } catch (err) {

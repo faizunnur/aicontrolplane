@@ -10,7 +10,10 @@ import { startServer, type TestServer } from "../helpers/server.js";
 describe("security edges", { timeout: 300_000 }, () => {
   let s: TestServer;
   before(async () => {
-    s = await startServer({ BROWSER_ENABLED: "false" });
+    // TRUST_PROXY=1: this suite plays a deployment behind one proxy, so the guess-limit test
+    // can present distinct client addresses through X-Forwarded-For. Without it (the default)
+    // that header is ignored and every request counts against the socket's own address.
+    s = await startServer({ BROWSER_ENABLED: "false", TRUST_PROXY: "1" });
   });
   after(async () => {
     await s?.stop();

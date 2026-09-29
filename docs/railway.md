@@ -104,7 +104,8 @@ there (in the `acp_files` table) and is moved over like this:
    It reads the mirrored SQLite file out of `acp_files`, creates the new tables, copies every
    row, turns your existing password into the owner account and carries your provider
    settings over. It is safe to run more than once. If the connection is refused over TLS,
-   add `ACP_PG_SSL=no-verify`.
+   `ACP_PG_SSL=no-verify` makes it work but disables certificate checks for this one
+   migration run — prefer fixing the certificate; the server warns loudly when it is set.
 4. Add `ACP_MASTER_KEY` (see above) to the app service, then deploy the new version.
 5. Sign in with your existing password (the email field can stay empty), then
    **Settings › Saved sign-ins › Restore** with the file from step 1.
@@ -185,6 +186,7 @@ DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the 64-character key>
 VNC_TARGET=http://browser.railway.internal:6080
+TRUST_PROXY=1
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15
 ```
 
@@ -207,6 +209,7 @@ DATABASE_URL=${{Postgres.DATABASE_PRIVATE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}?family=0
 ACP_MASTER_KEY=<the same 64-character key>
 PUBLIC_URL=https://${{api.RAILWAY_PUBLIC_DOMAIN}}
+TRUST_PROXY=1
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
 ```
 
@@ -246,6 +249,9 @@ a volume at `/data` so the Chrome profile stays warm across deploys (not require
 
 - `?family=0` lets the Redis client resolve Railway's private network addresses (IPv4 or
   IPv6); without it, connections to `*.railway.internal` can fail.
+- `TRUST_PROXY=1` tells the app it sits one hop behind Railway's proxy, so rate limits and
+  audit rows use the real client address from `X-Forwarded-For`. Without it (the default)
+  the socket address is used — correct for direct exposure, wrong behind a proxy.
 - `VNC_TARGET` (api) and `VNC_BIND` (browser) carry the "cloud desktop" sign-in screen
   (`/vnc`) from the browser service through the api. The live view of the agent's tab does not
   need them; it travels over Redis. This pair has not yet been exercised on Railway. If the
@@ -258,9 +264,10 @@ a volume at `/data` so the Chrome profile stays warm across deploys (not require
 ### Scaling
 
 - `api` and `worker`: raise **replicas** freely; they hold no state.
-- `browser`: today one replica drives one Chrome with all sign-ins; keep it at **1**. More
-  browser replicas need per-connection browser contexts, which is not built yet (see the
-  capacity notes in the migration plan).
+- `browser`: with `BROWSER_FLEET=ephemeral`, each replica opens isolated per-workspace
+  contexts and a per-(workspace, provider) claim keeps two replicas from driving the same
+  signed-in account — more than one replica is safe, though multi-replica has not yet been
+  load-proven on Railway. In legacy mode (one persistent profile) keep it at **1**.
 - Watch `/metrics` on the api (admin sign-in required) for queue depth (`acp_queue_jobs`),
   active runs and request latency before scaling anything.
 

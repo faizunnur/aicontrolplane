@@ -5,6 +5,19 @@ set -euo pipefail
 
 # A Railway volume announces where it is mounted; the app uses that path automatically.
 DATA_DIR="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
+
+# Chrome must not run as root: root cannot start the user-namespace sandbox that keeps one
+# workspace's pages away from another's cookies. When the container boots as root, it only
+# claims the data volume (mounted root-owned on most platforms) for pwuser, then re-runs
+# itself unprivileged. Everything below the drop - Xvfb, x11vnc, websockify, node - is pwuser.
+if [ "$(id -u)" = "0" ]; then
+  mkdir -p "$DATA_DIR"
+  if [ "$(stat -c %u "$DATA_DIR")" != "$(id -u pwuser)" ]; then
+    chown -R pwuser:pwuser "$DATA_DIR" || echo "[start] warning: could not hand $DATA_DIR to pwuser"
+  fi
+  exec gosu pwuser bash "$0" "$@"
+fi
+
 mkdir -p "$DATA_DIR"
 
 if [ "${HEADLESS:-false}" != "true" ]; then

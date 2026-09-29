@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
-import { Router, type Request, type Response } from "express";
+import { Router, type Request, type RequestHandler, type Response } from "express";
 import { z } from "zod";
 import { availableActions } from "../actions.js";
 import { ensureTaskAgent } from "../agents.js";
@@ -96,7 +96,8 @@ import {
   clientIp,
   createAdminPassword,
   createSession,
-  ingestToken,
+  ingestTokenSet,
+  invalidateBearerCache,
   requireAdmin,
   requireIngest,
   revokeSession,
@@ -174,6 +175,23 @@ function num(v: unknown, def: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
+/** Run rows going to a LIST leave their heavy payloads behind (raw provider payloads, long
+    details, checkpoints); the single-run route (/runs/:id) keeps them. */
+function runListView<T extends { raw?: unknown; details?: unknown; checkpoint?: unknown }>(r: T): Omit<T, "raw" | "details" | "checkpoint"> {
+  const { raw: _raw, details: _details, checkpoint: _checkpoint, ...rest } = r;
+  return rest;
+}
+/** Only a web address may become an href in the dashboard; anything else (javascript:, data:,
+    relative junk) is dropped rather than stored. */
+const isWebUrl = (v: string) => /^https?:\/\//i.test(v);
+const webUrl = z
+  .string()
+  .max(2000)
+  .optional()
+  .transform((v) => {
+    const t = v?.trim();
+    return t && isWebUrl(t) ? t : undefined;
+  });
 function secure(req: Request) {
   return req.secure || req.headers["x-forwarded-proto"] === "https";
 }
@@ -258,7 +276,8 @@ api.post("/signup", signupLimit, async (req, res) => {
   const token = randomBytes(32).toString("base64url");
   await withOrg(org.id, async () => {
     const u = await createUser({ email, password_hash: await hashPassword(password), role: "owner", verified: false });
-    await setSetting("ingest_token", randomBytes(24).toString("hex"));
+    // No ingest token is minted here: only its hash is ever stored, so a token minted now
+    // could never be shown. The owner creates one from Settings; rotation returns it once.
     await createUserToken(u.id, "verify", tokenHash(token), VERIFY_TTL_MS);
     await addAudit({ actor: email, action: "auth.signup", target: `org:${org.id}` });
   });
@@ -317,6 +336,7 @@ api.post("/password-reset/confirm", loginLimit, async (req, res) => {
   if (!u) return bad(res, "That link is not valid any more. Ask for a new one.", 400);
   await updateUser(u.id, { password_hash: await hashPassword(password) });
   await deleteSessionsForUser(u.id);
+  invalidateBearerCache(u.id); // the old password must stop working as a bearer token too
   await withOrg(u.org_id, () => addAudit({ actor: u.email, action: "auth.password_reset" }));
   res.json({ ok: true });
 });
@@ -351,10 +371,12 @@ api.post("/pairing/exchange", pairingLimit, async (req, res) => {
 /** The helper hands over the session it captured; the server filters it again, imports it, and checks. */
 api.post("/connections/:id/import-session", requirePairingFor, async (req, res, next) => {
   const pairing = res.locals.pairing as PairingRow | undefined;
+  // The workspace the cookies land in: the one that created the pairing, or — for a signed-in
+  // owner/admin — their own. Never a default: an import that cannot name its workspace is refused.
+  const orgId = pairing?.org_id ?? (res.locals.user as AuthUser | undefined)?.orgId;
+  if (!orgId) return res.status(401).json({ error: "unauthorized: no workspace could be established for this import" });
   try {
-    // No login here — the pairing token is the capability, and the import lands in the
-    // workspace that created the pairing.
-    await withOrg(pairing?.org_id ?? 1, () => importSession(req, res, pairing));
+    await withOrg(orgId, () => importSession(req, res, pairing));
   } catch (err) {
     // A refusal because the browser is held (a desktop sign-in) keeps the token: the helper retries.
     // Anything else ends the pairing with the reason, so the panel says what happened.
@@ -396,7 +418,7 @@ const ingestSchema = z.object({
     name: z.string().max(200).optional(),
     purpose: z.string().max(2000).optional(),
     schedule: z.string().max(200).optional(),
-    native_url: z.string().max(2000).optional(),
+    native_url: webUrl,
     status: z.string().max(60).optional(),
     keywords: z.string().max(500).optional(),
     delivery: DELIVERY.optional(),
@@ -418,7 +440,7 @@ const ingestSchema = z.object({
       finished_at: z.string().optional(),
       summary: z.string().max(4000).optional(),
       details: z.string().max(50_000).optional(),
-      output_url: z.string().max(2000).optional(),
+      output_url: webUrl,
       raw: z.unknown().optional(),
     })
     .optional(),
@@ -427,7 +449,7 @@ const ingestSchema = z.object({
       kind: z.string().max(40).default("notification"),
       title: z.string().min(1).max(300),
       body: z.string().max(20_000).optional(),
-      link: z.string().max(2000).optional(),
+      link: webUrl,
     })
     .optional(),
 });
@@ -535,7 +557,7 @@ const finishSchema = z.object({
   status: z.enum(["success", "failed", "needs_attention", "cancelled"]).default("success"),
   summary: z.string().max(4000).optional(),
   error: z.string().max(4000).optional(),
-  output_url: z.string().max(2000).optional(),
+  output_url: webUrl,
 });
 api.post("/runs/:id/finish", requireIngest, async (req, res) => {
   const run = await getRun(num(req.params.id, 0));
@@ -647,6 +669,22 @@ api.post("/inbox/:id/ack", requireIngest, async (req, res) => {
 
 api.use(requireAdmin);
 
+/** Owners and admins of a workspace: the people who may change how it behaves. */
+const operators: RequestHandler<any> = requireRole("owner", "admin");
+/**
+ * Install-wide observability (the process log, its level, /metrics) belongs to whoever runs
+ * the deployment: the founding workspace's owner or admin. Other workspaces share this
+ * process, so its ring buffer would leak their neighbours' requests.
+ */
+const foundingOperator: RequestHandler<any> = (_req, res, next) => {
+  const user = res.locals.user as AuthUser | undefined;
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  if (user.orgId !== 1 || (user.role !== "owner" && user.role !== "admin")) {
+    return res.status(403).json({ error: "this belongs to the deployment's operators (the founding workspace's owner or admin)" });
+  }
+  next();
+};
+
 /* ---------- the app: connections, chat, home ---------- */
 
 /** Live updates for the workspace (server-sent events). */
@@ -692,7 +730,7 @@ api.post("/connections", async (req, res) => {
   await savePlatformOverride(id, { ...parsed.data, hidden: false, chatUrl: parsed.data.chatUrl || appUrl, composerSelector: parsed.data.composerSelector || (appUrl ? "textarea, div[contenteditable=\"true\"]" : ""), replySelector: parsed.data.replySelector || "" });
   res.json(await connectionCard(getPlatform(id)!));
 });
-api.put("/connections/:id", async (req, res) => {
+api.put("/connections/:id", operators, async (req, res) => {
   const p = getPlatform(req.params.id);
   if (!p) return bad(res, "unknown AI", 404);
   const parsed = connectionPatch.safeParse(req.body);
@@ -739,7 +777,7 @@ const signInOptions = async (a: ReturnType<typeof requireProvider>) => {
 };
 
 /* local: the user signs in on their own computer and a helper hands the session to the cloud browser. */
-api.post("/connections/:id/pairing", async (req, res, next) => {
+api.post("/connections/:id/pairing", operators, async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!a.supports("signIn")) throw a.unsupported("signIn");
@@ -767,13 +805,13 @@ api.post("/connections/:id/pairing", async (req, res, next) => {
   }
 });
 api.get("/connections/:id/pairing", async (req, res) => res.json(await activePairing(req.params.id)));
-api.delete("/connections/:id/pairing", async (req, res) => {
+api.delete("/connections/:id/pairing", operators, async (req, res) => {
   const ok = await cancelPairing(req.params.id);
   res.json({ ok, pairing: await activePairing(req.params.id) });
 });
 
 /** Bring the AI's sign-in page up in its tab; the live view then shows that tab for the user to sign in. */
-api.post("/connections/:id/connect", async (req, res, next) => {
+api.post("/connections/:id/connect", operators, async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!browserRuntimeAvailable()) return bad(res, "the browser is disabled on this deployment", 409);
@@ -785,7 +823,7 @@ api.post("/connections/:id/connect", async (req, res, next) => {
   }
 });
 /** Desktop sign-in: open a plain browser window on the cloud display with the provider's site. */
-api.post("/connections/:id/signin", async (req, res, next) => {
+api.post("/connections/:id/signin", operators, async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     if (!a.supports("signIn")) throw a.unsupported("signIn");
@@ -797,7 +835,7 @@ api.post("/connections/:id/signin", async (req, res, next) => {
   }
 });
 /** The user pressed "I'm signed in": close the plain window, hand the profile back, and check. */
-api.post("/connections/:id/signin/finish", async (req, res, next) => {
+api.post("/connections/:id/signin/finish", operators, async (req, res, next) => {
   try {
     const a = requireProvider(req.params.id);
     const { wasDesktop, status } = await callBrowserOp<{ wasDesktop: boolean; status: string }>("desktop.finish", { platformId: a.id }, 120_000);
@@ -810,7 +848,7 @@ api.post("/connections/:id/signin/finish", async (req, res, next) => {
     next(err);
   }
 });
-api.post("/connections/:id/signin/cancel", async (req, res, next) => {
+api.post("/connections/:id/signin/cancel", operators, async (req, res, next) => {
   try {
     requireProvider(req.params.id);
     res.json(await callBrowserOp("desktop.cancel", {}, 60_000));
@@ -926,7 +964,7 @@ api.delete("/chat/:id", async (req, res) => res.json({ ok: await deleteMessage(n
 /* execution mode: auto (the agent acts on its own) or manual (it asks before acting) — a preset over the policies */
 const approvalView = (a: Awaited<ReturnType<typeof pendingApprovals>>[number]) => ({ ...a, messageId: a.message_id, runId: a.run_id });
 api.get("/settings/approval", async (_req, res) => res.json({ approvalMode: await approvalMode(), pending: (await pendingApprovals()).map(approvalView) }));
-api.put("/settings/approval", async (req, res) => {
+api.put("/settings/approval", operators, async (req, res) => {
   const mode = req.body?.approvalMode === "manual" ? "manual" : req.body?.approvalMode === "auto" ? "auto" : null;
   if (!mode) return bad(res, "approvalMode must be auto or manual");
   await setApprovalMode(mode);
@@ -937,7 +975,7 @@ api.put("/settings/approval", async (req, res) => {
 api.get("/approvals", async (req, res) => {
   res.json({ pending: (await pendingApprovals()).map(approvalView), recent: (await listApprovals({ status: ["approved", "rejected", "expired", "interrupted"], limit: num(req.query.limit, 30) })).map(approvalView) });
 });
-api.post("/approvals/:id/decide", async (req, res) => {
+api.post("/approvals/:id/decide", operators, async (req, res) => {
   const decision = req.body?.decision === "reject" || req.body?.decision === "rejected" ? "rejected" : req.body?.decision === "approve" || req.body?.decision === "approved" ? "approved" : null;
   if (!decision) return bad(res, "decision must be approve or reject");
   const row = await decide(num(req.params.id, 0), decision, "you", typeof req.body?.reason === "string" ? req.body.reason.slice(0, 500) : null);
@@ -947,7 +985,7 @@ api.post("/approvals/:id/decide", async (req, res) => {
 
 /* policies: which actions go ahead and which ask */
 api.get("/policies", async (_req, res) => res.json(await listPolicies()));
-api.put("/policies/:action", async (req, res, next) => {
+api.put("/policies/:action", operators, async (req, res, next) => {
   try {
     const mode = req.body?.mode;
     if (mode !== null && mode !== "auto" && mode !== "ask" && mode !== "always") return bad(res, "mode must be auto, ask, always or null");
@@ -959,32 +997,28 @@ api.put("/policies/:action", async (req, res, next) => {
 
 /* one call for the whole app */
 api.get("/home", async (req, res) => {
+  const user = res.locals.user as AuthUser;
   const connections = await Promise.all(visiblePlatforms().map((p) => connectionCard(p)));
   const conversations = await listConversations();
   const wanted = num(req.query.conversation_id, 0);
   const current = (wanted ? await getConversation(wanted) : undefined) ?? conversations[0] ?? null;
-  const runs = (await listRuns({ limit: 15 })).map((r) => ({ kind: "run", at: r.finished_at || r.started_at || r.created_at, platform: r.provider, title: r.label ?? r.task_name ?? r.kind, status: r.status, summary: r.summary, link: r.output_url || r.task_native_url, run_id: r.id, run_kind: r.kind }));
-  const events = (await listEvents({ limit: 15 })).map((e) => ({ kind: e.kind, at: e.occurred_at, platform: e.platform, title: e.title, status: e.kind === "run" ? "failed" : e.kind === "session" ? "needs_attention" : "info", summary: e.body, link: e.link, id: e.id, read: !!e.read }));
-  const activity = [...runs, ...events].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 20);
-  const attention = [
-    ...connections.filter((c) => c.status === "needs_login").map((c) => ({ kind: "session", platform: c.id, title: `${c.name} needs you to sign in again`, action: "connect" })),
-    ...(await listMessages({ status: "needs_assignment", limit: 10 })).map((m) => ({ kind: "message", id: m.id, title: "Which AI should do this?", body: m.text, action: "choose" })),
-    ...(await listMessages({ status: "failed", limit: 10 })).map((m) => ({ kind: "message", id: m.id, title: "Could not send an instruction", body: m.error ?? m.text, action: "retry" })),
-    ...(await listEvents({ unread: true, limit: 10 })).filter((e) => e.kind === "run").map((e) => ({ kind: "run", id: e.id, platform: e.platform, title: e.title, body: e.body, link: e.link, action: "dismiss" })),
-  ];
+  // The thread renders the tail; each expansion can cost reads (live runs fold their
+  // timeline), so only the last 50 go through it. Older messages load on scroll-up via /chat.
+  const recentMessages = current ? (await conversationMessages(current.id)).slice(-50) : [];
   res.json({
     connections,
     conversations,
     conversation: current,
-    messages: current ? await Promise.all((await conversationMessages(current.id)).map(expandMessage)) : [],
+    messages: await Promise.all(recentMessages.map(expandMessage)),
     approvalMode: await approvalMode(),
     approvals: (await pendingApprovals()).map(approvalView),
     agents: await listAgentProfiles(),
+    // The overview already carries the attention list and the recent runs; the page reads
+    // those from it, so /home no longer refetches the same rows a second time.
     overview: await overview(),
     // So a reloaded page can pick up a desktop sign-in that is still in progress.
     signInOptions: { desktop: browser.canDesktopSignIn(), vnc: { available: await vncAvailable(), url: VNC_PATH } },
-    attention,
-    activity,
+    user: { email: user.email, role: user.role },
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
     storage: await storageInfo(),
     browser: await browser.status(),
@@ -1001,7 +1035,9 @@ api.get("/home", async (req, res) => {
 api.get("/settings", async (_req, res) => {
   res.json({
     passwordFromEnv: adminFromEnv(),
-    ingestToken: await ingestToken(),
+    // Whether a token exists, never the token: the plaintext is shown once, at rotation,
+    // to an operator. Anything more would hand every member the whole workspace's agents.
+    ingest_token_set: await ingestTokenSet(),
     ingestTokenFromEnv: !!process.env.ACP_INGEST_TOKEN,
     router: { provider: config.router.provider, model: config.router.model, llm: config.router.llm },
     alerts: { webhook: !!config.alerts.webhookUrl, telegram: !!(config.alerts.telegramToken && config.alerts.telegramChatId) },
@@ -1060,18 +1096,20 @@ api.delete("/users/:id", requireRole("owner"), async (req, res) => {
   if (u.id === me.id) return bad(res, "You cannot delete your own account.", 409);
   await deleteSessionsForUser(u.id);
   await deleteUser(u.id);
+  invalidateBearerCache(u.id); // a cached bearer match must not outlive the account
   await addAudit({ actor: me.email, action: "user.deleted", target: u.email });
   res.json({ ok: true });
 });
 
 /** Who did what: logins, approvals, policy changes, exports, live-view control. */
 api.get("/audit", async (req, res) => res.json(await listAudit({ limit: num(req.query.limit, 100), action: typeof req.query.action === "string" ? req.query.action : undefined })));
-/** The server log, from memory: the last lines at any level, for debugging from inside the product. */
-api.get("/logs", (req, res) => {
+/** The server log, from memory: the last lines at any level, for debugging from inside the product.
+    The ring buffer is process-wide — every workspace's requests — so only the install's operators see it. */
+api.get("/logs", foundingOperator, (req, res) => {
   const level = typeof req.query.level === "string" && ["debug", "info", "warn", "error"].includes(req.query.level) ? (req.query.level as Level) : undefined;
   res.json({ level: logLevel(), scopes: logScopes(), lines: recentLogs({ limit: num(req.query.limit, 500), level, scope: typeof req.query.scope === "string" ? req.query.scope : undefined, after: req.query.after ? num(req.query.after, 0) : undefined }) });
 });
-api.put("/logs/level", async (req, res, next) => {
+api.put("/logs/level", foundingOperator, async (req, res, next) => {
   try {
     const level = setLogLevel(String(req.body?.level ?? ""));
     await addAudit({ actor: "you", action: "log.level", detail: level });
@@ -1080,7 +1118,9 @@ api.put("/logs/level", async (req, res, next) => {
     next(err);
   }
 });
-api.post("/settings/ingest-token/rotate", async (_req, res) => res.json({ ingestToken: await rotateIngestToken(), fromEnv: !!process.env.ACP_INGEST_TOKEN }));
+// The one moment the plaintext is shown: rotation answers with the new token so the operator
+// can hand it to their agents; afterwards only its existence is reported.
+api.post("/settings/ingest-token/rotate", operators, async (_req, res) => res.json({ ingestToken: await rotateIngestToken(), fromEnv: !!process.env.ACP_INGEST_TOKEN }));
 
 /* ---------- messages (instructions from you, routed to agents) ---------- */
 
@@ -1202,7 +1242,8 @@ const agentSchema = z.object({
   name: z.string().min(1).max(200),
   purpose: z.string().max(2000).nullable().optional(),
   schedule: z.string().max(200).nullable().optional(),
-  native_url: z.string().max(2000).nullable().optional(),
+  // A link the dashboard renders as an href: only web addresses survive.
+  native_url: z.string().max(2000).nullable().optional().transform((v) => (v == null ? v : isWebUrl(v.trim()) ? v.trim() : null)),
   status: z.string().max(60).nullable().optional(),
   enabled: z.boolean().optional(),
   keywords: z.string().max(500).nullable().optional(),
@@ -1217,7 +1258,7 @@ api.get("/tasks", async (req, res) => {
 api.get("/tasks/:id", async (req, res) => {
   const t = (await listTasks({ includeDisabled: true })).find((x) => x.id === num(req.params.id, 0));
   if (!t) return bad(res, "not found", 404);
-  res.json({ ...await taskView(t, await recentStatusesByTask(10)), runs: await listRuns({ task_id: t.id, limit: 20 }) });
+  res.json({ ...await taskView(t, await recentStatusesByTask(10)), runs: (await listRuns({ task_id: t.id, limit: 20 })).map(runListView) });
 });
 api.post("/tasks", async (req, res) => {
   const parsed = agentSchema.safeParse(req.body);
@@ -1265,7 +1306,7 @@ api.get("/agents", async (req, res) => {
 api.get("/agents/:id", async (req, res) => {
   const a = await getAgentProfile(num(req.params.id, 0));
   if (!a) return bad(res, "not found", 404);
-  res.json({ ...a, tasks: await listTasks({ agent_id: a.id }), runs: await listRuns({ agent_id: a.id, limit: 20 }) });
+  res.json({ ...a, tasks: await listTasks({ agent_id: a.id }), runs: (await listRuns({ agent_id: a.id, limit: 20 })).map(runListView) });
 });
 const profilePatch = z
   .object({
@@ -1300,14 +1341,16 @@ api.delete("/agents/:id", async (req, res) => {
 
 api.get("/runs", async (req, res) => {
   res.json(
-    await listRuns({
-            limit: num(req.query.limit, 50),
-            task_id: req.query.task_id ?? req.query.agent_id ? num(req.query.task_id ?? req.query.agent_id, 0) : undefined,
-            status: typeof req.query.status === "string" ? req.query.status.split(",") : undefined,
-            platform: typeof req.query.platform === "string" ? req.query.platform : undefined,
-            kind: typeof req.query.kind === "string" ? req.query.kind : undefined,
-            since: typeof req.query.since === "string" ? req.query.since : undefined,
-          }),
+    (
+      await listRuns({
+        limit: num(req.query.limit, 50),
+        task_id: req.query.task_id ?? req.query.agent_id ? num(req.query.task_id ?? req.query.agent_id, 0) : undefined,
+        status: typeof req.query.status === "string" ? req.query.status.split(",") : undefined,
+        platform: typeof req.query.platform === "string" ? req.query.platform : undefined,
+        kind: typeof req.query.kind === "string" ? req.query.kind : undefined,
+        since: typeof req.query.since === "string" ? req.query.since : undefined,
+      })
+    ).map(runListView),
   );
 });
 /** One run with its timeline: the raw events and the step view folded from them. */
@@ -1375,7 +1418,7 @@ const platformPatch = z
     ),
   })
   .partial();
-api.put("/platforms/:id", async (req, res) => {
+api.put("/platforms/:id", operators, async (req, res) => {
   const id = req.params.id.toLowerCase().replace(/[^a-z0-9_-]/g, "");
   if (!id) return bad(res, "invalid id");
   const parsed = platformPatch.safeParse(req.body);
@@ -1443,14 +1486,14 @@ api.post("/browser/backup", async (_req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);
   res.json({ ok: true, cookies: await browser.backupSessions(), storage: storageInfo() });
 });
-api.post("/browser/import-state", async (req, res) => {
+api.post("/browser/import-state", operators, async (req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);
   const cookies = Array.isArray(req.body?.cookies) ? req.body.cookies : [];
   if (!cookies.length) return bad(res, "body must be a Playwright storageState with a cookies array");
   await addAudit({ actor: "you", action: "browser.import_state", detail: `${cookies.length} cookies from ${clientIp(req)}` });
   res.json({ ok: true, imported: await browser.importState({ cookies }) });
 });
-api.get("/browser/export-state", async (req, res) => {
+api.get("/browser/export-state", operators, async (req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);
   // Cookies for every signed-in provider leave the server here; that is always worth a record.
   await addAudit({ actor: "you", action: "browser.export_state", detail: clientIp(req) });

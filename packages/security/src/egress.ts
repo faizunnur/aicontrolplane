@@ -31,14 +31,62 @@ export class EgressBlockedError extends Error {
   }
 }
 
-function isPrivate(ip: string): boolean {
-  if (net.isIPv6(ip)) {
-    const low = ip.toLowerCase();
-    if (low === "::1" || low === "::") return true;
-    if (low.startsWith("fe80:") || low.startsWith("fc") || low.startsWith("fd")) return true;
-    if (low.startsWith("::ffff:")) return isPrivate(low.slice("::ffff:".length));
-    return false;
+/**
+ * Parse an IPv6 literal into its eight 16-bit hextets. IPv6 has too many spellings for
+ * string prefixes to be a check ("0:0:0:0:0:0:0:1", "::0:1" and "::1" are the same
+ * address), so the address is canonicalized first and the ranges compared numerically.
+ * Null when it does not parse — which the caller treats as private, like the IPv4 branch.
+ */
+function parseIPv6(ip: string): number[] | null {
+  let s = ip;
+  const zone = s.indexOf("%"); // fe80::1%eth0 — the zone id is not part of the address
+  if (zone >= 0) s = s.slice(0, zone);
+  // An embedded dotted IPv4 tail (::ffff:127.0.0.1) becomes its two hextets.
+  const lastColon = s.lastIndexOf(":");
+  if (lastColon >= 0 && s.slice(lastColon + 1).includes(".")) {
+    const dotted = s.slice(lastColon + 1).split(".").map(Number);
+    if (dotted.length !== 4 || dotted.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return null;
+    s = s.slice(0, lastColon + 1) + ((dotted[0] << 8) | dotted[1]).toString(16) + ":" + ((dotted[2] << 8) | dotted[3]).toString(16);
   }
+  // Expand "::" into however many zero hextets it stands for. At most one is allowed.
+  const dbl = s.indexOf("::");
+  if (dbl !== s.lastIndexOf("::")) return null;
+  let fields: string[];
+  if (dbl >= 0) {
+    const head = s.slice(0, dbl).split(":").filter(Boolean);
+    const tail = s.slice(dbl + 2).split(":").filter(Boolean);
+    if (head.length + tail.length > 7) return null;
+    fields = [...head, ...new Array(8 - head.length - tail.length).fill("0"), ...tail];
+  } else {
+    fields = s.split(":");
+    if (fields.length !== 8) return null;
+  }
+  const hextets = fields.map((h) => (/^[0-9a-fA-F]{1,4}$/.test(h) ? parseInt(h, 16) : NaN));
+  return hextets.some(Number.isNaN) ? null : hextets;
+}
+
+/** The four octets embedded in a mapped/translated IPv6 address's last two hextets. */
+function embeddedV4(h6: number, h7: number): string {
+  return `${h6 >> 8}.${h6 & 0xff}.${h7 >> 8}.${h7 & 0xff}`;
+}
+
+function isPrivateV6(ip: string): boolean {
+  const h = parseIPv6(ip);
+  if (!h) return true; // unparseable: refuse, same philosophy as the IPv4 branch
+  const leadingZero = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0;
+  if (leadingZero && h[5] === 0 && h[6] === 0 && (h[7] === 0 || h[7] === 1)) return true; // :: and ::1
+  if ((h[0] & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((h[0] & 0xffc0) === 0xfec0) return true; // site-local fec0::/10 (deprecated, still routable on LANs)
+  if ((h[0] & 0xfe00) === 0xfc00) return true; // unique-local fc00::/7
+  // Addresses that are REALLY an IPv4 destination judge the IPv4 they carry:
+  if (leadingZero && h[5] === 0xffff) return isPrivate(embeddedV4(h[6], h[7])); // v4-mapped ::ffff:0:0/96
+  if (leadingZero && h[5] === 0) return isPrivate(embeddedV4(h[6], h[7])); // v4-compatible ::/96 (everything else in it was caught above)
+  if (h[0] === 0x0064 && h[1] === 0xff9b && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0) return isPrivate(embeddedV4(h[6], h[7])); // NAT64 64:ff9b::/96
+  return false;
+}
+
+export function isPrivate(ip: string): boolean {
+  if (net.isIPv6(ip)) return isPrivateV6(ip);
   const parts = ip.split(".").map(Number);
   if (parts.length !== 4 || parts.some((p) => Number.isNaN(p))) return true; // unparseable: refuse
   const [a, b] = parts;

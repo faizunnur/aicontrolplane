@@ -1,4 +1,4 @@
-import { currentStepOf, listAgentProfiles, listEvents, listMessages, listRuns, listTasks, recentRunEvents, type RunRow } from "./db.js";
+import { listAgentProfiles, listEvents, listMessages, listRuns, listTasks, recentRunEvents, type RunRow } from "./db.js";
 import { pendingApprovals } from "./policy.js";
 import { getProvider, listProviders } from "./providers/registry.js";
 
@@ -13,9 +13,14 @@ const startOfToday = () => {
   return d.toISOString();
 };
 
-export async function runWithStep(r: RunRow) {
-  const step = await currentStepOf(r.id);
-  return { ...r, provider_name: r.provider ? getProvider(r.provider)?.name ?? r.provider : null, current_step: step?.label ?? null, current_step_status: step?.status ?? null, elapsed_s: r.started_at ? Math.max(0, Math.round(((r.finished_at ? new Date(r.finished_at).getTime() : Date.now()) - new Date(r.started_at).getTime()) / 1000)) : null };
+/**
+ * A run row shaped for a list: the step label comes straight off runs.current_step (written
+ * on every step event), so a page of many runs costs no timeline reads; the heavy payload
+ * columns (raw provider payloads, long details, checkpoints) stay on the single-run route.
+ */
+export function runWithStep(r: RunRow) {
+  const { raw: _raw, details: _details, checkpoint: _checkpoint, ...rest } = r;
+  return { ...rest, provider_name: r.provider ? getProvider(r.provider)?.name ?? r.provider : null, current_step: r.current_step ?? null, elapsed_s: r.started_at ? Math.max(0, Math.round(((r.finished_at ? new Date(r.finished_at).getTime() : Date.now()) - new Date(r.started_at).getTime()) / 1000)) : null };
 }
 
 export interface AttentionItem {
@@ -45,7 +50,7 @@ export async function attentionItems(): Promise<AttentionItem[]> {
 
 export async function overview() {
   const since = startOfToday();
-  const running = await Promise.all((await listRuns({ status: "running", limit: 100 })).map(runWithStep));
+  const running = (await listRuns({ status: "running", limit: 100 })).map(runWithStep);
   const today = await listRuns({ since, limit: 500 });
   const approvals = await pendingApprovals();
   const agents = await listAgentProfiles();
@@ -67,7 +72,7 @@ export async function overview() {
     },
     running,
     attention: await attentionItems(),
-    recent: await Promise.all((await listRuns({ limit: 12 })).filter((r) => r.status !== "running").map(runWithStep)),
+    recent: (await listRuns({ limit: 12 })).filter((r) => r.status !== "running").map(runWithStep),
     upcoming: tasks
       .filter((t) => t.next_run)
       .sort((a, b) => String(a.next_run).localeCompare(String(b.next_run)))

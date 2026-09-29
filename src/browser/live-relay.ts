@@ -1,22 +1,32 @@
-import { keepSubscribed, resilientRedis } from "../../packages/realtime/src/index.js";
+import { keepSubscribed, liveFrameChannel, packEnvelope, resilientRedis } from "../../packages/realtime/src/index.js";
+import { bus } from "../bus.js";
+import { currentOrgId } from "../db.js";
 import { logger } from "../logger.js";
 import { acquireStream, applyCommand, refreshLevel, releaseStream, LEVEL_ORDER, type Level, type Meta, type Sink } from "./live-stream.js";
+import type { BrowserSnapshot } from "./manager.js";
 
 /*
   The source half of the remote live view, running where the browser lives. Api instances
   say what they are watching (a heartbeat, so a dead api stops a stream by silence) and
-  forward viewer commands; this relay drives the screencasts and publishes every frame.
+  forward viewer commands; this relay drives the screencasts and publishes the frames.
 
-    ctl   (api → here)  { t: "watching", wants: [{ org, platform, level }] }   every ~3s and on change
-                        { t: "cmd", org, platform, override, msg }
-    frame (here → api)  { org, platform, meta, metaChanged, data }             data = base64 JPEG
-                        { org, platform, error }
+    ctl    (api → here)  { t: "watching", wants: [{ org, platform, level }] }   every ~3s and on change
+                         { t: "cmd", org, platform, override, msg }
+    frame  (here → api)  one binary message per frame on the STREAM'S OWN channel
+                         acp:1:frame:{org}:{platform} — a JSON header line
+                         { platform, org, meta, metaChanged } followed by the raw JPEG bytes
+                         (packEnvelope); errors are a header-only { platform, org, error }.
+                         An api subscribes to a stream's channel only while it has a viewer
+                         for that (org, platform), so nobody parses frames nobody watches.
+    state  (here → api)  { org, snap } on acp:live:state — the browser snapshot, tagged with
+                         the workspace it describes, so an api delivers it only to that
+                         workspace's viewers (the events bridge would lose the org).
 */
 
 const log = logger("live-relay");
 
 export const LIVE_CTL_CHANNEL = "acp:live:ctl";
-export const LIVE_FRAME_CHANNEL = "acp:live:frame";
+export const LIVE_STATE_CHANNEL = "acp:live:state";
 const WATCH_TTL_MS = 10_000;
 
 interface Want {
@@ -39,10 +49,19 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
     congested: () => false, // redis takes every frame; the api side drops for slow sockets
     deliver: (frame, meta, metaChanged) => {
       // Many per second: while Redis is down a dropped frame is expected, and the outage is
-      // already reported by the client.
-      pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ org, platform, meta, metaChanged, data: frame.toString("base64") })).catch(() => undefined);
+      // already reported by the client. The JPEG travels as raw bytes, never base64.
+      pub.publish(liveFrameChannel(org, platform), packEnvelope({ platform, org, meta, metaChanged }, frame)).catch(() => undefined);
     },
   });
+
+  // Browser snapshots cross here rather than over the events bridge: this handler runs
+  // synchronously inside the emitter's workspace scope, so the org can travel with the
+  // snapshot and the api side can keep each workspace's tabs to its own viewers.
+  const onSnapshot = (snap: BrowserSnapshot) => {
+    const org = currentOrgId() ?? 1;
+    pub.publish(LIVE_STATE_CHANNEL, JSON.stringify({ org, snap })).catch(() => undefined);
+  };
+  bus.on("browser", onSnapshot);
 
   sub.on("message", (_ch: string, raw: string) => {
     void (async () => {
@@ -79,7 +98,7 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
       if (msg.t === "cmd" && msg.platform && msg.msg) {
         const org = Number(msg.org) || 1;
         const outcome = await applyCommand(org, msg.platform, msg.msg, { override: !!msg.override });
-        if (outcome.error) pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ org, platform: msg.platform, error: outcome.error })).catch(onError);
+        if (outcome.error) pub.publish(liveFrameChannel(org, msg.platform), packEnvelope({ platform: msg.platform, org, error: outcome.error })).catch(onError);
       }
     })().catch(onError);
   });
@@ -103,6 +122,7 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
     connected,
     stop: async () => {
       clearInterval(reap);
+      bus.off("browser", onSnapshot);
       for (const [key, w] of wants) if (w.attached) releaseStream(Number(key.split(":")[0]), key.slice(key.indexOf(":") + 1), w.sink);
       wants.clear();
       sub.disconnect();

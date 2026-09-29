@@ -16,7 +16,10 @@ describe("sign in from your own computer", { timeout: 300_000 }, () => {
 
   before(async () => {
     mock = await startMockProvider();
-    s = await startServer();
+    // TRUST_PROXY=1 declares the test client a proxy, so the guessing test's per-IP
+    // buckets come from X-Forwarded-For — as they would behind a real load balancer.
+    // Without it every request is 127.0.0.1 and the guesser's 429 outlives the guesser.
+    s = await startServer({ TRUST_PROXY: "1" });
     sse = await listenSse(s);
     await s.api("/connections", { body: { name: "Mock AI", appUrl: mock.url, purpose: "testing the connect flow" } });
     await s.api("/connections/mock-ai", { method: "PUT", body: { ...MOCK_SELECTORS, chatUrl: mock.url, sessionCookie: "mock_session", cookieDomain: "127.0.0.1" } });

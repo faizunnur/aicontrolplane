@@ -3,7 +3,7 @@ import { startRedisBridge } from "../../../packages/realtime/src/index.js";
 import { startLiveRelay } from "../../../src/browser/live-relay.js";
 import { settleCommandMessage } from "../../../src/answers.js";
 import { bus } from "../../../src/bus.js";
-import { browser } from "../../../src/browser/manager.js";
+import { browser, sweepDesktopTmp } from "../../../src/browser/manager.js";
 import { config } from "../../../src/config.js";
 import { dbReady } from "../../../src/db.js";
 import { logger } from "../../../src/logger.js";
@@ -26,6 +26,8 @@ const log = logger("browser-worker");
 
 onRunEnded(settleCommandMessage);
 
+// A previous run killed mid desktop sign-in leaves cookie-bearing throw-away profiles behind.
+sweepDesktopTmp();
 await initPlatforms();
 if (config.redisUrl) {
   const bridge = await startRedisBridge(bus, config.redisUrl, { onError: (err) => log.warn("redis bridge error", err) });

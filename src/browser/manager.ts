@@ -53,6 +53,75 @@ export function resolveExecutable(): { path: string; source: "env" | "channel" |
 /** Software WebGL under a virtual display: a browser without any WebGL is an oddity sites notice. */
 export const GPU_ARGS = process.platform === "linux" ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : [];
 
+/*
+  The Chromium sandbox. Every workspace's pages render inside the browser's process tree, so
+  the renderer sandbox is the wall between a compromised page and the other tenants' cookies.
+  ACP_BROWSER_SANDBOX: "auto" (the default) keeps it ON unless the process runs as root -
+  the user-namespace sandbox cannot start there; "on" forces it; "off" disables it, loudly.
+  // CONFIG SEAM: read straight from the environment until src/config.ts grows a browser.sandbox knob.
+*/
+export function sandboxDecision(): { mode: "auto" | "on" | "off"; on: boolean } {
+  const raw = (process.env.ACP_BROWSER_SANDBOX || "auto").toLowerCase();
+  const mode = raw === "on" || raw === "off" ? raw : "auto";
+  // On Windows/macOS dev boxes getuid does not exist; the sandbox is on there too.
+  const on = mode === "on" || (mode === "auto" && process.getuid?.() !== 0);
+  return { mode, on };
+}
+
+let warnedSandboxOff = false;
+/** The launch args the decision translates to. The one loud warning per process lives here. */
+export function sandboxArgs(): string[] {
+  const d = sandboxDecision();
+  if (d.on) return [];
+  if (!warnedSandboxOff) {
+    warnedSandboxOff = true;
+    log.warn(
+      `Chromium sandbox is OFF (${d.mode === "off" ? "ACP_BROWSER_SANDBOX=off" : "running as root, where the user-namespace sandbox cannot start"}): ` +
+        `every workspace's pages share one unsandboxed process tree. Run the container as a non-root user with docker/seccomp_profile.json to turn it on.`,
+    );
+  }
+  return ["--no-sandbox"];
+}
+
+/**
+ * Launch with the sandbox decision, and if the kernel refuses the sandbox under "auto"
+ * (seccomp swallowing the userns clone, typically), retry once without it - loudly, naming
+ * the fix. An explicit ACP_BROWSER_SANDBOX=on stays a hard failure: forced means forced.
+ */
+export async function launchWithSandboxFallback<T>(launch: (sandbox: string[]) => Promise<T>): Promise<T> {
+  const d = sandboxDecision();
+  try {
+    return await launch(sandboxArgs());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (d.mode === "auto" && d.on && /sandbox|namespace|clone/i.test(msg)) {
+      log.error(
+        "Chromium could not start its sandbox; retrying once WITHOUT it. Fix the deployment: run the container as a non-root user (the image's pwuser) " +
+          'with security_opt ["seccomp:./docker/seccomp_profile.json"] so user namespaces are allowed.',
+      );
+      return await launch(["--no-sandbox"]);
+    }
+    throw err;
+  }
+}
+
+/**
+ * A SIGKILL mid desktop sign-in leaves the throw-away profile - cookies included - under
+ * DATA_DIR/desktop-tmp. Nothing references it after a restart, so boot removes it whole.
+ */
+export function sweepDesktopTmp(): number {
+  const dir = path.join(config.dataDir, "desktop-tmp");
+  try {
+    const leftover = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    if (leftover) log.warn(`removing ${leftover} leftover desktop sign-in profile(s) from a previous run`);
+    fs.rmSync(dir, { recursive: true, force: true });
+    return leftover;
+  } catch (err) {
+    log.warn("could not sweep leftover desktop sign-in profiles", err);
+    return 0;
+  }
+}
+
 export interface BusyTask {
   /** Short human label: "Sending to ChatGPT", "Checking Claude", "Looking at Grok's tasks". */
   label: string;
@@ -168,7 +237,8 @@ class BrowserManager {
             `--window-size=${w},${h}`,
             "--window-position=0,0",
             "--lang=en-US",
-            ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage", ...GPU_ARGS] : []),
+            ...sandboxArgs(),
+            ...(process.platform === "linux" ? ["--disable-dev-shm-usage", ...GPU_ARGS] : []),
             url,
           ];
           log.info(`desktop sign-in for ${platformId}: opening ${exe.path} (${exe.source}) on ${process.env.DISPLAY ?? "the desktop"}`);
@@ -292,27 +362,29 @@ class BrowserManager {
     const [w, h] = config.browser.windowSize;
     const exe = resolveExecutable();
     log.info(`launching browser (headless=${config.browser.headless}, ${exe.source}: ${exe.path}) profile=${config.profileDir}`);
-    const ctx = await chromium.launchPersistentContext(config.profileDir, {
-      headless: config.browser.headless,
-      // The same binary a desktop sign-in opens, so the profile never changes hands between versions.
-      ...(exe.source === "bundled" ? {} : { executablePath: exe.path }),
-      viewport: config.browser.headless ? { width: w, height: h } : null,
-      locale: "en-US",
-      args: [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        // Encrypt cookies with the portable "basic" store, never a machine keyring, so the
-        // profile stays readable when the container is rebuilt on another host.
-        "--password-store=basic",
-        "--disable-blink-features=AutomationControlled",
-        `--window-size=${w},${h}`,
-        "--window-position=0,0",
-        "--no-first-run",
-        "--no-default-browser-check",
-        ...GPU_ARGS,
-      ],
-      ignoreDefaultArgs: ["--enable-automation"],
-    });
+    const ctx = await launchWithSandboxFallback((sandbox) =>
+      chromium.launchPersistentContext(config.profileDir, {
+        headless: config.browser.headless,
+        // The same binary a desktop sign-in opens, so the profile never changes hands between versions.
+        ...(exe.source === "bundled" ? {} : { executablePath: exe.path }),
+        viewport: config.browser.headless ? { width: w, height: h } : null,
+        locale: "en-US",
+        args: [
+          ...sandbox,
+          "--disable-dev-shm-usage",
+          // Encrypt cookies with the portable "basic" store, never a machine keyring, so the
+          // profile stays readable when the container is rebuilt on another host.
+          "--password-store=basic",
+          "--disable-blink-features=AutomationControlled",
+          `--window-size=${w},${h}`,
+          "--window-position=0,0",
+          "--no-first-run",
+          "--no-default-browser-check",
+          ...GPU_ARGS,
+        ],
+        ignoreDefaultArgs: ["--enable-automation"],
+      }),
+    );
     ctx.on("close", () => {
       log.warn("browser context closed");
       this.context = null;

@@ -1,7 +1,7 @@
 import { randomBytes, randomInt } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, Response } from "express";
-import { bearer, isAdmin, tokenHash } from "./auth.js";
+import { authUser, bearer, tokenHash } from "./auth.js";
 import { bus } from "./bus.js";
 import { addAudit, expirePairings, findPairingByCodeHash, findPairingByTokenHash, getPairing, insertPairing, latestPairing, replaceWaitingPairings, updatePairing, type PairingRow, type PairingStatus } from "./db.js";
 import { logger } from "./logger.js";
@@ -130,9 +130,20 @@ export async function pairingById(id: number): Promise<PairingView | null> {
   return row ? view(row) : null;
 }
 
-/** The import route: a pairing token made for this very provider, or the admin. */
+/**
+ * The import route: a pairing token made for this very provider, or a signed-in owner/admin
+ * importing into THEIR OWN workspace. A session is not enough by itself — the route must
+ * know exactly whose cookie jar the import lands in, so the caller's resolved user (with
+ * their orgId) rides along in res.locals.user; the route never falls back to a default org.
+ */
 export async function requirePairingFor(req: Request, res: Response, next: NextFunction) {
-  if (await isAdmin(req)) return next();
+  const user = await authUser(req);
+  if (user) {
+    // A member must not hand sessions to the workspace browser; that is the operators' call.
+    if (user.role !== "owner" && user.role !== "admin") return res.status(403).json({ error: "importing a session needs an owner or admin account" });
+    res.locals.user = user;
+    return next();
+  }
   const row = await pairingFromRequest(req);
   if (!row) return res.status(401).json({ error: "unauthorized: this needs a live pairing token from the app (make a new code there)" });
   if (row.platform !== req.params.id) return res.status(403).json({ error: `that code was made for ${row.platform}, not ${req.params.id}` });

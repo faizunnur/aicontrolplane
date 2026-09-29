@@ -219,7 +219,9 @@ describe("workspace end to end", { timeout: 600_000 }, () => {
   });
 
   it("custom agents register, report runs under a named profile, and appear beside the assistants", async () => {
-    const token = (await s.api("/settings")).ingestToken;
+    // The settings payload only says whether a token exists; rotation is the one moment
+    // the plaintext is handed out, so agents-to-be mint theirs there.
+    const token = (await s.api("/settings/ingest-token/rotate", { method: "POST" })).ingestToken;
     const ingest = (p: string, body: unknown) => fetch(`${s.base}/api${p}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, data: await r.json() }));
     const reg = await ingest("/agents/register", { key: "scanner-bot", name: "Scanner bot", description: "watches repositories", capabilities: ["scan"] });
     assert.equal(reg.status, 200);
@@ -240,7 +242,7 @@ describe("workspace end to end", { timeout: 600_000 }, () => {
   });
 
   it("the task registry answers for every provider, and agents stream a live run into it", async () => {
-    const token = (await s.api("/settings")).ingestToken;
+    const token = (await s.api("/settings/ingest-token/rotate", { method: "POST" })).ingestToken;
     const ingest = (p: string, body: unknown) => fetch(`${s.base}/api${p}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, data: await r.json() }));
     const tasks = await s.api("/tasks");
     const scan = tasks.find((t: any) => t.key === "repo-scan");

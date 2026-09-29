@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { runAction } from "./actions.js";
 import { ensureProviderAgent, ensureTaskAgent } from "./agents.js";
 
@@ -10,10 +11,33 @@ import { openMaybe } from "./secrets.js";
 import { getPlatform, refreshPlatformsNow } from "./platforms.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
-import { beginRun, endRun, RunTracker } from "./runs.js";
+import { beginRun, endRun, enforceRunQuotas, QuotaExceededError, RunTracker, withRunLease } from "./runs.js";
 import type { AgentDelivery, DeliveryMode, Task } from "../packages/core/src/index.js";
 
 const log = logger("deliver");
+
+/**
+ * Another browser worker holds this (workspace, provider) session claim (fleet.ts throws it
+ * by code, not by import, to keep the browser layer out of this module's graph). The attempt
+ * is settled, the message handed back, and the error rethrown so the job retries per policy.
+ */
+const isProviderBusy = (err: unknown): boolean => err instanceof Error && (err as { code?: string }).code === "PROVIDER_BUSY";
+
+/**
+ * Workspace quotas, checked before this delivery creates its run. The daily cap settles the
+ * message now (no retry can help today); the concurrency cap rethrows so the queue's backoff
+ * becomes the waiting room, and the message keeps its pre-delivery status for the sweep.
+ */
+async function gateDeliveryQuota(messageId: number): Promise<MessageWithTask | null> {
+  try {
+    await enforceRunQuotas();
+    return null;
+  } catch (err) {
+    if (err instanceof QuotaExceededError && !err.retryable) return (await updateMessage(messageId, { status: "failed", error: err.message }))!;
+    if (err instanceof QuotaExceededError) await updateMessage(messageId, { error: err.message });
+    throw err;
+  }
+}
 
 export function parseDelivery(task: Task): AgentDelivery {
   try {
@@ -48,9 +72,22 @@ export function describeMode(mode: DeliveryMode): string {
   }[mode];
 }
 
-async function webhookAuthHeader(token: string | null | undefined): Promise<Record<string, string>> {
+/**
+ * The webhook signature: v1=hex(hmac-sha256(webhook_token, `${ts}.${rawBody}`)), keyed on the
+ * same per-task token the bearer header carries. Receivers that verify it get authenticity
+ * AND replay protection (check the timestamp window); ones that only check the bearer keep
+ * working untouched.
+ */
+export function signWebhookBody(token: string, rawBody: string, tsSeconds = Math.floor(Date.now() / 1000)): { timestamp: string; signature: string } {
+  const ts = String(tsSeconds);
+  return { timestamp: ts, signature: `v1=${createHmac("sha256", token).update(`${ts}.${rawBody}`).digest("hex")}` };
+}
+
+async function webhookAuthHeaders(token: string | null | undefined, rawBody: string): Promise<Record<string, string>> {
   const t = await openMaybe(token ?? null);
-  return t ? { authorization: `Bearer ${t}` } : {};
+  if (!t) return {};
+  const { timestamp, signature } = signWebhookBody(t, rawBody);
+  return { authorization: `Bearer ${t}`, "x-acp-timestamp": timestamp, "x-acp-signature": signature };
 }
 
 function describeRouting(routing: string | null): string {
@@ -77,10 +114,12 @@ export async function deliverToConnection(messageId: number, platformId: string)
     adapter = getProvider(platformId);
   }
   if (!adapter) throw new Error(`unknown provider ${platformId}`);
+  const quotaStopped = await gateDeliveryQuota(msg.id);
+  if (quotaStopped) return quotaStopped;
   const p = adapter.config();
   const { run, track } = await beginRun({ kind: "chat", label: `Message to ${p.name}`, provider: p.id, message_id: msg.id, trigger: "user", agent_id: (await ensureProviderAgent(p.id))?.id ?? null });
-  // Everything this run does logs with its id attached.
-  return withLogContext({ run_id: run.id }, async () => {
+  // Everything this run does logs with its id attached, under a heartbeat on the run's lease.
+  return withRunLease(run.id, () => withLogContext({ run_id: run.id }, async () => {
     await updateMessage(msg.id, { platform: p.id, task_id: null, run_id: run.id, status: "assigned", delivery_mode: "chat", error: null, response: null, delivered_at: null, acked_at: null, steps: null });
     await track.set("route", `Sending to ${p.name}`, "done", describeRouting(msg.routing));
     // The gate comes before any browser work: under "ask" the run parks here, holding nothing.
@@ -91,7 +130,7 @@ export async function deliverToConnection(messageId: number, platformId: string)
       throw err;
     }
     return performChatSend(run.id, track, msg.id, platformId);
-  });
+  }));
 }
 
 /** The send segment: everything after the gate. Runs first-pass and on resume after approval. */
@@ -132,6 +171,14 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
     return (await updateMessage(msg.id, { status: "done", acked_at: new Date().toISOString(), response, error: null }))!;
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
+    if (isProviderBusy(err)) {
+      // This attempt's run is settled, but the message goes BACK to assigned and the error
+      // is rethrown: the job retries per policy, and the next attempt gets a fresh run.
+      await track.failRunning(error);
+      await endRun(runId, { status: "failed", error });
+      await updateMessage(msg.id, { status: "assigned", error });
+      throw err;
+    }
     log.error(`delivery of message ${msg.id} crashed`, err);
     return fail(error);
   }
@@ -142,7 +189,7 @@ registerResumer("chat", async (run) => {
     await endRun(run.id, { status: "failed", error: "the message behind this run is gone" });
     return;
   }
-  await withLogContext({ run_id: run.id }, () => performChatSend(run.id, new RunTracker(run.id, run.message_id), run.message_id!, run.provider!));
+  await withRunLease(run.id, () => withLogContext({ run_id: run.id }, () => performChatSend(run.id, new RunTracker(run.id, run.message_id), run.message_id!, run.provider!)));
 });
 
 /**
@@ -157,58 +204,80 @@ export async function deliverMessage(messageId: number): Promise<MessageWithTask
   if (!task) throw new Error("task not found");
   const mode = resolveMode(task);
   const nowIso = new Date().toISOString();
+  const quotaStopped = await gateDeliveryQuota(msg.id);
+  if (quotaStopped) return quotaStopped;
   const { run, track } = await beginRun({ kind: "dispatch", label: `Instruction to ${task.name}`, provider: task.platform, task_id: task.id, message_id: msg.id, trigger: "user", agent_id: task.agent_id ?? (await ensureTaskAgent(task))?.id ?? null });
   await updateMessage(msg.id, { run_id: run.id, steps: [] });
 
-  try {
-    switch (mode) {
-      case "inbox":
-      case "manual":
-        await track.waiting("deliver", mode === "inbox" ? `Waiting for ${task.name} to pick it up` : `Copy it into ${task.name} yourself`);
-        return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode, error: null }))!;
+  return withRunLease(run.id, async () => {
+    try {
+      switch (mode) {
+        case "inbox":
+        case "manual":
+          await track.waiting("deliver", mode === "inbox" ? `Waiting for ${task.name} to pick it up` : `Copy it into ${task.name} yourself`);
+          return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode, error: null }))!;
 
-      case "webhook": {
-        const d = parseDelivery(task);
-        if (!d.webhook_url) throw new Error("task has no webhook_url");
-        try {
-          await guard({ runId: run.id, messageId: msg.id, provider: task.platform, track, kind: "dispatch", checkpoint: { step: "deliver" } }, "dispatch_webhook", `Send this instruction to ${task.name}?`, msg.text.slice(0, 240));
-        } catch (err) {
-          if (err instanceof ApprovalPending) return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode }))!;
-          throw err;
+        case "webhook": {
+          const d = parseDelivery(task);
+          if (!d.webhook_url) throw new Error("task has no webhook_url");
+          try {
+            await guard({ runId: run.id, messageId: msg.id, provider: task.platform, track, kind: "dispatch", checkpoint: { step: "deliver" } }, "dispatch_webhook", `Send this instruction to ${task.name}?`, msg.text.slice(0, 240));
+          } catch (err) {
+            if (err instanceof ApprovalPending) return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode }))!;
+            throw err;
+          }
+          return performWebhookDeliver(run.id, track, msg.id);
         }
-        return performWebhookDeliver(run.id, track, msg.id);
-      }
 
-      case "browser": {
-        const p = getPlatform(task.platform);
-        if (!p) throw new Error(`unknown provider ${task.platform}`);
-        const actionName = parseDelivery(task).action || "send_message";
-        if (!p.actions?.[actionName]) throw new Error(`provider ${p.name} has no "${actionName}" action; define one in its settings`);
-        if ((await getPlatformState(p.id)).session_status === "needs_login") throw new Error(`${p.name} needs login before messages can be sent`);
-        await track.start("deliver", `Running "${actionName}" on ${p.name}`);
-        let r;
-        try {
-          r = await runAction(p, actionName, task, { message: msg.text }, { messageId: msg.id, runId: run.id, track, runKind: "dispatch" });
-        } catch (err) {
-          if (err instanceof ApprovalPending) return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode }))!;
-          throw err;
+        case "browser": {
+          const p = getPlatform(task.platform);
+          if (!p) throw new Error(`unknown provider ${task.platform}`);
+          const actionName = parseDelivery(task).action || "send_message";
+          if (!p.actions?.[actionName]) throw new Error(`provider ${p.name} has no "${actionName}" action; define one in its settings`);
+          if ((await getPlatformState(p.id)).session_status === "needs_login") throw new Error(`${p.name} needs login before messages can be sent`);
+          await track.start("deliver", `Running "${actionName}" on ${p.name}`);
+          let r;
+          try {
+            r = await runAction(p, actionName, task, { message: msg.text }, { messageId: msg.id, runId: run.id, track, runKind: "dispatch" });
+          } catch (err) {
+            if (err instanceof ApprovalPending) return (await updateMessage(msg.id, { status: "assigned", delivery_mode: mode }))!;
+            throw err;
+          }
+          if (!r.ok) throw new Error(r.message);
+          await track.done("deliver", r.message);
+          await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null });
+          return (await updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null }))!;
         }
-        if (!r.ok) throw new Error(r.message);
-        await track.done("deliver", r.message);
-        await endRun(run.id, { status: "success", summary: r.message, output_url: r.url ?? null });
-        return (await updateMessage(msg.id, { status: "delivered", delivery_mode: mode, delivered_at: nowIso, error: null }))!;
       }
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      if (isProviderBusy(err)) {
+        // Settle this attempt's run, hand the message back, and let the job retry per policy.
+        await track.failRunning(error);
+        await endRun(run.id, { status: "failed", error });
+        await updateMessage(msg.id, { status: "assigned", delivery_mode: mode, error });
+        throw err;
+      }
+      log.warn(`delivery of message ${msg.id} to ${task.name} via ${mode} failed: ${error}`);
+      await track.failRunning(error);
+      await endRun(run.id, { status: "failed", error });
+      await addEvent({ platform: task.platform, kind: "message", title: `Could not deliver instruction to ${task.name}`, body: `${error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
+      return (await updateMessage(msg.id, { status: "failed", delivery_mode: mode, error }))!;
     }
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    log.warn(`delivery of message ${msg.id} to ${task.name} via ${mode} failed: ${error}`);
-    await track.failRunning(error);
-    await endRun(run.id, { status: "failed", error });
-    await addEvent({ platform: task.platform, kind: "message", title: `Could not deliver instruction to ${task.name}`, body: `${error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
-    return (await updateMessage(msg.id, { status: "failed", delivery_mode: mode, error }))!;
-  }
-  return msg;
+    return msg;
+  });
 }
+
+/*
+  Webhook attempts and their backoff. The retries live INSIDE the handler, in one run, rather
+  than as a durable webhook.deliver job: a run's outcome is single-shot (endRun refuses a
+  settled run), so attempts spread over pg-boss redeliveries would each need their own run or
+  an illegal failed→running reopen. Three quick tries in one run keeps the timeline honest
+  (each attempt is a step detail, the final failure fails the run with the last error) and
+  stays well inside the dispatch handler's watchdog deadline.
+*/
+const WEBHOOK_ATTEMPTS = 3;
+const WEBHOOK_BACKOFF_MS = [2_000, 8_000];
 
 /** The webhook segment: everything after the gate. Runs first-pass and on resume after approval. */
 async function performWebhookDeliver(runId: number, track: RunTracker, messageId: number): Promise<MessageWithTask> {
@@ -217,24 +286,42 @@ async function performWebhookDeliver(runId: number, track: RunTracker, messageId
   const d = parseDelivery(task);
   try {
     await track.start("deliver", `Posting to ${task.name}'s webhook`);
-    const res = await egressFetch(d.webhook_url!, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...(await webhookAuthHeader(d.webhook_token)) },
-      body: JSON.stringify({
-        message_id: msg.id,
-        run_id: runId,
-        text: msg.text,
-        agent: { key: task.key, name: task.name, platform: task.platform },
-        task: { key: task.key, name: task.name, platform: task.platform },
-        created_at: msg.created_at,
-        ack_url: config.publicUrl ? `${config.publicUrl}/api/inbox/${msg.id}/ack` : null,
-      }),
-      signal: AbortSignal.timeout(20_000),
+    const body = JSON.stringify({
+      message_id: msg.id,
+      run_id: runId,
+      text: msg.text,
+      agent: { key: task.key, name: task.name, platform: task.platform },
+      task: { key: task.key, name: task.name, platform: task.platform },
+      created_at: msg.created_at,
+      ack_url: config.publicUrl ? `${config.publicUrl}/api/inbox/${msg.id}/ack` : null,
     });
-    if (!res.ok) throw new Error(`webhook responded ${res.status}`);
-    await track.done("deliver", `HTTP ${res.status}`);
-    await track.waiting("ack", `Waiting for ${task.name} to report back`);
-    return (await updateMessage(msg.id, { status: "delivered", delivery_mode: "webhook", delivered_at: new Date().toISOString(), error: null }))!;
+    let lastError = "";
+    for (let attempt = 1; attempt <= WEBHOOK_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        await track.set("deliver", "", "running", `attempt ${attempt} of ${WEBHOOK_ATTEMPTS}: ${lastError}`);
+        await new Promise((r) => setTimeout(r, WEBHOOK_BACKOFF_MS[attempt - 2]));
+      }
+      try {
+        // Signed fresh per attempt, so a receiver enforcing a timestamp window accepts retries.
+        const res = await egressFetch(d.webhook_url!, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(await webhookAuthHeaders(d.webhook_token, body)) },
+          body,
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (res.ok) {
+          await track.done("deliver", `HTTP ${res.status}${attempt > 1 ? ` (attempt ${attempt})` : ""}`);
+          await track.waiting("ack", `Waiting for ${task.name} to report back`);
+          return (await updateMessage(msg.id, { status: "delivered", delivery_mode: "webhook", delivered_at: new Date().toISOString(), error: null }))!;
+        }
+        lastError = `webhook responded ${res.status}`;
+        // A definite client-side rejection will not change on a retry; 408/429 are transient.
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) break;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    throw new Error(lastError || "webhook delivery failed");
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log.warn(`delivery of message ${msg.id} to ${task.name} via webhook failed: ${error}`);

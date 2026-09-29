@@ -34,12 +34,34 @@ let lastSaveAt: string | null = null;
 let lastError: string | null = null;
 let saving: Promise<string[]> | null = null;
 
+/**
+ * TLS for the mirror connection, from ACP_PG_SSL: verified by default when the URL wants
+ * TLS at all — accepting any certificate silently is a downgrade nobody chose. "no-verify"
+ * remains an explicit, loudly-logged opt-in for servers with self-signed certificates,
+ * "require" forces verified TLS, "disable" turns it off.
+ */
+function sslFor(u: string): pg.PoolConfig["ssl"] {
+  const mode = (process.env.ACP_PG_SSL || "").toLowerCase();
+  if (mode === "disable") return undefined;
+  if (mode === "no-verify") {
+    log.warn("ACP_PG_SSL=no-verify: the Postgres server's certificate is NOT verified; anyone between this process and the database can read the mirrored files");
+    return { rejectUnauthorized: false };
+  }
+  if (mode === "require") return { rejectUnauthorized: true };
+  return /sslmode=require|railway|\.rlwy\.net/.test(u) && !/localhost|127\.0\.0\.1|host\.docker\.internal/.test(u) ? { rejectUnauthorized: true } : undefined;
+}
+
 function connect(): Promise<boolean> {
   if (!persistEnabled) return Promise.resolve(false);
   if (ready) return ready;
   ready = (async () => {
     try {
-      pool = new pg.Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 10_000, ssl: /sslmode=require|railway|\.rlwy\.net/.test(url) && !/localhost|127\.0\.0\.1|host\.docker\.internal/.test(url) ? { rejectUnauthorized: false } : undefined });
+      pool = new pg.Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 10_000, ssl: sslFor(url) });
+      // An idle client dropping its connection emits here; without a listener it kills the process.
+      pool.on("error", (err) => {
+        lastError = err.message;
+        log.warn(`persistence pool error: ${err.message}`);
+      });
       await pool.query(`CREATE TABLE IF NOT EXISTS acp_files (name TEXT PRIMARY KEY, data BYTEA NOT NULL, sha256 TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
       lastError = null;
       return true;

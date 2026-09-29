@@ -39,9 +39,13 @@
       ${r.output_url ? `<a class="btn xs ghost" href="${esc(r.output_url)}" target="_blank" rel="noopener" title="Open the result">${icon("popout", "sm")}</a>` : ""}
     </div>`;
 
+  // Members may look but not decide: the server 403s these actions, so the buttons say so up front.
+  const canOperate = (ctx) => ctx?.role !== "member";
   const attentionRow = (x, ctx) => {
     const local = x.action === "connect" && ctx?.conn?.(x.platform)?.signInMode === "local";
-    const act = x.action === "decide" ? `<button class="btn small" data-approve-id="${x.id}" data-decision="reject">Reject</button><button class="btn small primary" data-approve-id="${x.id}" data-decision="approve">${icon("check", "sm")} Approve</button>`
+    const act = x.action === "decide" ? (canOperate(ctx)
+        ? `<button class="btn small" data-approve-id="${x.id}" data-decision="reject">Reject</button><button class="btn small primary" data-approve-id="${x.id}" data-decision="approve">${icon("check", "sm")} Approve</button>`
+        : `<span class="badge warn" title="Only owners and admins can decide approvals.">awaiting an operator</span>`)
       : x.action === "connect" ? `<button class="btn small primary" data-connect="${esc(x.platform)}">${local ? "Connect from this computer" : "Sign in"}</button>`
       : x.action === "open_chat" ? `<button class="btn small" data-nav="chat">Open command</button>`
       : x.action === "dismiss" ? `<button class="btn small ghost" data-read="${x.id}">Dismiss</button>` : "";
@@ -144,7 +148,7 @@
 
     async approvals(root, ctx) {
       const a = await ctx.api("/approvals?limit=30");
-      const card = (x) => `<div class="notice ${x.status === "pending" ? "warn" : ""}"><div class="body"><strong>${esc(x.summary)}</strong><div class="sub">${esc(x.action)}${x.run_label ? ` · ${esc(x.run_label)}` : ""}${x.provider ? ` · ${esc(ctx.aiName(x.provider))}` : ""} · asked ${esc(rel(x.requested_at))}${x.detail ? `<br><em>${esc(String(x.detail).slice(0, 240))}</em>` : ""}${x.status !== "pending" ? `<br>${esc(x.status)}${x.decided_by ? ` by ${esc(x.decided_by)}` : ""}${x.decided_at ? ` ${esc(rel(x.decided_at))}` : ""}${x.reason ? ` · ${esc(x.reason)}` : ""}` : ""}</div></div>${x.status === "pending" ? `<button class="btn small" data-approve-id="${x.id}" data-decision="reject">Reject</button><button class="btn small primary" data-approve-id="${x.id}" data-decision="approve">${icon("check", "sm")} Approve</button>` : `<span class="badge ${x.status === "approved" ? "ok" : x.status === "rejected" ? "bad" : "warn"}">${esc(x.status)}</span>`}</div>`;
+      const card = (x) => `<div class="notice ${x.status === "pending" ? "warn" : ""}"><div class="body"><strong>${esc(x.summary)}</strong><div class="sub">${esc(x.action)}${x.run_label ? ` · ${esc(x.run_label)}` : ""}${x.provider ? ` · ${esc(ctx.aiName(x.provider))}` : ""} · asked ${esc(rel(x.requested_at))}${x.detail ? `<br><em>${esc(String(x.detail).slice(0, 240))}</em>` : ""}${x.status !== "pending" ? `<br>${esc(x.status)}${x.decided_by ? ` by ${esc(x.decided_by)}` : ""}${x.decided_at ? ` ${esc(rel(x.decided_at))}` : ""}${x.reason ? ` · ${esc(x.reason)}` : ""}` : ""}</div></div>${x.status === "pending" ? (canOperate(ctx) ? `<button class="btn small" data-approve-id="${x.id}" data-decision="reject">Reject</button><button class="btn small primary" data-approve-id="${x.id}" data-decision="approve">${icon("check", "sm")} Approve</button>` : `<span class="badge warn" title="Only owners and admins can decide approvals.">awaiting an operator</span>`) : `<span class="badge ${x.status === "approved" ? "ok" : x.status === "rejected" ? "bad" : "warn"}">${esc(x.status)}</span>`}</div>`;
       root.innerHTML = `<section class="vsec"><h3>Waiting for you</h3>${a.pending.length ? `<div class="attention">${a.pending.map(card).join("")}</div>` : empty("Nothing to approve", "Under “Ask me first”, the agent pauses here before it sends or acts.")}</section>
         <section class="vsec"><h3>Decided</h3>${a.recent.length ? `<div class="attention">${a.recent.map(card).join("")}</div>` : `<p class="muted small">No decisions yet.</p>`}</section>
         <p class="muted small vfoot">Which actions ask is set under Settings › Approvals.</p>`;
@@ -186,7 +190,7 @@
         <label class="muted small">Show ${sel("data-log-level", f.level, LOG_LEVELS, (l) => (l === "debug" ? "everything" : `${l} and above`))}</label>
         <label class="muted small">from ${sel("data-log-scope", f.scope, ["", ...r.scopes.filter((s) => s !== f.scope), ...(f.scope ? [f.scope] : [])].sort(), (s) => s || "every part")}</label>
         <span class="spacer"></span>
-        <label class="muted small" title="What the server prints to its own console, which is what the host (Railway) shows. This view always keeps everything the server logged, whatever the console prints.">Console prints ${sel("data-console-level", r.level, LOG_LEVELS, (l) => `${l} and above`)}</label>
+        <label class="muted small" title="What the server prints to its own console, which is what the host (Railway) shows. This view always keeps everything the server logged, whatever the console prints.">Console prints ${sel(`data-console-level${ctx.role === "member" ? " disabled" : ""}`, r.level, LOG_LEVELS, (l) => `${l} and above`)}</label>
         <button class="btn xs ghost" data-log-clear title="Clear the screen; the server keeps its lines">Clear</button>
       </div>
       <div class="loglist" id="log-lines">${r.lines.map(logLine).join("")}</div>

@@ -11,6 +11,17 @@
 #     Needs ACP_MASTER_KEY in .env (openssl rand -hex 32): the split services refuse to start
 #     without one shared key.
 #
+# Secrets: ACP_ADMIN_TOKEN and ACP_INGEST_TOKEN have NO defaults on purpose. Leave them unset
+# and the app walks you through creating real ones on first visit; a baked-in placeholder
+# would be the same password on every install that ever copied this file. The split mode
+# needs POSTGRES_PASSWORD set in .env — there is no fallback for the database either. Note:
+# compose interpolates `${VAR:?}` even for profiles that are not running, so plain
+# `docker compose up` (single-container profile, no Postgres) also needs POSTGRES_PASSWORD
+# present in .env — any value; the single container never uses it.
+#
+# Only the api publishes a port. Never publish the worker or browser ports: they trust their
+# network neighbours (the queue, the VNC bridge) and have no login of their own.
+#
 # Guides: docs/local.md (this machine), docs/railway.md, docs/self-hosted.md.
 #
 # Dashboard: http://localhost:8080   Browser screen: http://localhost:8080/vnc/
@@ -21,8 +32,8 @@ services:
     ports:
       - "8080:8080"
     environment:
-      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-change-me-admin}
-      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-change-me-ingest}
+      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-}
+      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       SYNC_INTERVAL_MIN: ${SYNC_INTERVAL_MIN:-20}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
@@ -34,16 +45,28 @@ services:
     volumes:
       - acp-data:/data
     shm_size: "1g"
+    mem_limit: 3g
+    # Chrome's sandbox needs setuid/userns, so this service gets the tailored seccomp profile
+    # (docker/seccomp_profile.json) instead of no-new-privileges.
+    security_opt: ["seccomp:./docker/seccomp_profile.json"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     restart: unless-stopped
 
   db:
     profiles: ["split"]
     image: postgres:17-alpine
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-acp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - the split database has no default password}
       POSTGRES_DB: acp
     volumes:
       - acp-pg:/var/lib/postgresql/data
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -54,6 +77,7 @@ services:
   redis:
     profiles: ["split"]
     image: redis:7-alpine
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -70,14 +94,22 @@ services:
       - "8080:8080"
     environment:
       ROLE: api
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/acp
       REDIS_URL: redis://redis:6379
-      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-change-me-admin}
-      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-change-me-ingest}
+      ACP_ADMIN_TOKEN: ${ACP_ADMIN_TOKEN:-}
+      ACP_INGEST_TOKEN: ${ACP_INGEST_TOKEN:-}
       ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       # The live browser screen lives on the browser worker in split mode.
       VNC_TARGET: http://browser:6080
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
@@ -85,6 +117,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # No ports on the worker or browser: they are reachable from inside the compose network
+  # only, and must stay that way.
   worker:
     profiles: ["split"]
     build:
@@ -92,13 +126,21 @@ services:
       dockerfile: Dockerfile.api
     environment:
       ROLE: worker
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/acp
       REDIS_URL: redis://redis:6379
       ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       IMAP_HOST: ${IMAP_HOST:-}
       IMAP_USER: ${IMAP_USER:-}
       IMAP_PASS: ${IMAP_PASS:-}
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
@@ -111,7 +153,7 @@ services:
     build: .
     environment:
       ROLE: browser
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-acp}@db:5432/acp
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/acp
       REDIS_URL: redis://redis:6379
       ACP_MASTER_KEY: ${ACP_MASTER_KEY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
@@ -120,6 +162,16 @@ services:
     volumes:
       - acp-worker-data:/data
     shm_size: "1g"
+    mem_limit: 3g
+    # Chrome's sandbox needs setuid/userns, so the browser gets the tailored seccomp profile
+    # (docker/seccomp_profile.json) instead of no-new-privileges.
+    security_opt: ["seccomp:./docker/seccomp_profile.json"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     depends_on:
       db:
         condition: service_healthy

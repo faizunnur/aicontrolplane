@@ -29,9 +29,11 @@ describe("outbox event log", () => {
 
   it("pruning trims old entries and leaves fresh ones", async () => {
     await db.upsertTask({ platform: "chatgpt", key: "outbox-probe-2", name: "Outbox probe 2", source: "discovered" });
+    await db.flushNotifications(); // appends are batched; land them before pruning
     const removed = await db.pruneOutbox(0); // everything is "old" at a zero window
     assert.ok(removed > 0);
     await db.upsertTask({ platform: "chatgpt", key: "outbox-probe-3", name: "Outbox probe 3", source: "discovered" });
+    await db.flushNotifications();
     assert.ok((await db.outboxAfter(1, 0, 10)).length > 0, "new entries keep flowing");
   });
 });

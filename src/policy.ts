@@ -36,9 +36,11 @@ export const ACTIONS: Record<string, PolicyDefinition> = {
   screenshot: { label: "Take a screenshot", description: "Capture a provider's tab.", auto: "auto", manual: "auto", floor: "auto" },
   sync: { label: "Look at a provider's tasks", description: "Visit a provider's tasks page and read what it shows.", auto: "auto", manual: "auto", floor: "auto" },
   send_message: { label: "Send a message to an AI", description: "Type and send a message in a provider's chat.", auto: "auto", manual: "ask", floor: "auto" },
-  run_action: { label: "Run a browser action", description: "Run a configured sequence of clicks and inputs on a provider's site.", auto: "auto", manual: "ask", floor: "auto" },
+  // Configured click sequences and outbound instructions reach beyond a chat box, so even
+  // the easy-going preset asks first; an explicit override can still relax either to auto.
+  run_action: { label: "Run a browser action", description: "Run a configured sequence of clicks and inputs on a provider's site.", auto: "ask", manual: "ask", floor: "auto" },
   run_task: { label: "Start a task at a provider", description: "Trigger a task to run now (a routine's API trigger, an agent's webhook).", auto: "auto", manual: "ask", floor: "auto" },
-  dispatch_webhook: { label: "Send an instruction to your agent", description: "Post an instruction to one of your own agents.", auto: "auto", manual: "ask", floor: "auto" },
+  dispatch_webhook: { label: "Send an instruction to your agent", description: "Post an instruction to one of your own agents.", auto: "ask", manual: "ask", floor: "auto" },
   modify_repository: { label: "Modify a repository", description: "Push commits, open or merge pull requests.", auto: "ask", manual: "ask", floor: "ask" },
   deploy_production: { label: "Deploy to production", description: "Ship something to a live environment.", auto: "always", manual: "always", floor: "always" },
   delete_resource: { label: "Delete a resource", description: "Remove data, infrastructure or accounts.", auto: "always", manual: "always", floor: "always" },
