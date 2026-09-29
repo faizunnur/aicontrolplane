@@ -10,6 +10,6 @@ import { seal } from "./secrets.js";
   only the wiring lives here.
 */
 
-await initData({ dbPath: config.dbPath, databaseUrl: config.db.url || undefined, driver: config.db.driver, notify: (topic, payload, outboxId) => bus.emit(topic, payload, outboxId), sealSecret: (v) => seal(v) });
+await initData({ dbPath: config.dbPath, databaseUrl: config.db.url || undefined, driver: config.db.driver, notify: (topic, payload, outboxId, orgId) => bus.emit(topic, payload, outboxId, orgId), sealSecret: (v) => seal(v) });
 
 export * from "../packages/data/src/index.js";

@@ -38,7 +38,7 @@ describe("real user accounts", () => {
   it("sessions carry their user, and deleting the account kills them", async () => {
     const u = await db.createUser({ email: "gone@example.test", password_hash: await auth.hashPassword("gone-password-3") });
     const req = { headers: {}, socket: { remoteAddress: "127.0.0.1" } } as unknown as import("node:http").IncomingMessage;
-    const token = await auth.createSession(req, { id: u.id, email: u.email, role: u.role });
+    const token = await auth.createSession(req, { id: u.id, email: u.email, role: u.role, orgId: u.org_id });
     const authed = { headers: { cookie: `acp_session=${token}` } } as unknown as import("node:http").IncomingMessage;
     assert.equal((await auth.authUser(authed))?.email, "gone@example.test");
     await db.deleteSessionsForUser(u.id);

@@ -22,6 +22,11 @@ delete process.env.RAILWAY_VOLUME_MOUNT_PATH;
  * it instead of SQLite. Each test process gets its own throw-away database, because the files
  * run in parallel and every one assumes a fresh store.
  */
+// Unit tests exercise the data layer directly, and node:test callbacks run outside any async
+// scope entered here — so the data layer accepts this default workspace in their stead. The
+// spawned-server e2e suite does not set it: there, an unscoped query still throws.
+process.env.ACP_TEST_DEFAULT_ORG = "1";
+
 export const testDriver: "sqlite" | "pg" = process.env.TEST_PG_URL ? "pg" : "sqlite";
 if (process.env.TEST_PG_URL) {
   const { default: pg } = await import("pg");

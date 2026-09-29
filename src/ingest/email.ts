@@ -2,7 +2,7 @@ import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { sendAlert } from "../alerts.js";
 import { config } from "../config.js";
-import { addEvent, listTasks, recordRun } from "../db.js";
+import { addEvent, listTasks, recordRun, withOrg } from "../db.js";
 import { logger } from "../logger.js";
 import { mapRunStatus } from "../providers/browser/normalize.js";
 
@@ -53,6 +53,11 @@ function platformForSender(address: string): string | null {
 
 /** Fetch unseen messages, turn matching ones into events (and runs when an agent name matches). */
 export async function pollOnce(): Promise<number> {
+  // The IMAP account comes from install-level env config, so whatever it ingests belongs to
+  // the founding workspace — whoever triggered the poll.
+  return withOrg(1, () => pollOnceInner());
+}
+async function pollOnceInner(): Promise<number> {
   if (polling) return 0;
   polling = true;
   let count = 0;

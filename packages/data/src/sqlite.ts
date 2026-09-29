@@ -453,6 +453,158 @@ const MIGRATIONS: { id: number; name: string; up: (db: Database.Database) => voi
       }
     },
   },
+  {
+    id: 12,
+    name: "workspaces: orgs, per-org uniqueness, account verification",
+    up: (db) => {
+      // SQLite installs stay a single workspace (org 1) — sign-up needs Postgres — but they
+      // run the same org-scoped SQL, so every tenant table gains org_id and the uniqueness
+      // that must be per-workspace becomes composite. SQLite cannot alter a primary key, so
+      // the affected tables are rebuilt (create new → copy → drop old → rename); the old
+      // single-column uniques must go with them or composite upserts would still trip on
+      // them. foreign_keys is OFF for the whole migration run.
+      db.exec(`CREATE TABLE IF NOT EXISTS orgs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        plan TEXT NOT NULL DEFAULT 'default',
+        quotas TEXT,
+        created_at TEXT NOT NULL
+      )`);
+      db.prepare("INSERT OR IGNORE INTO orgs (id, name, created_at) VALUES (1, 'Default', ?)").run(now());
+
+      db.exec(`CREATE TABLE settings_new (
+        key TEXT NOT NULL,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        value TEXT NOT NULL,
+        PRIMARY KEY (org_id, key)
+      )`);
+      db.exec("INSERT INTO settings_new (key, org_id, value) SELECT key, 1, value FROM settings");
+      db.exec("DROP TABLE settings");
+      db.exec("ALTER TABLE settings_new RENAME TO settings");
+
+      db.exec(`CREATE TABLE policies_new (
+        action TEXT NOT NULL,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        mode TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (org_id, action)
+      )`);
+      db.exec("INSERT INTO policies_new (action, org_id, mode, updated_at) SELECT action, 1, mode, updated_at FROM policies");
+      db.exec("DROP TABLE policies");
+      db.exec("ALTER TABLE policies_new RENAME TO policies");
+
+      db.exec(`CREATE TABLE platform_state_new (
+        platform TEXT NOT NULL,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        session_status TEXT NOT NULL DEFAULT 'unknown',
+        last_sync_at TEXT,
+        last_ok_at TEXT,
+        last_error TEXT,
+        screenshot_path TEXT,
+        meta TEXT,
+        PRIMARY KEY (org_id, platform)
+      )`);
+      db.exec("INSERT INTO platform_state_new (platform, org_id, session_status, last_sync_at, last_ok_at, last_error, screenshot_path, meta) SELECT platform, 1, session_status, last_sync_at, last_ok_at, last_error, screenshot_path, meta FROM platform_state");
+      db.exec("DROP TABLE platform_state");
+      db.exec("ALTER TABLE platform_state_new RENAME TO platform_state");
+
+      db.exec(`CREATE TABLE browser_sessions_new (
+        id TEXT NOT NULL,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        blob TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (org_id, id)
+      )`);
+      db.exec("INSERT INTO browser_sessions_new (id, org_id, blob, updated_at) SELECT id, 1, blob, updated_at FROM browser_sessions");
+      db.exec("DROP TABLE browser_sessions");
+      db.exec("ALTER TABLE browser_sessions_new RENAME TO browser_sessions");
+
+      db.exec(`CREATE TABLE agent_profiles_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        provider_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'custom',
+        capabilities TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        configuration TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`);
+      db.exec("INSERT INTO agent_profiles_new (id, org_id, key, name, description, provider_id, kind, capabilities, status, configuration, created_at, updated_at) SELECT id, 1, key, name, description, provider_id, kind, capabilities, status, configuration, created_at, updated_at FROM agent_profiles");
+      db.exec("DROP TABLE agent_profiles");
+      db.exec("ALTER TABLE agent_profiles_new RENAME TO agent_profiles");
+      db.exec("CREATE UNIQUE INDEX agent_profiles_org_key ON agent_profiles(org_id, key)");
+
+      db.exec(`CREATE TABLE tasks_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        platform TEXT NOT NULL,
+        key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'registry',
+        purpose TEXT,
+        schedule TEXT,
+        native_url TEXT,
+        status TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        meta TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        keywords TEXT,
+        delivery TEXT,
+        agent_id INTEGER REFERENCES agent_profiles(id) ON DELETE SET NULL,
+        prompt TEXT,
+        next_run TEXT,
+        configuration TEXT,
+        UNIQUE(org_id, platform, key)
+      )`);
+      db.exec("INSERT INTO tasks_new (id, org_id, platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, created_at, updated_at, keywords, delivery, agent_id, prompt, next_run, configuration) SELECT id, 1, platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, created_at, updated_at, keywords, delivery, agent_id, prompt, next_run, configuration FROM tasks");
+      db.exec("DROP TABLE tasks");
+      db.exec("ALTER TABLE tasks_new RENAME TO tasks");
+
+      db.exec(`CREATE TABLE events_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        platform TEXT,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT,
+        link TEXT,
+        read INTEGER NOT NULL DEFAULT 0,
+        occurred_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        dedupe_key TEXT
+      )`);
+      db.exec("INSERT INTO events_new (id, org_id, platform, kind, title, body, link, read, occurred_at, created_at, dedupe_key) SELECT id, 1, platform, kind, title, body, link, read, occurred_at, created_at, dedupe_key FROM events");
+      db.exec("DROP TABLE events");
+      db.exec("ALTER TABLE events_new RENAME TO events");
+      db.exec("CREATE UNIQUE INDEX events_org_dedupe ON events(org_id, dedupe_key) WHERE dedupe_key IS NOT NULL");
+
+      // The rest only need the column (their ids stay globally unique).
+      for (const t of ["messages", "runs", "run_events", "captures", "sync_log", "approvals", "audit_log", "sessions", "pairings", "conversations", "outbox", "browser_ops", "users"]) {
+        ensureColumn(db, t, "org_id", "org_id INTEGER NOT NULL DEFAULT 1");
+      }
+      db.exec("DROP INDEX IF EXISTS runs_idempotency");
+      db.exec("CREATE UNIQUE INDEX runs_idempotency ON runs(org_id, idempotency_key) WHERE idempotency_key IS NOT NULL");
+      db.exec("CREATE INDEX IF NOT EXISTS outbox_org_id ON outbox(org_id, id)");
+
+      // Accounts that exist predate verification; they must not be locked out.
+      ensureColumn(db, "users", "verified_at", "verified_at TEXT");
+      db.prepare("UPDATE users SET verified_at = ? WHERE verified_at IS NULL").run(now());
+      db.exec(`CREATE TABLE IF NOT EXISTS user_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT
+      )`);
+    },
+  },
 ];
 
 function migrate(db: Database.Database) {

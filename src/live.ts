@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
+import type { AuthUser } from "./auth.js";
 import { bus } from "./bus.js";
-import { getMessage, getRun, outboxAfter, type MessageWithTask } from "./db.js";
+import { getMessage, getRun, outboxAfter, withOrg, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
 import { sseClients } from "./metrics.js";
 import { getPlatform } from "./platforms.js";
@@ -15,17 +16,22 @@ import { connectionCard, expandMessage } from "./view.js";
 */
 
 const log = logger("live");
-const clients = new Set<Response>();
+/** Every open page, with the workspace it is allowed to see. */
+const clients = new Map<Response, { orgId: number }>();
 
 function writeEvent(res: Response, event: string, data: unknown, id?: number) {
   const idLine = id !== undefined ? `id: ${id}\n` : "";
   res.write(`${idLine}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function broadcast(event: string, data: unknown, id?: number) {
+function broadcast(event: string, data: unknown, id?: number, orgId?: number) {
   if (!clients.size) return;
+  // Fail closed: an event that names no workspace (boot paths, browser state, log lines) is
+  // an install-level concern and reaches only the founding workspace's pages.
+  const target = orgId ?? 1;
   const failed: Response[] = [];
-  for (const res of clients) {
+  for (const [res, c] of clients) {
+    if (c.orgId !== target) continue;
     try {
       writeEvent(res, event, data, id);
     } catch {
@@ -72,40 +78,45 @@ async function toSse(topic: string, payload: unknown): Promise<{ event: string; 
 }
 
 // "msg" rather than "message": an EventSource treats unnamed events as "message" too, so keep the names distinct.
-bus.on("message:row", async (row: MessageWithTask, id?: number) => broadcast("msg", await expandMessage(row), id));
-bus.on("message:deleted", (info: { id: number; conversation_id: number | null }, id?: number) => broadcast("msg-deleted", info, id));
-bus.on("platform:row", async (pid: string, id?: number) => {
+// Handlers receive (payload, outboxId, orgId) from the data layer's announcer and deliver
+// only to that workspace's pages; view expansions read the database, so they re-enter the
+// event's own scope.
+bus.on("message:row", async (row: MessageWithTask, id?: number, org?: number) => broadcast("msg", await withOrg(org ?? 1, () => expandMessage(row)), id, org));
+bus.on("message:deleted", (info: { id: number; conversation_id: number | null }, id?: number, org?: number) => broadcast("msg-deleted", info, id, org));
+bus.on("platform:row", async (pid: string, id?: number, org?: number) => {
   const p = getPlatform(pid);
-  if (p) broadcast("connection", await connectionCard(p), id);
+  if (p) broadcast("connection", await withOrg(org ?? 1, () => connectionCard(p)), id, org);
 });
 bus.on("browser", (state: unknown) => broadcast("browser", state));
-bus.on("conversation", (c: unknown, id?: number) => broadcast("conversation", c, id));
-bus.on("settings", (s: unknown) => broadcast("settings", s));
-bus.on("run", (r: unknown, id?: number) => broadcast("run", r, id));
-bus.on("run-event", async (e: { run_id: number; type?: string }, id?: number) => {
-  broadcast("run-event", e, id);
+bus.on("conversation", (c: unknown, id?: number, org?: number) => broadcast("conversation", c, id, org));
+bus.on("settings", (s: unknown, id?: number, org?: number) => broadcast("settings", s, id, org));
+bus.on("run", (r: unknown, id?: number, org?: number) => broadcast("run", r, id, org));
+bus.on("run-event", async (e: { run_id: number; type?: string }, id?: number, org?: number) => {
+  broadcast("run-event", e, id, org);
   // The thread renders a live run's steps from "msg" updates. Steps are no longer mirrored
   // onto the message row while a run executes, so refresh the open pages' view of the
   // message here — folding costs a read only while someone is actually watching.
   if (!clients.size || e.type !== "step") return;
   try {
-    const run = await getRun(e.run_id);
-    if (!run?.message_id) return;
-    const m = await getMessage(run.message_id);
-    if (m) broadcast("msg", await expandMessage(m));
+    await withOrg(org ?? 1, async () => {
+      const run = await getRun(e.run_id);
+      if (!run?.message_id) return;
+      const m = await getMessage(run.message_id);
+      if (m) broadcast("msg", await expandMessage(m), undefined, org);
+    });
   } catch (err) {
     log.debug("live step fanout failed", err);
   }
 });
-bus.on("task", (t: unknown, id?: number) => broadcast("task", t, id));
-bus.on("task:deleted", (t: unknown, id?: number) => broadcast("task-deleted", t, id));
-bus.on("notification", (n: unknown, id?: number) => broadcast("notification", n, id));
-bus.on("approval", (a: unknown, id?: number) => broadcast("approval", a, id));
-bus.on("policy", (p: unknown) => broadcast("policy", p));
-bus.on("agent", (a: unknown, id?: number) => broadcast("agent", a, id));
-bus.on("agent:deleted", (a: unknown, id?: number) => broadcast("agent-deleted", a, id));
+bus.on("task", (t: unknown, id?: number, org?: number) => broadcast("task", t, id, org));
+bus.on("task:deleted", (t: unknown, id?: number, org?: number) => broadcast("task-deleted", t, id, org));
+bus.on("notification", (n: unknown, id?: number, org?: number) => broadcast("notification", n, id, org));
+bus.on("approval", (a: unknown, id?: number, org?: number) => broadcast("approval", a, id, org));
+bus.on("policy", (p: unknown, id?: number, org?: number) => broadcast("policy", p, id, org));
+bus.on("agent", (a: unknown, id?: number, org?: number) => broadcast("agent", a, id, org));
+bus.on("agent:deleted", (a: unknown, id?: number, org?: number) => broadcast("agent-deleted", a, id, org));
 bus.on("log", (l: unknown) => broadcast("log", l));
-bus.on("pairing", (p: unknown) => broadcast("pairing", p));
+bus.on("pairing", (p: unknown, id?: number, org?: number) => broadcast("pairing", p, id, org));
 
 export function streamClients() {
   return clients.size;
@@ -113,6 +124,8 @@ export function streamClients() {
 
 /** GET /api/stream */
 export function streamHandler(req: Request, res: Response) {
+  // Behind requireAdmin: the stream shows exactly one workspace — the signed-in user's.
+  const orgId = (res.locals.user as AuthUser | undefined)?.orgId ?? 1;
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -130,13 +143,13 @@ export function streamHandler(req: Request, res: Response) {
   void (async () => {
     if (replay !== null) {
       try {
-        const rows = await outboxAfter(replay, 1000);
+        const rows = await outboxAfter(orgId, replay, 1000);
         if (rows.length >= 1000) {
           writeEvent(res, "resync", { reason: "too far behind; refetch state" });
         } else {
           for (const row of rows) {
             try {
-              const mapped = await toSse(row.topic, row.payload ? JSON.parse(row.payload) : null);
+              const mapped = await withOrg(orgId, () => toSse(row.topic, row.payload ? JSON.parse(row.payload) : null));
               if (mapped) writeEvent(res, mapped.event, mapped.data, row.id);
             } catch {
               /* one bad row must not end the replay */
@@ -148,7 +161,7 @@ export function streamHandler(req: Request, res: Response) {
         writeEvent(res, "resync", { reason: "replay unavailable" });
       }
     }
-    clients.add(res);
+    clients.set(res, { orgId });
     sseClients.set(clients.size);
     log.debug(`stream client connected (${clients.size} open)${replay !== null ? ` replayed from #${replay}` : ""}`);
   })();

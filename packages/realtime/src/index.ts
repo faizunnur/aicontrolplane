@@ -11,8 +11,8 @@ import { Redis } from "ioredis";
 */
 
 export interface BusLike {
-  emit(topic: string, payload: unknown, outboxId?: number): unknown;
-  on(topic: string, handler: (payload: unknown, outboxId?: number) => void): unknown;
+  emit(topic: string, payload: unknown, outboxId?: number, orgId?: number): unknown;
+  on(topic: string, handler: (payload: unknown, outboxId?: number, orgId?: number) => void): unknown;
 }
 
 /** The data and control topics worth mirroring across instances. Browser frames and log lines stay local. */
@@ -107,11 +107,13 @@ export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: Red
   let deliveringRemote = false;
 
   for (const topic of MIRRORED_TOPICS) {
-    bus.on(topic, (payload: unknown, outboxId?: number) => {
+    bus.on(topic, (payload: unknown, outboxId?: number, orgId?: number) => {
       if (deliveringRemote) return;
       let body: string;
       try {
-        body = JSON.stringify({ topic, payload, id: outboxId });
+        // The workspace travels with the event so the receiving side delivers it to the
+        // right clients, exactly as a local emit would.
+        body = JSON.stringify({ topic, payload, id: outboxId, org: orgId });
       } catch {
         return; // unserializable payloads stay local
       }
@@ -122,11 +124,11 @@ export async function startRedisBridge(bus: BusLike, redisUrl: string, opts: Red
 
   sub.on("message", (_ch: string, raw: string) => {
     try {
-      const { topic, payload, id } = JSON.parse(raw) as { topic: string; payload: unknown; id?: number };
+      const { topic, payload, id, org } = JSON.parse(raw) as { topic: string; payload: unknown; id?: number; org?: number };
       if (!MIRRORED_TOPICS.includes(topic as (typeof MIRRORED_TOPICS)[number])) return;
       deliveringRemote = true;
       try {
-        bus.emit(topic, payload, id);
+        bus.emit(topic, payload, id, org);
       } finally {
         deliveringRemote = false;
       }

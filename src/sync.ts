@@ -2,7 +2,7 @@ import { ensureSystemAgent, ensureTaskAgent } from "./agents.js";
 import { sendAlert } from "./alerts.js";
 import { browser, vncState } from "./browser/manager.js";
 import { config } from "./config.js";
-import { addEvent, findTask, finishSyncLog, getPlatformState, getSetting, recordRun, setPlatformState, startSyncLog, upsertTask } from "./db.js";
+import { addEvent, findTask, finishSyncLog, getPlatformState, getSetting, recordRun, setPlatformState, startSyncLog, upsertTask, withOrg } from "./db.js";
 import { logger } from "./logger.js";
 import { syncablePlatforms } from "./platforms.js";
 import { getProvider } from "./providers/registry.js";
@@ -80,6 +80,10 @@ async function tick() {
  * queue's cron in split mode (one firing per interval however many browser workers run).
  */
 export async function syncTick(): Promise<void> {
+  // The one browser serves the founding workspace until the fleet phase fans sync out per workspace.
+  return withOrg(1, () => syncTickInner());
+}
+async function syncTickInner(): Promise<void> {
   try {
     if (vncState.connections > 0 || Date.now() - vncState.lastActivityAt < 60_000) {
       log.info("skipping scheduled sync: browser screen is in use");

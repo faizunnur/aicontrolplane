@@ -1,4 +1,4 @@
-import { addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, listStaleRunningRuns, runEvents, setCancelRequested, startRun, transitionRun, updateMessage, type StartRunInput } from "./db.js";
+import { addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, listStaleRunningRunsAll, runEvents, setCancelRequested, startRun, systemScope, transitionRun, updateMessage, withOrg, type StartRunInput } from "./db.js";
 import { logger } from "./logger.js";
 import { runsSettled } from "./metrics.js";
 import type { Run, RunStatus, Step, StepStatus } from "../packages/core/src/index.js";
@@ -184,16 +184,20 @@ export const STALE_RUN_MS = 30 * 60_000;
 export async function reapStaleRuns(staleMs = STALE_RUN_MS): Promise<number> {
   const cutoff = new Date(Date.now() - staleMs).toISOString();
   let reaped = 0;
-  for (const run of await listStaleRunningRuns(cutoff)) {
-    const error = "Its process stopped answering; the run was abandoned.";
-    const failed = await transitionRun(run.id, ["running"], "failed", { error });
-    if (!failed) continue; // it moved on its own — alive after all
-    await addRunEvent(run.id, { type: "error", label: "Abandoned", detail: error });
-    if (run.message_id) {
-      const m = await getMessage(run.message_id);
-      if (m && (m.status === "assigned" || m.status === "delivered")) await updateMessage(m.id, { status: "failed", error });
-    }
-    reaped++;
+  // The worklist spans every workspace; each run is then repaired inside its own, so the
+  // failure event and message update land where they belong.
+  for (const run of await systemScope(() => listStaleRunningRunsAll(cutoff))) {
+    reaped += await withOrg(run.org_id, async () => {
+      const error = "Its process stopped answering; the run was abandoned.";
+      const failed = await transitionRun(run.id, ["running"], "failed", { error });
+      if (!failed) return 0; // it moved on its own — alive after all
+      await addRunEvent(run.id, { type: "error", label: "Abandoned", detail: error });
+      if (run.message_id) {
+        const m = await getMessage(run.message_id);
+        if (m && (m.status === "assigned" || m.status === "delivered")) await updateMessage(m.id, { status: "failed", error });
+      }
+      return 1;
+    });
   }
   if (reaped) log.warn(`reaped ${reaped} stale run(s)`);
   return reaped;

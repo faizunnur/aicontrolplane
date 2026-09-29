@@ -10,16 +10,19 @@ import {
   createUser,
   deleteAllSessions,
   deleteSession,
+  findOrgIdByIngestToken,
   findSession,
   getSetting,
   getSettingCached,
   getUser,
   getUserByEmail,
   insertSession,
+  listAllUsers,
   purgeExpiredSessions,
   setSetting,
   touchSession,
   updateUser,
+  withOrg,
   type UserRole,
   type UserRow,
 } from "./db.js";
@@ -45,6 +48,8 @@ export interface AuthUser {
   id: number;
   email: string;
   role: UserRole;
+  /** The workspace every query this user makes is scoped to. */
+  orgId: number;
 }
 
 export function tokenHash(token: string): string {
@@ -60,8 +65,8 @@ function safeEqual(a: string, b: string): boolean {
 const envAdmin = process.env.ACP_ADMIN_TOKEN || "";
 const envIngest = process.env.ACP_INGEST_TOKEN || "";
 
-/** The stand-in owner for ACP_ADMIN_TOKEN logins on deployments with no user rows. */
-const ENV_OWNER: AuthUser = { id: 0, email: "admin@env", role: "owner" };
+/** The stand-in owner for ACP_ADMIN_TOKEN logins on deployments with no user rows. Founding workspace. */
+const ENV_OWNER: AuthUser = { id: 0, email: "admin@env", role: "owner", orgId: 1 };
 
 export async function hashPassword(password: string): Promise<string> {
   return argonHash(password, { memoryCost: 19_456, timeCost: 2, parallelism: 1 });
@@ -90,8 +95,11 @@ export function adminFromEnv(): boolean {
  */
 export async function createAdminPassword(password: string, email = "admin@local"): Promise<boolean> {
   if (!(await setupRequired())) return false;
-  await createUser({ email, password_hash: await hashPassword(password), role: "owner" });
-  if (!envIngest && !(await getSetting("ingest_token"))) await setSetting("ingest_token", randomBytes(24).toString("hex"));
+  // First run: the owner of the founding workspace, trusted by construction (no email round-trip).
+  await withOrg(1, async () => {
+    await createUser({ email, password_hash: await hashPassword(password), role: "owner" });
+    if (!envIngest && !(await getSetting("ingest_token"))) await setSetting("ingest_token", randomBytes(24).toString("hex"));
+  });
   return true;
 }
 
@@ -104,15 +112,15 @@ export async function verifyUser(password: string, email?: string): Promise<Auth
   let user: UserRow | undefined;
   if (email) user = await getUserByEmail(email);
   else {
-    const n = await countUsers();
-    if (n === 1) user = await getUserByEmail((await (await import("./db.js")).listUsers())[0].email);
-    else if (n > 1) return null; // several accounts: the email says which
+    const all = await listAllUsers();
+    if (all.length === 1) user = await getUser(all[0].id);
+    else if (all.length > 1) return null; // several accounts: the email says which
   }
   if (!user) return null;
   if (!(await verifyPassword(user.password_hash, password))) return null;
   if (user.password_hash.startsWith("sha256:")) await updateUser(user.id, { password_hash: await hashPassword(password) });
   await updateUser(user.id, { last_login_at: new Date().toISOString() });
-  return { id: user.id, email: user.email, role: user.role };
+  return { id: user.id, email: user.email, role: user.role, orgId: user.org_id };
 }
 
 /**
@@ -129,11 +137,12 @@ export async function matchUserByPassword(password: string, callerIp = "unknown"
   if (hit && Date.now() - hit.at < 30_000) return hit.user;
   const fails = bearerFails.get(callerIp);
   if (fails && fails.resetAt > Date.now() && fails.count > 20) return null; // guessing costs nothing further
-  const { listUsers } = await import("./db.js");
-  for (const u of await listUsers()) {
+  // O(all accounts on the install) argon2 checks — tolerable now, the reason per-workspace
+  // API keys are the successor to password-as-bearer.
+  for (const u of await listAllUsers()) {
     const row = await getUser(u.id);
     if (row && (await verifyPassword(row.password_hash, password))) {
-      const user: AuthUser = { id: row.id, email: row.email, role: row.role };
+      const user: AuthUser = { id: row.id, email: row.email, role: row.role, orgId: row.org_id };
       if (bearerHits.size > 1000) bearerHits.clear();
       bearerHits.set(key, { at: Date.now(), user });
       return user;
@@ -229,8 +238,9 @@ export async function createSession(req: IncomingMessage, user?: AuthUser | null
     user_agent: String(req.headers["user-agent"] ?? "").slice(0, 300) || null,
     ip: clientIp(req),
     user_id: user && user.id !== 0 ? user.id : null,
+    org_id: user?.orgId ?? 1,
   });
-  await addAudit({ actor: user?.email ?? "you", action: "auth.login", detail: clientIp(req) });
+  await withOrg(user?.orgId ?? 1, () => addAudit({ actor: user?.email ?? "you", action: "auth.login", detail: clientIp(req) }));
   return token;
 }
 
@@ -245,7 +255,7 @@ async function userById(id: number | null): Promise<AuthUser | null> {
   const hit = userCache.get(id);
   if (hit && Date.now() - hit.at < 5_000) return hit.user;
   const row = await getUser(id);
-  const user = row ? { id: row.id, email: row.email, role: row.role } : null;
+  const user = row ? { id: row.id, email: row.email, role: row.role, orgId: row.org_id } : null;
   userCache.set(id, { at: Date.now(), user });
   return user;
 }
@@ -296,20 +306,35 @@ export async function isAdmin(req: IncomingMessage): Promise<boolean> {
   return (await authUser(req)) !== null;
 }
 
+/**
+ * Which workspace an agent's credential belongs to: its workspace's ingest token, or (for
+ * scripts) a user's password. Null when the credential matches nothing.
+ */
+export async function resolveIngestOrg(req: IncomingMessage): Promise<number | null> {
+  const keyHeader = req.headers["x-api-key"];
+  for (const cred of [bearer(req), typeof keyHeader === "string" ? keyHeader : undefined]) {
+    if (!cred) continue;
+    if (envIngest && safeEqual(cred, envIngest)) return 1;
+    if (envAdmin && safeEqual(cred, envAdmin)) return 1;
+    const org = await findOrgIdByIngestToken(cred);
+    if (org !== undefined) return org;
+    const user = await matchUserByPassword(cred, clientIp(req));
+    if (user) return user.orgId;
+  }
+  return null;
+}
+
 export async function isIngest(req: IncomingMessage): Promise<boolean> {
-  const b = bearer(req);
-  if (b && (safeEqual(b, await ingestToken()) || (await verifyAdmin(b)))) return true;
-  const key = req.headers["x-api-key"];
-  if (typeof key === "string" && (safeEqual(key, await ingestToken()) || (await verifyAdmin(key)))) return true;
-  return false;
+  return (await resolveIngestOrg(req)) !== null;
 }
 
 export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const user = await authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized", setup: await setupRequired() });
   res.locals.user = user;
-  // Every log line and audit row this request causes says who did it.
-  withLogContext({ user: user.email }, () => next());
+  // Every log line and audit row this request causes says who did it — and every query it
+  // makes is scoped to their workspace.
+  withLogContext({ user: user.email, org: user.orgId }, () => withOrg(user.orgId, () => next()));
 }
 
 /** Route gate for role-sensitive endpoints (user management, token rotation, policies). */
@@ -323,8 +348,10 @@ export function requireRole(...roles: UserRole[]) {
 }
 
 export async function requireIngest(req: Request, res: Response, next: NextFunction) {
-  if (await isIngest(req)) return next();
-  res.status(401).json({ error: "unauthorized: send Authorization: Bearer <ingest token>" });
+  const org = await resolveIngestOrg(req);
+  if (org === null) return res.status(401).json({ error: "unauthorized: send Authorization: Bearer <ingest token>" });
+  // Everything the agent reports lands in the workspace its token belongs to.
+  withLogContext({ org }, () => withOrg(org, () => next()));
 }
 
 export function sessionCookieHeader(secure: boolean, token: string): string {

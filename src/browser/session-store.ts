@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
-import { getBrowserSession, setBrowserSession } from "../db.js";
+import { currentOrgId, getBrowserSession, setBrowserSession, withOrg } from "../db.js";
+
+const inHomeOrg = <T>(fn: () => T): T => withOrg(currentOrgId() ?? 1, fn);
 import { logger } from "../logger.js";
 import { isSealed, open, seal } from "../secrets.js";
 
@@ -19,7 +21,7 @@ const DEFAULT_ID = "default"; // one shared browser today; per provider-connecti
 const legacyFile = () => path.join(config.dataDir, "sessions.json");
 
 export async function saveSessionState(stateJson: string): Promise<void> {
-  await setBrowserSession(DEFAULT_ID, await seal(stateJson));
+  await inHomeOrg(async () => setBrowserSession(DEFAULT_ID, await seal(stateJson)));
   // The plaintext file must not linger once the sealed copy exists.
   try {
     if (fs.existsSync(legacyFile())) {
@@ -32,7 +34,7 @@ export async function saveSessionState(stateJson: string): Promise<void> {
 }
 
 export async function loadSessionState(): Promise<string | null> {
-  const sealed = await getBrowserSession(DEFAULT_ID);
+  const sealed = await inHomeOrg(() => getBrowserSession(DEFAULT_ID));
   if (sealed) {
     try {
       return isSealed(sealed) ? await open(sealed) : sealed;

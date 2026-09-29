@@ -1,6 +1,6 @@
 import { backfillAgents } from "./agents.js";
 import { browser } from "./browser/manager.js";
-import { pruneOutbox } from "./db.js";
+import { pruneOutbox, withOrg } from "./db.js";
 import { startEmailPoller } from "./ingest/email.js";
 import { registerJobHandlers, type HandlerScope } from "./jobs.js";
 import { queue } from "./queue.js";
@@ -24,7 +24,9 @@ export async function startExecutionServices(scope: HandlerScope): Promise<void>
   if (persistEnabled) startPersistLoop();
   if (scope === "core" || scope === "all") {
     try {
-      await backfillAgents();
+      // Boot housekeeping predates any request: it belongs to the founding workspace until
+      // the browser fleet phase makes provider bookkeeping per-workspace.
+      await withOrg(1, () => backfillAgents());
       // Approvals whose run died are closed; parked ones keep waiting. Runs are reaped by
       // silence, not by boot — another executor may be mid-flight.
       const approvals = await recoverInterruptedApprovals();

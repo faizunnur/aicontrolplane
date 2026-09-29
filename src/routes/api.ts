@@ -66,6 +66,7 @@ import {
   updateMessage,
   upsertAgentProfile,
   upsertTask,
+  withOrg,
 } from "../db.js";
 import { streamClients, streamHandler } from "../live.js";
 import { routeMessage } from "../router.js";
@@ -224,6 +225,19 @@ api.post("/pairing/exchange", pairingLimit, async (req, res) => {
 api.post("/connections/:id/import-session", requirePairingFor, async (req, res, next) => {
   const pairing = res.locals.pairing as PairingRow | undefined;
   try {
+    // No login here — the pairing token is the capability, and the import lands in the
+    // workspace that created the pairing.
+    await withOrg(pairing?.org_id ?? 1, () => importSession(req, res, pairing));
+  } catch (err) {
+    // A refusal because the browser is held (a desktop sign-in) keeps the token: the helper retries.
+    // Anything else ends the pairing with the reason, so the panel says what happened.
+    const status = err && typeof err === "object" ? (err as { status?: number }).status : undefined;
+    if (pairing && status !== 409) await finishPairing(pairing.id, "failed", err instanceof Error ? err.message : String(err));
+    next(err);
+  }
+});
+async function importSession(req: Request, res: Response, pairing: PairingRow | undefined) {
+  {
     const a = requireProvider(String(req.params.id));
     if (!browserRuntimeAvailable()) return bad(res, "the browser is disabled on this deployment", 409);
     const p = a.config();
@@ -243,14 +257,8 @@ api.post("/connections/:id/import-session", requirePairingFor, async (req, res, 
       if (pairing) await finishPairing(pairing.id, "failed", `${p.name} still looks signed out after importing ${imported.cookies} cookies. Make sure you can see your chats in the Chrome window, then make a new code and try again.`);
     }
     res.json({ ok: status === "logged_in", status, name: p.name, imported, dropped: picked.dropped, mode: "local" });
-  } catch (err) {
-    // A refusal because the browser is held (a desktop sign-in) keeps the token: the helper retries.
-    // Anything else ends the pairing with the reason, so the panel says what happened.
-    const status = err && typeof err === "object" ? (err as { status?: number }).status : undefined;
-    if (pairing && status !== 409) await finishPairing(pairing.id, "failed", err instanceof Error ? err.message : String(err));
-    next(err);
   }
-});
+}
 
 /* ---------- ingest (push from agents) ---------- */
 

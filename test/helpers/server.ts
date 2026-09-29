@@ -66,6 +66,9 @@ export async function startServer(env: Record<string, string> = {}, opts: { data
       SYNC_ENABLED: "false",
       ROUTER_PROVIDER: "none",
       NODE_ENV: "test",
+      // The unit-suite convenience default must never reach a real server: here, an
+      // unscoped tenant query is a bug the suite exists to catch.
+      ACP_TEST_DEFAULT_ORG: "",
       LOG_LEVEL: process.env.ACP_TEST_LOG || "warn",
       DATABASE_URL: "",
       RAILWAY_VOLUME_MOUNT_PATH: "",
@@ -167,6 +170,9 @@ export async function startWorker(env: Record<string, string>, opts: { dataDir?:
       SYNC_ENABLED: "false",
       ROUTER_PROVIDER: "none",
       NODE_ENV: "test",
+      // The unit-suite convenience default must never reach a real server: here, an
+      // unscoped tenant query is a bug the suite exists to catch.
+      ACP_TEST_DEFAULT_ORG: "",
       LOG_LEVEL: process.env.ACP_TEST_LOG || "warn",
       RAILWAY_VOLUME_MOUNT_PATH: "",
       ...env,

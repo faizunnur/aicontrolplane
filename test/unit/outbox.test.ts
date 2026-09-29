@@ -7,13 +7,13 @@ const { beginRun } = await import("../../src/runs.js");
 
 describe("outbox event log", () => {
   it("every announced change lands in the log, in order, with a replay cursor", async () => {
-    const before = await db.outboxAfter(0, 2000);
+    const before = await db.outboxAfter(1, 0, 2000);
     const cursor = before.at(-1)?.id ?? 0;
     const t = await db.upsertTask({ platform: "chatgpt", key: "outbox-probe", name: "Outbox probe", source: "discovered" });
     const { run, track } = await beginRun({ kind: "sync", label: "probe", provider: "chatgpt", task_id: t.id });
     await track.start("open", "Opening");
     await db.flushNotifications(); // appends are chained behind the announcing write
-    const after = await db.outboxAfter(cursor, 2000);
+    const after = await db.outboxAfter(1, cursor, 2000);
     const topics = after.map((e) => e.topic);
     assert.ok(topics.includes("task"), "the task upsert was logged");
     assert.ok(topics.includes("run"), "the run start was logged");
@@ -32,7 +32,7 @@ describe("outbox event log", () => {
     const removed = await db.pruneOutbox(0); // everything is "old" at a zero window
     assert.ok(removed > 0);
     await db.upsertTask({ platform: "chatgpt", key: "outbox-probe-3", name: "Outbox probe 3", source: "discovered" });
-    assert.ok((await db.outboxAfter(0, 10)).length > 0, "new entries keep flowing");
+    assert.ok((await db.outboxAfter(1, 0, 10)).length > 0, "new entries keep flowing");
   });
 });
 

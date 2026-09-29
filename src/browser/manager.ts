@@ -7,7 +7,7 @@ import { config } from "../config.js";
 import { logger } from "../logger.js";
 import { persistStatus, saveToDatabase } from "../persist.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
-import { browserSessionUpdatedAt } from "../db.js";
+import { browserSessionUpdatedAt, currentOrgId, withOrg } from "../db.js";
 import { chromeInstallCandidates } from "./executable.js";
 import { loadSessionState, saveSessionState } from "./session-store.js";
 
@@ -556,7 +556,7 @@ export async function storageInfo(): Promise<{
   }
   let backupAt: string | null = null;
   try {
-    backupAt = (await browserSessionUpdatedAt("default")) ?? null;
+    backupAt = (await withOrg(currentOrgId() ?? 1, () => browserSessionUpdatedAt("default"))) ?? null;
     if (!backupAt) {
       const f = path.join(config.dataDir, "sessions.json");
       if (fs.existsSync(f)) backupAt = fs.statSync(f).mtime.toISOString();

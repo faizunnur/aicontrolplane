@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import { config } from "./config.js";
-import { getSetting, setSetting } from "./db.js";
+import { currentOrgId, getSetting, setSetting, withOrg } from "./db.js";
+
+// Provider configuration is the founding workspace's until the browser fleet phase keys this
+// cache per workspace; reads outside any scope (boot, timers) default there too.
+const inHomeOrg = <T>(fn: () => T): T => withOrg(currentOrgId() ?? 1, fn);
 import { logger } from "./logger.js";
 import { base, BUILTIN_DEFAULTS } from "./providers/defaults.js";
 import type { PlatformConfig } from "../packages/core/src/index.js";
@@ -39,14 +43,14 @@ function parseOverrides(raw: string | undefined | null): Overrides {
 async function loadFromDb(): Promise<void> {
   const gen = generation;
   let next: Overrides;
-  const raw = await getSetting(KEY);
+  const raw = await inHomeOrg(() => getSetting(KEY));
   if (raw !== undefined) {
     next = parseOverrides(raw);
   } else if (fs.existsSync(config.platformsFile)) {
     // One-time import of the legacy file, then the database is the source.
     try {
       next = parseOverrides(fs.readFileSync(config.platformsFile, "utf8"));
-      await setSetting(KEY, JSON.stringify(next));
+      await inHomeOrg(() => setSetting(KEY, JSON.stringify(next)));
       log.info(`imported platform overrides from ${config.platformsFile} into the database`);
     } catch (err) {
       log.warn("platforms.json unreadable, ignoring", err);
@@ -111,7 +115,7 @@ export async function savePlatformOverride(id: string, patch: Partial<PlatformCo
   cache = { ...cache, [id]: cleaned as Partial<PlatformConfig> };
   generation++;
   loadedAt = Date.now();
-  await setSetting(KEY, JSON.stringify(cache));
+  await inHomeOrg(() => setSetting(KEY, JSON.stringify(cache)));
   return getPlatform(id)!;
 }
 
@@ -121,7 +125,7 @@ export async function deletePlatformOverride(id: string): Promise<void> {
   cache = next;
   generation++;
   loadedAt = Date.now();
-  await setSetting(KEY, JSON.stringify(cache));
+  await inHomeOrg(() => setSetting(KEY, JSON.stringify(cache)));
 }
 
 /** Providers that have a tasks page and can therefore be looked at through the browser. */

@@ -1,5 +1,5 @@
 import { bus } from "./bus.js";
-import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, listRuns, setPolicyOverride, setSetting, transitionRun, updateApproval, type ApprovalRow } from "./db.js";
+import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicyOverrides, getRun, getSettingCached, listApprovals, listPendingApprovalsAll, listRunsByStatusAll, setPolicyOverride, setSetting, systemScope, transitionRun, updateApproval, withOrg, type ApprovalRow } from "./db.js";
 import { logger } from "./logger.js";
 import { queue, resumeJobFor, type RunResumeJob } from "./queue.js";
 import { endRun, finishParked, RunTracker } from "./runs.js";
@@ -236,18 +236,20 @@ function parseCheckpoint(raw: string | null): { v: number; kind: string; step: s
  */
 export async function sweepApprovals(timeoutMs = APPROVAL_TIMEOUT_MS): Promise<number> {
   const cutoff = new Date(Date.now() - timeoutMs).toISOString();
-  const pending = await listApprovals({ status: "pending", limit: 500 });
+  const pending = await systemScope(() => listPendingApprovalsAll(500));
   let expired = 0;
   for (const a of pending) {
     if (a.requested_at >= cutoff) continue;
-    const row = await updateApproval(a.id, { status: "expired", decided_by: "timeout", reason: "no decision in time" });
-    if (!row) continue;
-    expired++;
-    if (a.run_id) {
-      const run = await getRun(a.run_id);
-      await queue.send<RunResumeJob>(resumeJobFor(run?.kind ?? "task"), { runId: a.run_id, approvalId: a.id, decision: "timeout" }, { singletonKey: `resume:${a.id}` });
-    }
-    await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval expired undecided", body: a.summary, dedupe_key: `approval_expired:${a.id}` });
+    expired += await withOrg(a.org_id, async () => {
+      const row = await updateApproval(a.id, { status: "expired", decided_by: "timeout", reason: "no decision in time" });
+      if (!row) return 0;
+      if (a.run_id) {
+        const run = await getRun(a.run_id);
+        await queue.send<RunResumeJob>(resumeJobFor(run?.kind ?? "task"), { runId: a.run_id, approvalId: a.id, decision: "timeout" }, { singletonKey: `resume:${a.id}` });
+      }
+      await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval expired undecided", body: a.summary, dedupe_key: `approval_expired:${a.id}` });
+      return 1;
+    });
   }
   return expired;
 }
@@ -285,17 +287,18 @@ export async function requestExternalApproval(input: { action: string; summary: 
  */
 export async function reconcileParkedRuns(): Promise<number> {
   let handled = 0;
-  for (const run of await listRuns({ status: "waiting_approval", limit: 200 })) {
-    const approval = (await listApprovals({ run_id: run.id, limit: 1 }))[0];
-    if (!approval) {
-      await finishParked(run, "failed", { error: "It was parked for an approval that no longer exists." });
-      handled++;
-      continue;
-    }
-    if (approval.status === "pending") continue; // sweepApprovals expires it when its time comes
-    const decision: Decision = approval.status === "approved" ? "approved" : approval.status === "rejected" ? "rejected" : "timeout";
-    await queue.send<RunResumeJob>(resumeJobFor(run.kind), { runId: run.id, approvalId: approval.id, decision }, { singletonKey: `resume:${approval.id}:rec` });
-    handled++;
+  for (const parked of await systemScope(() => listRunsByStatusAll("waiting_approval", 200))) {
+    handled += await withOrg(parked.org_id, async () => {
+      const approval = (await listApprovals({ run_id: parked.id, limit: 1 }))[0];
+      if (!approval) {
+        await finishParked(parked, "failed", { error: "It was parked for an approval that no longer exists." });
+        return 1;
+      }
+      if (approval.status === "pending") return 0; // sweepApprovals expires it when its time comes
+      const decision: Decision = approval.status === "approved" ? "approved" : approval.status === "rejected" ? "rejected" : "timeout";
+      await queue.send<RunResumeJob>(resumeJobFor(parked.kind), { runId: parked.id, approvalId: approval.id, decision }, { singletonKey: `resume:${approval.id}:rec` });
+      return 1;
+    });
   }
   return handled;
 }
@@ -311,14 +314,16 @@ export async function reconcileParkedRuns(): Promise<number> {
  */
 export async function recoverInterruptedApprovals(): Promise<number> {
   let repaired = 0;
-  for (const a of await listApprovals({ status: "pending", limit: 500 })) {
+  for (const a of await systemScope(() => listPendingApprovalsAll(500))) {
     if (!a.run_id) continue;
-    const run = await getRun(a.run_id);
-    if (run && run.status === "waiting_approval") continue; // parked and healthy: survives the restart
-    if (run && run.status === "running") continue; // mid-park on a live instance, or under a decided gate
-    await updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the run ended before anyone decided" });
-    await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval was interrupted by a restart", body: a.summary, dedupe_key: `approval_interrupted:${a.id}` });
-    repaired++;
+    repaired += await withOrg(a.org_id, async () => {
+      const run = await getRun(a.run_id!);
+      if (run && run.status === "waiting_approval") return 0; // parked and healthy: survives the restart
+      if (run && run.status === "running") return 0; // mid-park on a live instance, or under a decided gate
+      await updateApproval(a.id, { status: "interrupted", decided_by: "system", reason: "the run ended before anyone decided" });
+      await addEvent({ platform: a.provider ?? null, kind: "approval", title: "An approval was interrupted by a restart", body: a.summary, dedupe_key: `approval_interrupted:${a.id}` });
+      return 1;
+    });
   }
   const expired = await sweepApprovals();
   if (repaired || expired) log.warn(`approval recovery: ${repaired} interrupted (run gone), ${expired} expired (overdue)`);

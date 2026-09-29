@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type Database from "better-sqlite3";
 import type {
   AgentDelivery,
@@ -40,8 +41,8 @@ import { openPg } from "./pg.js";
       conformance for that is the unit suite executed against both drivers in CI.
 */
 
-/** How the data layer announces a change (topic, payload, outbox id when logged). Wired in initData. */
-export type Notify = (topic: string, payload: unknown, outboxId?: number) => void;
+/** How the data layer announces a change (topic, payload, outbox id, workspace). Wired in initData. */
+export type Notify = (topic: string, payload: unknown, outboxId?: number, orgId?: number) => void;
 
 let q: SqlDriver;
 /** The raw SQLite handle — only in sqlite mode, only for the legacy file-mirror backup. */
@@ -61,6 +62,51 @@ async function sealSecretsIn<T extends Record<string, unknown> | null | undefine
   }
   return out as T;
 }
+/* ---------- the workspace (org) scope ----------
+   Which workspace a query belongs to rides an AsyncLocalStorage, entered at the edges (an
+   authenticated request, a queue job adopting its row's org, a boot path that is org 1 by
+   definition). Tenant queries fail closed: no scope, no rows. Cross-workspace maintenance
+   (reapers, sweeps, prunes) runs under systemScope and uses the *All variants, adopting each
+   row's org before touching it. */
+
+type OrgScope = { orgId: number } | { system: true };
+const orgAls = new AsyncLocalStorage<OrgScope>();
+
+/** Run fn with every tenant query scoped to this workspace. */
+export function withOrg<T>(orgId: number, fn: () => T): T {
+  return orgAls.run({ orgId }, fn);
+}
+/** Cross-workspace maintenance scope: tenant queries still throw; only *All variants work. */
+export function systemScope<T>(fn: () => T): T {
+  return orgAls.run({ system: true }, fn);
+}
+export function currentOrgId(): number | undefined {
+  const sc = orgAls.getStore();
+  return sc && "orgId" in sc ? sc.orgId : undefined;
+}
+/** The ambient workspace. Throws when none is in scope: a leak-by-default is never an option. */
+function oid(): number {
+  const sc = orgAls.getStore();
+  if (!sc) {
+    // Unit tests drive this layer directly and node:test re-enters its own async scope, so an
+    // ALS entered at file top level never reaches the callbacks. The spawned-server e2e suite
+    // does NOT set this, so fail-closed stays proven where it matters: end to end.
+    const t = process.env.ACP_TEST_DEFAULT_ORG;
+    if (t) return Number(t);
+    throw new Error("tenant query outside a workspace scope (wrap the caller in withOrg)");
+  }
+  if ("system" in sc) throw new Error("tenant query under systemScope: use the *All variant and adopt the row's org");
+  return sc.orgId;
+}
+function assertSystem(): void {
+  const sc = orgAls.getStore();
+  if (!sc || !("system" in sc)) throw new Error("this cross-workspace query must run under systemScope");
+}
+/** Test-only: scope the rest of the current async context (node --test files run top-level). */
+export function enterOrgScopeForTests(orgId: number): void {
+  orgAls.enterWith({ orgId });
+}
+
 /**
  * Every announced change is first appended to the outbox — the durable, ordered event log
  * with a monotonic id (the replay cursor for reconnecting clients, and what a relay tails
@@ -71,11 +117,14 @@ let outboxChain: Promise<void> = Promise.resolve();
 const notify: Notify = (topic, payload) => {
   // Appends and emits are chained so events keep their write order — outbox ids are the
   // replay cursor, and an inversion (finish logged before start) would corrupt every
-  // reconnecting client's view.
+  // reconnecting client's view. The org is captured HERE, synchronously: the chained
+  // continuation runs outside the caller's scope. Announcements from org-less paths (boot,
+  // maintenance) belong to the founding workspace.
+  const orgId = currentOrgId() ?? 1;
   outboxChain = outboxChain.then(async () => {
-    const id = await appendOutbox(topic, payload).catch(() => undefined);
+    const id = await appendOutbox(topic, payload, orgId).catch(() => undefined);
     try {
-      _notify(topic, payload, id ?? undefined);
+      _notify(topic, payload, id ?? undefined, orgId);
     } catch {
       /* an announcement failing must never break the write it announces */
     }
@@ -87,20 +136,20 @@ export async function flushNotifications(): Promise<void> {
   await outboxChain;
 }
 
-async function appendOutbox(topic: string, payload: unknown): Promise<number | undefined> {
+async function appendOutbox(topic: string, payload: unknown, orgId: number): Promise<number | undefined> {
   let body: string | null = null;
   try {
     body = payload === undefined ? null : JSON.stringify(payload);
   } catch {
     body = null;
   }
-  const row = await q.get<{ id: number }>("INSERT INTO outbox (topic, payload, created_at, published_at) VALUES (?, ?, ?, ?) RETURNING id", [topic, body, now(), now()]);
+  const row = await q.get<{ id: number }>("INSERT INTO outbox (org_id, topic, payload, created_at, published_at) VALUES (?, ?, ?, ?, ?) RETURNING id", [orgId, topic, body, now(), now()]);
   return row?.id;
 }
 
-/** Outbox entries after a cursor, oldest first — the replay path for reconnecting consumers. */
-export async function outboxAfter(id: number, limit = 500): Promise<{ id: number; topic: string; payload: string | null; created_at: string }[]> {
-  return q.all("SELECT id, topic, payload, created_at FROM outbox WHERE id > ? ORDER BY id LIMIT ?", [id, Math.min(Math.max(limit, 1), 2000)]);
+/** One workspace's outbox entries after a cursor, oldest first — the replay path for reconnecting consumers. */
+export async function outboxAfter(orgId: number, id: number, limit = 500): Promise<{ id: number; topic: string; payload: string | null; created_at: string }[]> {
+  return q.all("SELECT id, topic, payload, created_at FROM outbox WHERE org_id = ? AND id > ? ORDER BY id LIMIT ?", [orgId, id, Math.min(Math.max(limit, 1), 2000)]);
 }
 
 /** Trim the log; consumers further behind than this refetch state instead of replaying. */
@@ -149,6 +198,25 @@ export async function closeData(): Promise<void> {
 }
 
 export const now = () => new Date().toISOString();
+
+/* ---------- workspaces (orgs) ---------- */
+
+export interface OrgRow {
+  id: number;
+  name: string;
+  plan: string;
+  quotas: string | null;
+  created_at: string;
+}
+
+/** Create a workspace. Part of sign-up, which starts before any workspace exists. */
+export async function createOrg(input: { name: string }): Promise<OrgRow> {
+  const row = await q.get<{ id: number }>("INSERT INTO orgs (name, created_at) VALUES (?, ?) RETURNING id", [input.name.slice(0, 120) || "Workspace", now()]);
+  return (await q.get<OrgRow>("SELECT * FROM orgs WHERE id = ?", [row!.id]))!;
+}
+export async function getOrg(id: number): Promise<OrgRow | undefined> {
+  return q.get<OrgRow>("SELECT * FROM orgs WHERE id = ?", [id]);
+}
 
 /** Applied schema migrations, newest last. SQLite runs 1..6; Postgres starts at 100. */
 export async function schemaVersion(): Promise<{ id: number; name: string; applied_at: string }[]> {
@@ -204,23 +272,25 @@ export async function listTasks(opts: { platform?: string; agent_id?: number; in
     params.push(opts.agent_id);
   }
   if (!opts.includeDisabled) where.push("t.enabled = 1");
+  where.push("t.org_id = ?");
+  params.push(oid());
   const limit = Math.min(Math.max(opts.limit ?? 500, 1), 2000);
   const sql = `SELECT t.* FROM tasks t ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY t.platform, t.name LIMIT ?`;
   const tasks = await q.all<Task>(sql, [...params, limit]);
   const out: TaskWithLastRun[] = [];
   for (const t of tasks) {
-    const last = await q.get<Run>(`SELECT * FROM runs WHERE task_id = ? ORDER BY COALESCE(finished_at, started_at, created_at) DESC LIMIT 1`, [t.id]);
+    const last = await q.get<Run>(`SELECT * FROM runs WHERE task_id = ? AND org_id = ? ORDER BY COALESCE(finished_at, started_at, created_at) DESC LIMIT 1`, [t.id, oid()]);
     out.push({ ...t, last_run: last ?? null });
   }
   return out;
 }
 
 export async function getTask(id: number): Promise<Task | undefined> {
-  return q.get<Task>("SELECT * FROM tasks WHERE id = ?", [id]);
+  return q.get<Task>("SELECT * FROM tasks WHERE id = ? AND org_id = ?", [id, oid()]);
 }
 
 export async function findTask(platform: string, key: string): Promise<Task | undefined> {
-  return q.get<Task>("SELECT * FROM tasks WHERE platform = ? AND key = ?", [platform, key]);
+  return q.get<Task>("SELECT * FROM tasks WHERE platform = ? AND key = ? AND org_id = ?", [platform, key, oid()]);
 }
 
 /** Insert or update by (platform, key). Fields that are undefined are left untouched on update. */
@@ -248,7 +318,7 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
          next_run = COALESCE(?, next_run),
          configuration = COALESCE(?, configuration),
          updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND org_id = ?`,
       [
         input.name ?? null,
         input.source ?? null,
@@ -266,6 +336,7 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
         conf ?? null,
         ts,
         existing.id,
+        oid(),
       ],
     );
     const t = (await getTask(existing.id))!;
@@ -273,9 +344,10 @@ export async function upsertTask(input: TaskInput): Promise<Task> {
     return t;
   }
   const row = await q.get<{ id: number }>(
-    `INSERT INTO tasks (platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, keywords, delivery, agent_id, prompt, next_run, configuration, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    `INSERT INTO tasks (org_id, platform, key, name, source, purpose, schedule, native_url, status, enabled, meta, keywords, delivery, agent_id, prompt, next_run, configuration, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     [
+      oid(),
       input.platform,
       input.key,
       input.name ?? input.key,
@@ -305,7 +377,7 @@ export async function updateTask(id: number, patch: Partial<TaskInput>): Promise
   const t = await getTask(id);
   if (!t) return undefined;
   await q.run(
-    `UPDATE tasks SET name=?, purpose=?, schedule=?, native_url=?, status=?, enabled=?, meta=?, platform=?, key=?, keywords=?, delivery=?, agent_id=?, prompt=?, next_run=?, configuration=?, updated_at=? WHERE id=?`,
+    `UPDATE tasks SET name=?, purpose=?, schedule=?, native_url=?, status=?, enabled=?, meta=?, platform=?, key=?, keywords=?, delivery=?, agent_id=?, prompt=?, next_run=?, configuration=?, updated_at=? WHERE id=? AND org_id=?`,
     [
       patch.name ?? t.name,
       patch.purpose === undefined ? t.purpose : patch.purpose,
@@ -324,6 +396,7 @@ export async function updateTask(id: number, patch: Partial<TaskInput>): Promise
       patch.configuration === undefined ? t.configuration : patch.configuration === null ? null : JSON.stringify(await sealSecretsIn(patch.configuration)),
       now(),
       id,
+      oid(),
     ],
   );
   const next = await getTask(id);
@@ -332,7 +405,7 @@ export async function updateTask(id: number, patch: Partial<TaskInput>): Promise
 }
 
 export async function deleteTask(id: number): Promise<boolean> {
-  const ok = (await q.run("DELETE FROM tasks WHERE id = ?", [id])).changes > 0;
+  const ok = (await q.run("DELETE FROM tasks WHERE id = ? AND org_id = ?", [id, oid()])).changes > 0;
   if (ok) notify("task:deleted", { id });
   return ok;
 }
@@ -368,7 +441,7 @@ export async function recordRun(input: RecordRunInput): Promise<{ run: Run; crea
   const provider = input.provider ?? task?.platform ?? null;
   const label = input.label ?? task?.name ?? null;
   if (input.external_id && input.task_id) {
-    const existing = await q.get<Run>("SELECT * FROM runs WHERE task_id = ? AND external_id = ?", [input.task_id, input.external_id]);
+    const existing = await q.get<Run>("SELECT * FROM runs WHERE task_id = ? AND external_id = ? AND org_id = ?", [input.task_id, input.external_id, oid()]);
     if (existing) {
       await q.run(
         `UPDATE runs SET status=?, started_at=COALESCE(?, started_at), finished_at=COALESCE(?, finished_at),
@@ -382,9 +455,10 @@ export async function recordRun(input: RecordRunInput): Promise<{ run: Run; crea
     }
   }
   const row = await q.get<{ id: number }>(
-    `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at)
-     VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    `INSERT INTO runs (org_id, task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     [
+      oid(),
       input.task_id,
       input.agent_id ?? task?.agent_id ?? null,
       provider,
@@ -439,9 +513,10 @@ export async function startRun(input: StartRunInput): Promise<Run> {
   let row: { id: number } | undefined;
   try {
     row = await q.get<{ id: number }>(
-    `INSERT INTO runs (task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at, idempotency_key, priority, queued_at, checkpoint)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?) RETURNING id`,
+    `INSERT INTO runs (org_id, task_id, agent_id, provider, kind, trigger, message_id, label, external_id, status, started_at, finished_at, summary, details, output_url, error, source, raw, created_at, idempotency_key, priority, queued_at, checkpoint)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?) RETURNING id`,
     [
+      oid(),
       input.task_id ?? null,
       input.agent_id ?? task?.agent_id ?? null,
       input.provider ?? task?.platform ?? null,
@@ -469,7 +544,7 @@ export async function startRun(input: StartRunInput): Promise<Run> {
     throw err;
   }
   const run = (await getRun(row!.id))!;
-  if (input.message_id) await q.run("UPDATE messages SET run_id = ? WHERE id = ?", [run.id, input.message_id]);
+  if (input.message_id) await q.run("UPDATE messages SET run_id = ? WHERE id = ? AND org_id = ?", [run.id, input.message_id, oid()]);
   notify("run", run);
   return run;
 }
@@ -479,7 +554,7 @@ export async function finishRun(id: number, patch: { status: RunStatus; summary?
   if (!r) return undefined;
   // Guarded transition: only a running run can be finished. A run that already settled keeps
   // its outcome, whoever reports later (double finish, late webhook, restart recovery races).
-  const res = await q.run(`UPDATE runs SET status=?, finished_at=?, summary=?, error=?, output_url=?, details=?, external_id=? WHERE id=? AND status='running'`, [
+  const res = await q.run(`UPDATE runs SET status=?, finished_at=?, summary=?, error=?, output_url=?, details=?, external_id=? WHERE id=? AND org_id=? AND status='running'`, [
     patch.status,
     now(),
     patch.summary === undefined ? r.summary : patch.summary,
@@ -488,6 +563,7 @@ export async function finishRun(id: number, patch: { status: RunStatus; summary?
     patch.details === undefined ? r.details : patch.details,
     patch.external_id === undefined ? r.external_id : patch.external_id,
     id,
+    oid(),
   ]);
   if (res.changes === 0) return r;
   const run = (await getRun(id))!;
@@ -496,7 +572,13 @@ export async function finishRun(id: number, patch: { status: RunStatus; summary?
 }
 
 export async function getRun(id: number): Promise<Run | undefined> {
-  return q.get<Run>("SELECT * FROM runs WHERE id = ?", [id]);
+  return q.get<Run>("SELECT * FROM runs WHERE id = ? AND org_id = ?", [id, oid()]);
+}
+
+/** A run row wherever it lives — the org-adoption peek for queue-job entry points. */
+export async function getRunAnyOrg(id: number): Promise<(Run & { org_id: number }) | undefined> {
+  assertSystem();
+  return q.get<Run & { org_id: number }>("SELECT * FROM runs WHERE id = ?", [id]);
 }
 
 /**
@@ -520,7 +602,7 @@ export async function transitionRun(
     }
   }
   if (patch.finished ?? TERMINAL_RUN_STATUSES.includes(to)) sets.push("finished_at = ?"), params.push(now());
-  const res = await q.run(`UPDATE runs SET ${sets.join(", ")} WHERE id = ? AND status IN (${from.map(() => "?").join(",")})`, [...params, id, ...from]);
+  const res = await q.run(`UPDATE runs SET ${sets.join(", ")} WHERE id = ? AND org_id = ? AND status IN (${from.map(() => "?").join(",")})`, [...params, id, oid(), ...from]);
   if (res.changes === 0) return undefined;
   const run = (await getRun(id))!;
   notify("run", run);
@@ -529,28 +611,30 @@ export async function transitionRun(
 
 /** Cooperative stop: flip the flag; the executing side checks it between steps. */
 export async function setCancelRequested(id: number): Promise<void> {
-  await q.run("UPDATE runs SET cancel_requested = 1 WHERE id = ?", [id]);
+  await q.run("UPDATE runs SET cancel_requested = 1 WHERE id = ? AND org_id = ?", [id, oid()]);
 }
 export async function cancelRequested(id: number): Promise<boolean> {
-  return ((await q.get<{ cancel_requested: number }>("SELECT cancel_requested FROM runs WHERE id = ?", [id]))?.cancel_requested ?? 0) === 1;
+  return ((await q.get<{ cancel_requested: number }>("SELECT cancel_requested FROM runs WHERE id = ? AND org_id = ?", [id, oid()]))?.cancel_requested ?? 0) === 1;
 }
 
 /** A run already recorded under this idempotency key, if any. */
 export async function findRunByIdempotencyKey(key: string): Promise<Run | undefined> {
-  return q.get<Run>("SELECT * FROM runs WHERE idempotency_key = ?", [key]);
+  return q.get<Run>("SELECT * FROM runs WHERE idempotency_key = ? AND org_id = ?", [key, oid()]);
 }
 
-/** Queued/retrying runs nobody picked up since the cutoff — their job was lost; re-send it. */
-export async function listStuckQueuedRuns(cutoffIso: string, limit = 100): Promise<Run[]> {
-  return q.all<Run>("SELECT * FROM runs WHERE status IN ('queued','retrying') AND COALESCE(queued_at, created_at) < ? LIMIT ?", [cutoffIso, limit]);
+/** Queued/retrying runs nobody picked up since the cutoff, across every workspace — their job was lost; re-send it. */
+export async function listStuckQueuedRunsAll(cutoffIso: string, limit = 100): Promise<(Run & { org_id: number })[]> {
+  assertSystem();
+  return q.all<Run & { org_id: number }>("SELECT * FROM runs WHERE status IN ('queued','retrying') AND COALESCE(queued_at, created_at) < ? LIMIT ?", [cutoffIso, limit]);
 }
 
 /**
  * Running runs with no sign of life since the cutoff: no timeline event and no start after
  * it. What the reaper fails — a crashed executor's leftovers, never a live run elsewhere.
  */
-export async function listStaleRunningRuns(cutoffIso: string, limit = 100): Promise<Run[]> {
-  return q.all<Run>(
+export async function listStaleRunningRunsAll(cutoffIso: string, limit = 100): Promise<(Run & { org_id: number })[]> {
+  assertSystem();
+  return q.all<Run & { org_id: number }>(
     `SELECT r.* FROM runs r
      WHERE r.status = 'running' AND r.kind != 'external'
        AND COALESCE((SELECT MAX(e.at) FROM run_events e WHERE e.run_id = r.id), r.started_at, r.created_at) < ?
@@ -561,7 +645,13 @@ export async function listStaleRunningRuns(cutoffIso: string, limit = 100): Prom
 
 /** Attach the provider's own id to a run, so a later report with the same id updates it. */
 export async function setRunExternalId(id: number, externalId: string): Promise<void> {
-  await q.run("UPDATE runs SET external_id = ? WHERE id = ?", [externalId, id]);
+  await q.run("UPDATE runs SET external_id = ? WHERE id = ? AND org_id = ?", [externalId, id, oid()]);
+}
+
+/** Runs in a status across every workspace — the maintenance reconciler's worklist. */
+export async function listRunsByStatusAll(status: RunStatus, limit = 200): Promise<(Run & { org_id: number })[]> {
+  assertSystem();
+  return q.all<Run & { org_id: number }>("SELECT * FROM runs WHERE status = ? LIMIT ?", [status, limit]);
 }
 
 export type RunRow = Run & { task_name: string | null; task_key: string | null; task_native_url: string | null; agent_name: string | null };
@@ -570,8 +660,8 @@ const RUN_SELECT = `SELECT r.*, t.name AS task_name, t.key AS task_key, t.native
   FROM runs r LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN agent_profiles a ON a.id = r.agent_id`;
 
 export async function listRuns(opts: { limit?: number; task_id?: number; status?: string | string[]; platform?: string; kind?: string; agent_id?: number; since?: string; message_id?: number } = {}): Promise<RunRow[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["r.org_id = ?"];
+  const params: unknown[] = [oid()];
   if (opts.task_id) {
     where.push("r.task_id = ?");
     params.push(opts.task_id);
@@ -618,7 +708,8 @@ export interface RunEventInput {
 }
 
 export async function addRunEvent(runId: number, input: RunEventInput): Promise<RunEvent> {
-  const row = await q.get<{ id: number }>(`INSERT INTO run_events (run_id, at, type, key, label, status, detail, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, [
+  const row = await q.get<{ id: number }>(`INSERT INTO run_events (org_id, run_id, at, type, key, label, status, detail, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, [
+    oid(),
     runId,
     input.at ?? now(),
     input.type,
@@ -634,15 +725,15 @@ export async function addRunEvent(runId: number, input: RunEventInput): Promise<
 }
 
 export async function runEvents(runId: number): Promise<RunEvent[]> {
-  return q.all<RunEvent>("SELECT * FROM run_events WHERE run_id = ? ORDER BY id", [runId]);
+  return q.all<RunEvent>("SELECT * FROM run_events WHERE run_id = ? AND org_id = ? ORDER BY id", [runId, oid()]);
 }
 
 export type ActivityRow = RunEvent & { run_label: string | null; run_kind: RunKind; provider: string | null; agent_id: number | null; agent_name: string | null; task_id: number | null; run_status: RunStatus };
 
 /** The newest timeline lines across every run: the unified activity feed. */
 export async function recentRunEvents(opts: { limit?: number; since?: string; provider?: string; agent_id?: number; run_id?: number } = {}): Promise<ActivityRow[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["e.org_id = ?"];
+  const params: unknown[] = [oid()];
   if (opts.since) {
     where.push("e.at >= ?");
     params.push(opts.since);
@@ -715,10 +806,11 @@ export interface EventInput {
 /** Returns the event, or null when dedupe_key already exists. */
 export async function addEvent(input: EventInput): Promise<EventRow | null> {
   if (input.dedupe_key) {
-    const dup = await q.get("SELECT id FROM events WHERE dedupe_key = ?", [input.dedupe_key]);
+    const dup = await q.get("SELECT id FROM events WHERE dedupe_key = ? AND org_id = ?", [input.dedupe_key, oid()]);
     if (dup) return null;
   }
-  const row = await q.get<{ id: number }>(`INSERT INTO events (platform, kind, title, body, link, read, occurred_at, created_at, dedupe_key) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?) RETURNING id`, [
+  const row = await q.get<{ id: number }>(`INSERT INTO events (org_id, platform, kind, title, body, link, read, occurred_at, created_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?) RETURNING id`, [
+    oid(),
     input.platform ?? null,
     input.kind,
     input.title,
@@ -734,8 +826,8 @@ export async function addEvent(input: EventInput): Promise<EventRow | null> {
 }
 
 export async function listEvents(opts: { limit?: number; unread?: boolean; platform?: string } = {}): Promise<EventRow[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["org_id = ?"];
+  const params: unknown[] = [oid()];
   if (opts.unread) where.push("read = 0");
   if (opts.platform) {
     where.push("platform = ?");
@@ -746,16 +838,16 @@ export async function listEvents(opts: { limit?: number; unread?: boolean; platf
 }
 
 export async function markEventRead(id: number, read = true): Promise<boolean> {
-  return (await q.run("UPDATE events SET read = ? WHERE id = ?", [read ? 1 : 0, id])).changes > 0;
+  return (await q.run("UPDATE events SET read = ? WHERE id = ? AND org_id = ?", [read ? 1 : 0, id, oid()])).changes > 0;
 }
 export async function markAllEventsRead(): Promise<number> {
-  return (await q.run("UPDATE events SET read = 1 WHERE read = 0")).changes;
+  return (await q.run("UPDATE events SET read = 1 WHERE read = 0 AND org_id = ?", [oid()])).changes;
 }
 
 /* ---------- platform state ---------- */
 
 export async function getPlatformState(platform: string): Promise<PlatformState> {
-  const row = await q.get<PlatformState>("SELECT * FROM platform_state WHERE platform = ?", [platform]);
+  const row = await q.get<PlatformState>("SELECT * FROM platform_state WHERE platform = ? AND org_id = ?", [platform, oid()]);
   return row ?? { platform, session_status: "unknown", last_sync_at: null, last_ok_at: null, last_error: null, screenshot_path: null, meta: null };
 }
 
@@ -763,18 +855,18 @@ export async function setPlatformState(platform: string, patch: Partial<Omit<Pla
   const cur = await getPlatformState(platform);
   const next: PlatformState = { ...cur, ...patch, platform };
   await q.run(
-    `INSERT INTO platform_state (platform, session_status, last_sync_at, last_ok_at, last_error, screenshot_path, meta)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(platform) DO UPDATE SET session_status=excluded.session_status, last_sync_at=excluded.last_sync_at,
+    `INSERT INTO platform_state (org_id, platform, session_status, last_sync_at, last_ok_at, last_error, screenshot_path, meta)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(org_id, platform) DO UPDATE SET session_status=excluded.session_status, last_sync_at=excluded.last_sync_at,
        last_ok_at=excluded.last_ok_at, last_error=excluded.last_error, screenshot_path=excluded.screenshot_path, meta=excluded.meta`,
-    [platform, next.session_status, next.last_sync_at, next.last_ok_at, next.last_error, next.screenshot_path, next.meta],
+    [oid(), platform, next.session_status, next.last_sync_at, next.last_ok_at, next.last_error, next.screenshot_path, next.meta],
   );
   notify("platform:row", platform);
   return next;
 }
 
 export async function allPlatformStates(): Promise<PlatformState[]> {
-  return q.all<PlatformState>("SELECT * FROM platform_state");
+  return q.all<PlatformState>("SELECT * FROM platform_state WHERE org_id = ?", [oid()]);
 }
 
 /* ---------- captures ---------- */
@@ -782,11 +874,11 @@ export async function allPlatformStates(): Promise<PlatformState[]> {
 export async function addCapture(c: { platform: string; url: string; method: string; status: number; content_type: string; body: string }): Promise<void> {
   const MAX = 512 * 1024;
   const body = c.body.length > MAX ? c.body.slice(0, MAX) : c.body;
-  await q.run(`INSERT INTO captures (platform, url, method, status, content_type, body, size, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [c.platform, c.url, c.method, c.status, c.content_type, body, c.body.length, now()]);
+  await q.run(`INSERT INTO captures (org_id, platform, url, method, status, content_type, body, size, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [oid(), c.platform, c.url, c.method, c.status, c.content_type, body, c.body.length, now()]);
 }
 
 export async function pruneCaptures(platform: string, keep = 300): Promise<void> {
-  await q.run(`DELETE FROM captures WHERE platform = ? AND id NOT IN (SELECT id FROM captures WHERE platform = ? ORDER BY id DESC LIMIT ?)`, [platform, platform, keep]);
+  await q.run(`DELETE FROM captures WHERE platform = ? AND org_id = ? AND id NOT IN (SELECT id FROM captures WHERE platform = ? AND org_id = ? ORDER BY id DESC LIMIT ?)`, [platform, oid(), platform, oid(), keep]);
 }
 
 export interface CaptureSummary {
@@ -800,35 +892,41 @@ export interface CaptureSummary {
 }
 
 export async function listCaptures(platform: string, limit = 100): Promise<CaptureSummary[]> {
-  return q.all<CaptureSummary>(`SELECT id, url, method, status, content_type, size, captured_at FROM captures WHERE platform = ? ORDER BY id DESC LIMIT ?`, [platform, limit]);
+  return q.all<CaptureSummary>(`SELECT id, url, method, status, content_type, size, captured_at FROM captures WHERE platform = ? AND org_id = ? ORDER BY id DESC LIMIT ?`, [platform, oid(), limit]);
 }
 
 export async function getCapture(id: number): Promise<(CaptureSummary & { platform: string; body: string }) | undefined> {
-  return q.get<CaptureSummary & { platform: string; body: string }>("SELECT * FROM captures WHERE id = ?", [id]);
+  return q.get<CaptureSummary & { platform: string; body: string }>("SELECT * FROM captures WHERE id = ? AND org_id = ?", [id, oid()]);
 }
 
 /* ---------- sync log ---------- */
 
 export async function startSyncLog(platform: string): Promise<number> {
-  const row = await q.get<{ id: number }>("INSERT INTO sync_log (platform, started_at) VALUES (?, ?) RETURNING id", [platform, now()]);
+  const row = await q.get<{ id: number }>("INSERT INTO sync_log (org_id, platform, started_at) VALUES (?, ?, ?) RETURNING id", [oid(), platform, now()]);
   return row!.id;
 }
 export async function finishSyncLog(id: number, r: { ok: boolean; message?: string; agents?: number; runs?: number; captures?: number }): Promise<void> {
-  await q.run(`UPDATE sync_log SET finished_at=?, ok=?, message=?, agents_found=?, runs_found=?, captures=? WHERE id=?`, [now(), r.ok ? 1 : 0, r.message ?? null, r.agents ?? 0, r.runs ?? 0, r.captures ?? 0, id]);
+  await q.run(`UPDATE sync_log SET finished_at=?, ok=?, message=?, agents_found=?, runs_found=?, captures=? WHERE id=? AND org_id=?`, [now(), r.ok ? 1 : 0, r.message ?? null, r.agents ?? 0, r.runs ?? 0, r.captures ?? 0, id, oid()]);
 }
 export async function recentSyncLogs(limit = 30): Promise<unknown[]> {
-  return q.all("SELECT * FROM sync_log ORDER BY id DESC LIMIT ?", [limit]);
+  return q.all("SELECT * FROM sync_log WHERE org_id = ? ORDER BY id DESC LIMIT ?", [oid(), limit]);
 }
 
 /* ---------- settings ---------- */
 
 export async function getSetting(key: string): Promise<string | undefined> {
-  const r = await q.get<{ value: string }>("SELECT value FROM settings WHERE key = ?", [key]);
+  const r = await q.get<{ value: string }>("SELECT value FROM settings WHERE key = ? AND org_id = ?", [key, oid()]);
   return r?.value;
 }
 export async function setSetting(key: string, value: string): Promise<void> {
-  await q.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [key, value]);
-  settingCache.delete(key);
+  await q.run("INSERT INTO settings (key, org_id, value) VALUES (?, ?, ?) ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value", [key, oid(), value]);
+  settingCache.delete(`${oid()}:${key}`);
+}
+
+/** Which workspace an agent's ingest token belongs to. Global by nature: the token IS the lookup key. */
+export async function findOrgIdByIngestToken(token: string): Promise<number | undefined> {
+  const r = await q.get<{ org_id: number }>("SELECT org_id FROM settings WHERE key = 'ingest_token' AND value = ?", [token]);
+  return r?.org_id;
 }
 
 /**
@@ -837,10 +935,11 @@ export async function setSetting(key: string, value: string): Promise<void> {
  */
 const settingCache = new Map<string, { v: string | undefined; at: number }>();
 export async function getSettingCached(key: string, ttlMs = 5_000): Promise<string | undefined> {
-  const hit = settingCache.get(key);
+  const cacheKey = `${oid()}:${key}`;
+  const hit = settingCache.get(cacheKey);
   if (hit && Date.now() - hit.at < ttlMs) return hit.v;
   const v = await getSetting(key);
-  settingCache.set(key, { v, at: Date.now() });
+  settingCache.set(cacheKey, { v, at: Date.now() });
   return v;
 }
 
@@ -848,6 +947,7 @@ export async function getSettingCached(key: string, ttlMs = 5_000): Promise<stri
 
 export interface BrowserOpRow {
   id: number;
+  org_id: number;
   op: string;
   payload: string | null;
   status: "pending" | "done" | "failed";
@@ -857,14 +957,19 @@ export interface BrowserOpRow {
 }
 
 export async function createBrowserOp(op: string, payload: unknown): Promise<BrowserOpRow> {
-  const row = await q.get<{ id: number }>("INSERT INTO browser_ops (op, payload, status, created_at) VALUES (?, ?, 'pending', ?) RETURNING id", [op, payload === undefined ? null : JSON.stringify(payload), now()]);
+  const row = await q.get<{ id: number }>("INSERT INTO browser_ops (org_id, op, payload, status, created_at) VALUES (?, ?, ?, 'pending', ?) RETURNING id", [oid(), op, payload === undefined ? null : JSON.stringify(payload), now()]);
   return (await getBrowserOp(row!.id))!;
 }
 export async function getBrowserOp(id: number): Promise<BrowserOpRow | undefined> {
+  return q.get<BrowserOpRow>("SELECT * FROM browser_ops WHERE id = ? AND org_id = ?", [id, oid()]);
+}
+/** A browser-op row wherever it lives — the org-adoption peek for the browser.op job. */
+export async function getBrowserOpAnyOrg(id: number): Promise<BrowserOpRow | undefined> {
+  assertSystem();
   return q.get<BrowserOpRow>("SELECT * FROM browser_ops WHERE id = ?", [id]);
 }
 export async function finishBrowserOp(id: number, status: "done" | "failed", result: unknown): Promise<void> {
-  await q.run("UPDATE browser_ops SET status = ?, result = ?, finished_at = ? WHERE id = ? AND status = 'pending'", [status, result === undefined ? null : JSON.stringify(result), now(), id]);
+  await q.run("UPDATE browser_ops SET status = ?, result = ?, finished_at = ? WHERE id = ? AND org_id = ? AND status = 'pending'", [status, result === undefined ? null : JSON.stringify(result), now(), id, oid()]);
 }
 export async function pruneBrowserOps(olderThanMs = 60 * 60_000): Promise<number> {
   return (await q.run("DELETE FROM browser_ops WHERE created_at < ?", [new Date(Date.now() - olderThanMs).toISOString()])).changes;
@@ -873,14 +978,14 @@ export async function pruneBrowserOps(olderThanMs = 60 * 60_000): Promise<number
 /* ---------- browser session state (sealed storageState blobs) ---------- */
 
 export async function getBrowserSession(id: string): Promise<string | undefined> {
-  const r = await q.get<{ blob: string }>("SELECT blob FROM browser_sessions WHERE id = ?", [id]);
+  const r = await q.get<{ blob: string }>("SELECT blob FROM browser_sessions WHERE id = ? AND org_id = ?", [id, oid()]);
   return r?.blob;
 }
 export async function setBrowserSession(id: string, blob: string): Promise<void> {
-  await q.run("INSERT INTO browser_sessions (id, blob, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at", [id, blob, now()]);
+  await q.run("INSERT INTO browser_sessions (id, org_id, blob, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(org_id, id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at", [id, oid(), blob, now()]);
 }
 export async function browserSessionUpdatedAt(id: string): Promise<string | undefined> {
-  const r = await q.get<{ updated_at: string }>("SELECT updated_at FROM browser_sessions WHERE id = ?", [id]);
+  const r = await q.get<{ updated_at: string }>("SELECT updated_at FROM browser_sessions WHERE id = ? AND org_id = ?", [id, oid()]);
   return r?.updated_at;
 }
 
@@ -907,8 +1012,8 @@ const AGENT_SELECT = `SELECT a.*,
   FROM agent_profiles a`;
 
 export async function listAgentProfiles(opts: { provider?: string; kind?: string; includeDisabled?: boolean } = {}): Promise<AgentProfileSummary[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["a.org_id = ?"];
+  const params: unknown[] = [oid()];
   if (opts.provider) {
     where.push("a.provider_id = ?");
     params.push(opts.provider);
@@ -922,11 +1027,11 @@ export async function listAgentProfiles(opts: { provider?: string; kind?: string
 }
 
 export async function getAgentProfile(id: number): Promise<AgentProfileSummary | undefined> {
-  return q.get<AgentProfileSummary>(`${AGENT_SELECT} WHERE a.id = ?`, [id]);
+  return q.get<AgentProfileSummary>(`${AGENT_SELECT} WHERE a.id = ? AND a.org_id = ?`, [id, oid()]);
 }
 
 export async function findAgentProfile(key: string): Promise<AgentProfileSummary | undefined> {
-  return q.get<AgentProfileSummary>(`${AGENT_SELECT} WHERE a.key = ?`, [key]);
+  return q.get<AgentProfileSummary>(`${AGENT_SELECT} WHERE a.key = ? AND a.org_id = ?`, [key, oid()]);
 }
 
 /** Insert or update by key. Fields that are undefined are left untouched on update. */
@@ -938,14 +1043,15 @@ export async function upsertAgentProfile(input: AgentProfileInput): Promise<Agen
   if (existing) {
     await q.run(
       `UPDATE agent_profiles SET name = COALESCE(?, name), description = COALESCE(?, description), provider_id = COALESCE(?, provider_id), kind = COALESCE(?, kind),
-         capabilities = COALESCE(?, capabilities), status = COALESCE(?, status), configuration = COALESCE(?, configuration), updated_at = ? WHERE id = ?`,
-      [input.name ?? null, input.description ?? null, input.provider_id ?? null, input.kind ?? null, caps ?? null, input.status ?? null, conf ?? null, ts, existing.id],
+         capabilities = COALESCE(?, capabilities), status = COALESCE(?, status), configuration = COALESCE(?, configuration), updated_at = ? WHERE id = ? AND org_id = ?`,
+      [input.name ?? null, input.description ?? null, input.provider_id ?? null, input.kind ?? null, caps ?? null, input.status ?? null, conf ?? null, ts, existing.id, oid()],
     );
     const a = (await getAgentProfile(existing.id))!;
     notify("agent", a);
     return a;
   }
-  const row = await q.get<{ id: number }>(`INSERT INTO agent_profiles (key, name, description, provider_id, kind, capabilities, status, configuration, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, [
+  const row = await q.get<{ id: number }>(`INSERT INTO agent_profiles (org_id, key, name, description, provider_id, kind, capabilities, status, configuration, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, [
+    oid(),
     input.key,
     input.name ?? input.key,
     input.description ?? null,
@@ -965,7 +1071,7 @@ export async function upsertAgentProfile(input: AgentProfileInput): Promise<Agen
 export async function updateAgentProfile(id: number, patch: Partial<AgentProfileInput>): Promise<AgentProfileSummary | undefined> {
   const a = await getAgentProfile(id);
   if (!a) return undefined;
-  await q.run(`UPDATE agent_profiles SET name=?, description=?, provider_id=?, kind=?, capabilities=?, status=?, configuration=?, updated_at=? WHERE id=?`, [
+  await q.run(`UPDATE agent_profiles SET name=?, description=?, provider_id=?, kind=?, capabilities=?, status=?, configuration=?, updated_at=? WHERE id=? AND org_id=?`, [
     patch.name ?? a.name,
     patch.description === undefined ? a.description : patch.description,
     patch.provider_id === undefined ? a.provider_id : patch.provider_id,
@@ -975,6 +1081,7 @@ export async function updateAgentProfile(id: number, patch: Partial<AgentProfile
     patch.configuration === undefined ? a.configuration : patch.configuration === null ? null : JSON.stringify(patch.configuration),
     now(),
     id,
+    oid(),
   ]);
   const next = await getAgentProfile(id);
   if (next) notify("agent", next);
@@ -982,7 +1089,7 @@ export async function updateAgentProfile(id: number, patch: Partial<AgentProfile
 }
 
 export async function deleteAgentProfile(id: number): Promise<boolean> {
-  const ok = (await q.run("DELETE FROM agent_profiles WHERE id = ?", [id])).changes > 0;
+  const ok = (await q.run("DELETE FROM agent_profiles WHERE id = ? AND org_id = ?", [id, oid()])).changes > 0;
   if (ok) notify("agent:deleted", { id });
   return ok;
 }
@@ -991,19 +1098,20 @@ export async function deleteAgentProfile(id: number): Promise<boolean> {
 
 export async function getPolicyOverrides(): Promise<Record<string, PolicyMode>> {
   const out: Record<string, PolicyMode> = {};
-  for (const r of await q.all<{ action: string; mode: PolicyMode }>("SELECT action, mode FROM policies")) out[r.action] = r.mode;
+  for (const r of await q.all<{ action: string; mode: PolicyMode }>("SELECT action, mode FROM policies WHERE org_id = ?", [oid()])) out[r.action] = r.mode;
   return out;
 }
 export async function setPolicyOverride(action: string, mode: PolicyMode | null): Promise<void> {
-  if (mode === null) await q.run("DELETE FROM policies WHERE action = ?", [action]);
-  else await q.run("INSERT INTO policies (action, mode, updated_at) VALUES (?, ?, ?) ON CONFLICT(action) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at", [action, mode, now()]);
+  if (mode === null) await q.run("DELETE FROM policies WHERE action = ? AND org_id = ?", [action, oid()]);
+  else await q.run("INSERT INTO policies (action, org_id, mode, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(org_id, action) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at", [action, oid(), mode, now()]);
 }
 
 export type ApprovalRow = Approval & { run_label: string | null; run_kind: string | null };
 const APPROVAL_SELECT = `SELECT a.*, r.label AS run_label, r.kind AS run_kind FROM approvals a LEFT JOIN runs r ON r.id = a.run_id`;
 
 export async function createApproval(input: { run_id?: number | null; message_id?: number | null; action: string; provider?: string | null; summary: string; detail?: string | null }): Promise<ApprovalRow> {
-  const row = await q.get<{ id: number }>(`INSERT INTO approvals (run_id, message_id, action, provider, summary, detail, status, requested_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id`, [
+  const row = await q.get<{ id: number }>(`INSERT INTO approvals (org_id, run_id, message_id, action, provider, summary, detail, status, requested_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id`, [
+    oid(),
     input.run_id ?? null,
     input.message_id ?? null,
     input.action,
@@ -1017,7 +1125,7 @@ export async function createApproval(input: { run_id?: number | null; message_id
   return a;
 }
 export async function getApproval(id: number): Promise<ApprovalRow | undefined> {
-  return q.get<ApprovalRow>(`${APPROVAL_SELECT} WHERE a.id = ?`, [id]);
+  return q.get<ApprovalRow>(`${APPROVAL_SELECT} WHERE a.id = ? AND a.org_id = ?`, [id, oid()]);
 }
 export async function updateApproval(id: number, patch: { status: ApprovalStatus; decided_by?: string | null; reason?: string | null }): Promise<ApprovalRow | undefined> {
   const a = await getApproval(id);
@@ -1025,21 +1133,28 @@ export async function updateApproval(id: number, patch: { status: ApprovalStatus
   // Guarded: only a pending approval can be decided/expired/interrupted. Whoever loses the
   // race (a decision landing at the same moment as the timeout sweep) gets undefined and
   // backs off — an approval never carries one outcome while its run settles with another.
-  const res = await q.run("UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, reason = ? WHERE id = ? AND status = 'pending'", [
+  const res = await q.run("UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, reason = ? WHERE id = ? AND org_id = ? AND status = 'pending'", [
     patch.status,
     patch.status === "pending" ? null : now(),
     patch.decided_by ?? a.decided_by,
     patch.reason ?? a.reason,
     id,
+    oid(),
   ]);
   if (res.changes === 0) return undefined;
   const next = (await getApproval(id))!;
   notify("approval", next);
   return next;
 }
+/** Pending approvals across every workspace — the timeout sweep's and boot recovery's worklist. */
+export async function listPendingApprovalsAll(limit = 500): Promise<(ApprovalRow & { org_id: number })[]> {
+  assertSystem();
+  return q.all<ApprovalRow & { org_id: number }>(`${APPROVAL_SELECT} WHERE a.status = 'pending' ORDER BY a.requested_at DESC LIMIT ?`, [limit]);
+}
+
 export async function listApprovals(opts: { status?: ApprovalStatus | ApprovalStatus[]; message_id?: number; run_id?: number; limit?: number } = {}): Promise<ApprovalRow[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["a.org_id = ?"];
+  const params: unknown[] = [oid()];
   if (opts.status) {
     const list = Array.isArray(opts.status) ? opts.status : [opts.status];
     where.push(`a.status IN (${list.map(() => "?").join(",")})`);
@@ -1058,7 +1173,12 @@ export async function listApprovals(opts: { status?: ApprovalStatus | ApprovalSt
 }
 
 export async function addAudit(input: { actor: string; action: string; target?: string | null; detail?: string | null; metadata?: unknown }): Promise<AuditEntry> {
-  const row = await q.get<{ id: number }>("INSERT INTO audit_log (at, actor, action, target, detail, metadata) VALUES (?, ?, ?, ?, ?, ?) RETURNING id", [
+  // The one deliberate scope exception: security events (failed logins, sign-up attempts)
+  // legitimately happen before any workspace is known and land in the founding workspace's
+  // audit, whose owner operates the install.
+  const org = currentOrgId() ?? 1;
+  const row = await q.get<{ id: number }>("INSERT INTO audit_log (org_id, at, actor, action, target, detail, metadata) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", [
+    org,
     now(),
     input.actor,
     input.action,
@@ -1070,8 +1190,8 @@ export async function addAudit(input: { actor: string; action: string; target?: 
 }
 export async function listAudit(opts: { limit?: number; action?: string } = {}): Promise<AuditEntry[]> {
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
-  if (opts.action) return q.all<AuditEntry>("SELECT * FROM audit_log WHERE action LIKE ? ORDER BY id DESC LIMIT ?", [opts.action + "%", limit]);
-  return q.all<AuditEntry>("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", [limit]);
+  if (opts.action) return q.all<AuditEntry>("SELECT * FROM audit_log WHERE org_id = ? AND action LIKE ? ORDER BY id DESC LIMIT ?", [oid(), opts.action + "%", limit]);
+  return q.all<AuditEntry>("SELECT * FROM audit_log WHERE org_id = ? ORDER BY id DESC LIMIT ?", [oid(), limit]);
 }
 
 /* ---------- users ---------- */
@@ -1079,25 +1199,31 @@ export async function listAudit(opts: { limit?: number; action?: string } = {}):
 export type UserRole = "owner" | "admin" | "member";
 export interface UserRow {
   id: number;
+  org_id: number;
   email: string;
   password_hash: string;
   role: UserRole;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
+  /** Null until the verification link is clicked; accounts from before verification are grandfathered. */
+  verified_at: string | null;
 }
 
-export async function createUser(input: { email: string; password_hash: string; role?: UserRole }): Promise<UserRow> {
+export async function createUser(input: { email: string; password_hash: string; role?: UserRole; verified?: boolean }): Promise<UserRow> {
   const ts = now();
-  const row = await q.get<{ id: number }>("INSERT INTO users (email, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING id", [
+  const row = await q.get<{ id: number }>("INSERT INTO users (org_id, email, password_hash, role, created_at, updated_at, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", [
+    oid(),
     input.email.trim().toLowerCase(),
     input.password_hash,
     input.role ?? "member",
     ts,
     ts,
+    input.verified === false ? null : ts,
   ]);
   return (await getUser(row!.id))!;
 }
+/** By-id and by-email lookups are global: they ARE how a request finds its workspace. */
 export async function getUser(id: number): Promise<UserRow | undefined> {
   return q.get<UserRow>("SELECT * FROM users WHERE id = ?", [id]);
 }
@@ -1105,12 +1231,18 @@ export async function getUserByEmail(email: string): Promise<UserRow | undefined
   return q.get<UserRow>("SELECT * FROM users WHERE email = ?", [email.trim().toLowerCase()]);
 }
 export async function listUsers(): Promise<Omit<UserRow, "password_hash">[]> {
-  return q.all<Omit<UserRow, "password_hash">>("SELECT id, email, role, created_at, updated_at, last_login_at FROM users ORDER BY id");
+  return q.all<Omit<UserRow, "password_hash">>("SELECT id, org_id, email, role, created_at, updated_at, last_login_at, verified_at FROM users WHERE org_id = ? ORDER BY id", [oid()]);
 }
+/** Every account on the install: login-time resolution (which account does this credential belong to). */
+export async function listAllUsers(): Promise<Pick<UserRow, "id" | "email">[]> {
+  return q.all<Pick<UserRow, "id" | "email">>("SELECT id, email FROM users ORDER BY id");
+}
+/** Install-wide count: drives first-run setup, which happens before any workspace exists. */
 export async function countUsers(): Promise<number> {
   return (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM users"))!.n;
 }
 export async function updateUser(id: number, patch: { password_hash?: string; role?: UserRole; last_login_at?: string }): Promise<UserRow | undefined> {
+  // Global by id: login upgrades a hash before any scope exists; ids come from verified lookups.
   const u = await getUser(id);
   if (!u) return undefined;
   await q.run("UPDATE users SET password_hash = ?, role = ?, last_login_at = ?, updated_at = ? WHERE id = ?", [
@@ -1123,7 +1255,36 @@ export async function updateUser(id: number, patch: { password_hash?: string; ro
   return getUser(id);
 }
 export async function deleteUser(id: number): Promise<boolean> {
-  return (await q.run("DELETE FROM users WHERE id = ?", [id])).changes > 0;
+  return (await q.run("DELETE FROM users WHERE id = ? AND org_id = ?", [id, oid()])).changes > 0;
+}
+export async function setUserVerified(id: number): Promise<void> {
+  await q.run("UPDATE users SET verified_at = ?, updated_at = ? WHERE id = ? AND verified_at IS NULL", [now(), now(), id]);
+}
+
+/* ---------- one-time account tokens (email verification, password reset) ---------- */
+
+export interface UserTokenRow {
+  id: number;
+  user_id: number;
+  kind: "verify" | "reset";
+  token_hash: string;
+  created_at: string;
+  expires_at: string;
+  used_at: string | null;
+}
+
+export async function createUserToken(userId: number, kind: "verify" | "reset", tokenHash: string, ttlMs: number): Promise<void> {
+  await q.run("INSERT INTO user_tokens (user_id, kind, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)", [userId, kind, tokenHash, now(), new Date(Date.now() + ttlMs).toISOString()]);
+}
+/** Redeem a token exactly once: the guarded update wins or the call returns undefined. */
+export async function consumeUserToken(tokenHash: string, kind: "verify" | "reset"): Promise<UserTokenRow | undefined> {
+  const row = await q.get<UserTokenRow>("SELECT * FROM user_tokens WHERE token_hash = ? AND kind = ?", [tokenHash, kind]);
+  if (!row || row.used_at || row.expires_at <= now()) return undefined;
+  const res = await q.run("UPDATE user_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL", [now(), row.id]);
+  return res.changes > 0 ? row : undefined;
+}
+export async function pruneUserTokens(): Promise<number> {
+  return (await q.run("DELETE FROM user_tokens WHERE expires_at <= ? OR used_at IS NOT NULL", [new Date(Date.now() - 24 * 60 * 60_000).toISOString()])).changes;
 }
 export async function deleteSessionsForUser(userId: number): Promise<number> {
   return (await q.run("DELETE FROM sessions WHERE user_id = ?", [userId])).changes;
@@ -1133,6 +1294,7 @@ export async function deleteSessionsForUser(userId: number): Promise<number> {
 
 export interface SessionRow {
   id: number;
+  org_id: number;
   token_hash: string;
   created_at: string;
   last_seen_at: string;
@@ -1142,9 +1304,10 @@ export interface SessionRow {
   user_id: number | null;
 }
 
-export async function insertSession(input: { token_hash: string; expires_at: string; user_agent?: string | null; ip?: string | null; user_id?: number | null }): Promise<SessionRow> {
+export async function insertSession(input: { token_hash: string; expires_at: string; user_agent?: string | null; ip?: string | null; user_id?: number | null; org_id?: number }): Promise<SessionRow> {
   const ts = now();
-  const row = await q.get<{ id: number }>("INSERT INTO sessions (token_hash, created_at, last_seen_at, expires_at, user_agent, ip, user_id) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", [
+  const row = await q.get<{ id: number }>("INSERT INTO sessions (org_id, token_hash, created_at, last_seen_at, expires_at, user_agent, ip, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id", [
+    input.org_id ?? 1,
     input.token_hash,
     ts,
     ts,
@@ -1179,6 +1342,7 @@ export async function countSessions(): Promise<number> {
 export type PairingStatus = "waiting" | "paired" | "importing" | "done" | "failed" | "expired" | "cancelled" | "replaced";
 export interface PairingRow {
   id: number;
+  org_id: number;
   platform: string;
   code_hash: string;
   token_hash: string | null;
@@ -1193,9 +1357,12 @@ export interface PairingRow {
 }
 
 export async function insertPairing(input: { platform: string; code_hash: string; expires_at: string }): Promise<PairingRow> {
-  const row = await q.get<{ id: number }>("INSERT INTO pairings (platform, code_hash, status, created_at, expires_at) VALUES (?, ?, 'waiting', ?, ?) RETURNING id", [input.platform, input.code_hash, now(), input.expires_at]);
-  return (await getPairing(row!.id))!;
+  const row = await q.get<{ id: number }>("INSERT INTO pairings (org_id, platform, code_hash, status, created_at, expires_at) VALUES (?, ?, ?, 'waiting', ?, ?) RETURNING id", [oid(), input.platform, input.code_hash, now(), input.expires_at]);
+  return (await q.get<PairingRow>("SELECT * FROM pairings WHERE id = ?", [row!.id]))!;
 }
+// Pairing lookups by id/code/token are global on purpose: the exchange arrives with no login
+// and no workspace — the hashed code or token IS the capability, and the caller adopts the
+// row's org before importing anything.
 export async function getPairing(id: number): Promise<PairingRow | undefined> {
   return q.get<PairingRow>("SELECT * FROM pairings WHERE id = ?", [id]);
 }
@@ -1217,7 +1384,7 @@ export async function updatePairing(id: number, patch: Partial<Pick<PairingRow, 
   return getPairing(id);
 }
 export async function latestPairing(platform: string): Promise<PairingRow | undefined> {
-  return q.get<PairingRow>("SELECT * FROM pairings WHERE platform = ? ORDER BY id DESC LIMIT 1", [platform]);
+  return q.get<PairingRow>("SELECT * FROM pairings WHERE platform = ? AND org_id = ? ORDER BY id DESC LIMIT 1", [platform, oid()]);
 }
 /** Codes and tokens die on their own; nothing lingers as "waiting" past its time. */
 export async function expirePairings(): Promise<number> {
@@ -1225,17 +1392,17 @@ export async function expirePairings(): Promise<number> {
 }
 /** A new code for a provider retires any earlier one still waiting. */
 export async function replaceWaitingPairings(platform: string, exceptId: number): Promise<number> {
-  return (await q.run("UPDATE pairings SET status = 'replaced', finished_at = ? WHERE platform = ? AND status = 'waiting' AND id <> ?", [now(), platform, exceptId])).changes;
+  return (await q.run("UPDATE pairings SET status = 'replaced', finished_at = ? WHERE platform = ? AND org_id = ? AND status = 'waiting' AND id <> ?", [now(), platform, oid(), exceptId])).changes;
 }
 
 /* ---------- overview ---------- */
 
 export async function overviewCounts() {
   const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
-  const tasks = (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE enabled = 1"))!;
-  const failed = (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE status IN ('failed','needs_attention') AND COALESCE(finished_at, started_at, created_at) > ?`, [daysAgo(7)]))!;
-  const unread = (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE read = 0"))!;
-  const runs24h = (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE COALESCE(finished_at, started_at, created_at) > ?`, [daysAgo(1)]))!;
+  const tasks = (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE enabled = 1 AND org_id = ?", [oid()]))!;
+  const failed = (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE status IN ('failed','needs_attention') AND COALESCE(finished_at, started_at, created_at) > ? AND org_id = ?`, [daysAgo(7), oid()]))!;
+  const unread = (await q.get<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE read = 0 AND org_id = ?", [oid()]))!;
+  const runs24h = (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE COALESCE(finished_at, started_at, created_at) > ? AND org_id = ?`, [daysAgo(1), oid()]))!;
   return { agents: tasks.n, tasks: tasks.n, failed7d: failed.n, unreadEvents: unread.n, runs24h: runs24h.n };
 }
 
@@ -1264,28 +1431,29 @@ const CONVERSATION_SELECT = `SELECT c.*,
 
 export async function createConversation(title = ""): Promise<ConversationSummary> {
   const ts = now();
-  const row = await q.get<{ id: number }>("INSERT INTO conversations (title, created_at, updated_at, last_message_at) VALUES (?, ?, ?, NULL) RETURNING id", [title.slice(0, 120), ts, ts]);
+  const row = await q.get<{ id: number }>("INSERT INTO conversations (org_id, title, created_at, updated_at, last_message_at) VALUES (?, ?, ?, ?, NULL) RETURNING id", [oid(), title.slice(0, 120), ts, ts]);
   const c = (await getConversation(row!.id))!;
   notify("conversation", { action: "created", conversation: c });
   return c;
 }
 
 export async function getConversation(id: number): Promise<ConversationSummary | undefined> {
-  return q.get<ConversationSummary>(`${CONVERSATION_SELECT} WHERE c.id = ?`, [id]);
+  return q.get<ConversationSummary>(`${CONVERSATION_SELECT} WHERE c.id = ? AND c.org_id = ?`, [id, oid()]);
 }
 
 export async function listConversations(limit = 200): Promise<ConversationSummary[]> {
-  return q.all<ConversationSummary>(`${CONVERSATION_SELECT} ORDER BY COALESCE(c.last_message_at, c.created_at) DESC LIMIT ?`, [Math.min(Math.max(limit, 1), 1000)]);
+  return q.all<ConversationSummary>(`${CONVERSATION_SELECT} WHERE c.org_id = ? ORDER BY COALESCE(c.last_message_at, c.created_at) DESC LIMIT ?`, [oid(), Math.min(Math.max(limit, 1), 1000)]);
 }
 
 export async function updateConversation(id: number, patch: { title?: string; last_message_at?: string }): Promise<ConversationSummary | undefined> {
   const c = await getConversation(id);
   if (!c) return undefined;
-  await q.run("UPDATE conversations SET title = ?, last_message_at = ?, updated_at = ? WHERE id = ?", [
+  await q.run("UPDATE conversations SET title = ?, last_message_at = ?, updated_at = ? WHERE id = ? AND org_id = ?", [
     patch.title === undefined ? c.title : patch.title.slice(0, 120),
     patch.last_message_at === undefined ? c.last_message_at : patch.last_message_at,
     now(),
     id,
+    oid(),
   ]);
   const next = (await getConversation(id))!;
   notify("conversation", { action: "updated", conversation: next });
@@ -1295,15 +1463,15 @@ export async function updateConversation(id: number, patch: { title?: string; la
 export async function deleteConversation(id: number): Promise<boolean> {
   const c = await getConversation(id);
   if (!c) return false;
-  await q.run("DELETE FROM messages WHERE conversation_id = ?", [id]);
-  await q.run("DELETE FROM conversations WHERE id = ?", [id]);
+  await q.run("DELETE FROM messages WHERE conversation_id = ? AND org_id = ?", [id, oid()]);
+  await q.run("DELETE FROM conversations WHERE id = ? AND org_id = ?", [id, oid()]);
   notify("conversation", { action: "deleted", conversation: c });
   return true;
 }
 
 /** Messages of one thread, oldest first. */
 export async function conversationMessages(conversationId: number, limit = 300): Promise<MessageWithTask[]> {
-  return q.all<MessageWithTask>(`${MESSAGE_SELECT} WHERE m.conversation_id = ? ORDER BY m.created_at ASC, m.id ASC LIMIT ?`, [conversationId, Math.min(Math.max(limit, 1), 2000)]);
+  return q.all<MessageWithTask>(`${MESSAGE_SELECT} WHERE m.conversation_id = ? AND m.org_id = ? ORDER BY m.created_at ASC, m.id ASC LIMIT ?`, [conversationId, oid(), Math.min(Math.max(limit, 1), 2000)]);
 }
 
 /* ---------- messages (what you typed; each one may point at a run) ---------- */
@@ -1317,9 +1485,9 @@ const MESSAGE_SELECT = `SELECT m.*, t.name AS task_name, t.platform AS task_plat
 
 export async function createMessage(text: string, conversationId: number | null = null): Promise<MessageRow> {
   const ts = now();
-  const row = await q.get<{ id: number }>(`INSERT INTO messages (text, status, conversation_id, created_at, updated_at) VALUES (?, 'needs_assignment', ?, ?, ?) RETURNING id`, [text, conversationId, ts, ts]);
+  const row = await q.get<{ id: number }>(`INSERT INTO messages (org_id, text, status, conversation_id, created_at, updated_at) VALUES (?, ?, 'needs_assignment', ?, ?, ?) RETURNING id`, [oid(), text, conversationId, ts, ts]);
   if (conversationId) {
-    await q.run("UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ?", [ts, ts, conversationId]);
+    await q.run("UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ? AND org_id = ?", [ts, ts, conversationId, oid()]);
     const c = await getConversation(conversationId);
     if (c) notify("conversation", { action: "updated", conversation: c });
   }
@@ -1329,7 +1497,13 @@ export async function createMessage(text: string, conversationId: number | null 
 }
 
 export async function getMessage(id: number): Promise<MessageWithTask | undefined> {
-  return q.get<MessageWithTask>(`${MESSAGE_SELECT} WHERE m.id = ?`, [id]);
+  return q.get<MessageWithTask>(`${MESSAGE_SELECT} WHERE m.id = ? AND m.org_id = ?`, [id, oid()]);
+}
+
+/** A message row wherever it lives — the org-adoption peek for delivery jobs. */
+export async function getMessageAnyOrg(id: number): Promise<(MessageWithTask & { org_id: number }) | undefined> {
+  assertSystem();
+  return q.get<MessageWithTask & { org_id: number }>(`${MESSAGE_SELECT} WHERE m.id = ?`, [id]);
 }
 
 export interface MessagePatch {
@@ -1351,7 +1525,7 @@ export async function updateMessage(id: number, patch: MessagePatch): Promise<Me
   const m = await getMessage(id);
   if (!m) return undefined;
   const json = (v: unknown, cur: string | null) => (v === undefined ? cur : v === null ? null : JSON.stringify(v));
-  await q.run(`UPDATE messages SET status=?, platform=?, task_id=?, run_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, steps=?, updated_at=? WHERE id=?`, [
+  await q.run(`UPDATE messages SET status=?, platform=?, task_id=?, run_id=?, suggestions=?, routing=?, delivery_mode=?, delivered_at=?, acked_at=?, response=?, error=?, steps=?, updated_at=? WHERE id=? AND org_id=?`, [
     patch.status ?? m.status,
     patch.platform === undefined ? m.platform : patch.platform,
     patch.task_id === undefined ? m.task_id : patch.task_id,
@@ -1366,6 +1540,7 @@ export async function updateMessage(id: number, patch: MessagePatch): Promise<Me
     json(patch.steps, m.steps),
     now(),
     id,
+    oid(),
   ]);
   const next = await getMessage(id);
   if (next) {
@@ -1380,8 +1555,8 @@ export async function updateMessage(id: number, patch: MessagePatch): Promise<Me
 }
 
 export async function listMessages(opts: { status?: string; task_id?: number; limit?: number } = {}): Promise<MessageWithTask[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["m.org_id = ?"];
+  const params: unknown[] = [oid()];
   if (opts.status) {
     where.push("m.status = ?");
     params.push(opts.status);
@@ -1396,12 +1571,12 @@ export async function listMessages(opts: { status?: string; task_id?: number; li
 
 /** Messages waiting for a task's agent that pulls its instructions. */
 export async function inboxFor(taskId: number): Promise<MessageWithTask[]> {
-  return q.all<MessageWithTask>(`${MESSAGE_SELECT} WHERE m.task_id = ? AND m.delivery_mode = 'inbox' AND m.status IN ('assigned','delivered') ORDER BY m.created_at ASC`, [taskId]);
+  return q.all<MessageWithTask>(`${MESSAGE_SELECT} WHERE m.task_id = ? AND m.org_id = ? AND m.delivery_mode = 'inbox' AND m.status IN ('assigned','delivered') ORDER BY m.created_at ASC`, [taskId, oid()]);
 }
 
 export async function deleteMessage(id: number): Promise<boolean> {
   const m = await getMessage(id);
-  const ok = (await q.run("DELETE FROM messages WHERE id = ?", [id])).changes > 0;
+  const ok = (await q.run("DELETE FROM messages WHERE id = ? AND org_id = ?", [id, oid()])).changes > 0;
   if (ok && m) {
     notify("message:deleted", { id, conversation_id: m.conversation_id });
     if (m.conversation_id) {
@@ -1413,7 +1588,7 @@ export async function deleteMessage(id: number): Promise<boolean> {
 }
 
 export async function openMessageCount(): Promise<number> {
-  return (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM messages WHERE status IN ('needs_assignment','failed')`))!.n;
+  return (await q.get<{ n: number }>(`SELECT COUNT(*) AS n FROM messages WHERE status IN ('needs_assignment','failed') AND org_id = ?`, [oid()]))!.n;
 }
 
 /* ---------- stats ---------- */
@@ -1435,8 +1610,8 @@ export async function runStats(days = 14): Promise<DayStat[]> {
   cutoff.setUTCHours(0, 0, 0, 0);
   cutoff.setUTCDate(cutoff.getUTCDate() - (n - 1));
   const rows = await q.all<{ day: string; status: string; n: number }>(
-    `SELECT substr(COALESCE(finished_at, started_at, created_at), 1, 10) AS day, status, COUNT(*) AS n FROM runs WHERE COALESCE(finished_at, started_at, created_at) >= ? GROUP BY day, status`,
-    [cutoff.toISOString()],
+    `SELECT substr(COALESCE(finished_at, started_at, created_at), 1, 10) AS day, status, COUNT(*) AS n FROM runs WHERE COALESCE(finished_at, started_at, created_at) >= ? AND org_id = ? GROUP BY day, status`,
+    [cutoff.toISOString(), oid()],
   );
   const out: DayStat[] = [];
   const today = new Date();
@@ -1454,8 +1629,8 @@ export async function runStats(days = 14): Promise<DayStat[]> {
 /** Last few run statuses per task, newest first, for the history dots on the tasks table. */
 export async function recentStatusesByTask(limit = 6): Promise<Record<number, string[]>> {
   const rows = await q.all<{ task_id: number; status: string }>(
-    `SELECT task_id, status FROM (SELECT task_id, status, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY COALESCE(finished_at, started_at, created_at) DESC) AS rn FROM runs WHERE task_id IS NOT NULL) ranked WHERE rn <= ?`,
-    [limit],
+    `SELECT task_id, status FROM (SELECT task_id, status, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY COALESCE(finished_at, started_at, created_at) DESC) AS rn FROM runs WHERE task_id IS NOT NULL AND org_id = ?) ranked WHERE rn <= ?`,
+    [oid(), limit],
   );
   const out: Record<number, string[]> = {};
   for (const r of rows) (out[r.task_id] ??= []).push(r.status);
