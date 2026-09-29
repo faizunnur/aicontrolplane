@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
 import { settleCommandMessage } from "./answers.js";
-import { crossOrigin, isAdmin } from "./auth.js";
+import { authUser, crossOrigin, isAdmin } from "./auth.js";
 import { bus } from "./bus.js";
 import { startRedisBridge } from "../packages/realtime/src/index.js";
 import { handleLiveUpgrade } from "./browser/live.js";
@@ -110,8 +110,15 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 app.use("/vnc", async (req, res) => {
-  if (!await isAdmin(req)) {
+  const vncUser = await authUser(req);
+  if (!vncUser) {
     res.status(401).type("html").send(`<p>Unauthorized. Sign in on the <a href="/">dashboard</a> first.</p>`);
+    return;
+  }
+  // The desktop screen is ONE display showing the founding workspace's browser (and, later,
+  // whoever holds the desktop sign-in). Other workspaces have no business seeing it.
+  if (vncUser.orgId !== browser.vncOwnerOrg()) {
+    res.status(403).type("html").send(`<p>The cloud desktop belongs to another workspace. Use the live view instead.</p>`);
     return;
   }
   if (req.originalUrl === "/vnc") return res.redirect("/vnc/");
@@ -148,14 +155,22 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (!await isAdmin(req)) {
+  const wsUser = await authUser(req);
+  if (!wsUser) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
   }
   if (isLive) {
-    // The live browser view: Chromium screencast frames + input, see src/browser/live.ts.
-    handleLiveUpgrade(req, socket, head);
+    // The live browser view: Chromium screencast frames + input, scoped to the viewer's
+    // workspace — see src/browser/live.ts.
+    handleLiveUpgrade(req, socket, head, wsUser.orgId);
+    return;
+  }
+  if (wsUser.orgId !== browser.vncOwnerOrg()) {
+    // One physical display; only its current owner workspace may watch it.
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
     return;
   }
   req.url = req.url!.replace(/^\/vnc/, "") || "/";

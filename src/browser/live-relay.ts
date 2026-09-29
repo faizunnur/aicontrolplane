@@ -7,10 +7,10 @@ import { acquireStream, applyCommand, refreshLevel, releaseStream, LEVEL_ORDER, 
   say what they are watching (a heartbeat, so a dead api stops a stream by silence) and
   forward viewer commands; this relay drives the screencasts and publishes every frame.
 
-    ctl   (api → here)  { t: "watching", wants: [{ platform, level }] }   every ~3s and on change
-                        { t: "cmd", platform, override, msg }
-    frame (here → api)  { platform, meta, metaChanged, data }             data = base64 JPEG
-                        { platform, error }
+    ctl   (api → here)  { t: "watching", wants: [{ org, platform, level }] }   every ~3s and on change
+                        { t: "cmd", org, platform, override, msg }
+    frame (here → api)  { org, platform, meta, metaChanged, data }             data = base64 JPEG
+                        { org, platform, error }
 */
 
 const log = logger("live-relay");
@@ -34,19 +34,19 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
 
   const wants = new Map<string, Want>();
 
-  const sinkFor = (platform: string, level: Level): Sink => ({
+  const sinkFor = (org: number, platform: string, level: Level): Sink => ({
     level,
     congested: () => false, // redis takes every frame; the api side drops for slow sockets
     deliver: (frame, meta, metaChanged) => {
       // Many per second: while Redis is down a dropped frame is expected, and the outage is
       // already reported by the client.
-      pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ platform, meta, metaChanged, data: frame.toString("base64") })).catch(() => undefined);
+      pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ org, platform, meta, metaChanged, data: frame.toString("base64") })).catch(() => undefined);
     },
   });
 
   sub.on("message", (_ch: string, raw: string) => {
     void (async () => {
-      let msg: { t?: string; wants?: { platform: string; level?: string }[]; platform?: string; override?: boolean; msg?: Record<string, unknown> };
+      let msg: { t?: string; wants?: { org?: number; platform: string; level?: string }[]; org?: number; platform?: string; override?: boolean; msg?: Record<string, unknown> };
       try {
         msg = JSON.parse(raw);
       } catch {
@@ -56,27 +56,30 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
         const now = Date.now();
         for (const w of msg.wants) {
           if (!w?.platform) continue;
+          const org = Number(w.org) || 1;
+          const key = `${org}:${w.platform}`;
           const level = LEVEL_ORDER.includes(w.level as Level) ? (w.level as Level) : "medium";
-          let cur = wants.get(w.platform);
+          let cur = wants.get(key);
           if (!cur) {
-            cur = { level, lastSeen: now, sink: sinkFor(w.platform, level), attached: false };
-            wants.set(w.platform, cur);
+            cur = { level, lastSeen: now, sink: sinkFor(org, w.platform, level), attached: false };
+            wants.set(key, cur);
           }
           cur.lastSeen = now;
           if (cur.level !== level) {
             cur.level = level;
             cur.sink.level = level;
-            await refreshLevel(w.platform);
+            await refreshLevel(org, w.platform);
           }
           if (!cur.attached) {
-            cur.attached = await acquireStream(w.platform, cur.sink);
+            cur.attached = await acquireStream(org, w.platform, cur.sink);
           }
         }
         return;
       }
       if (msg.t === "cmd" && msg.platform && msg.msg) {
-        const outcome = await applyCommand(msg.platform, msg.msg, { override: !!msg.override });
-        if (outcome.error) pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ platform: msg.platform, error: outcome.error })).catch(onError);
+        const org = Number(msg.org) || 1;
+        const outcome = await applyCommand(org, msg.platform, msg.msg, { override: !!msg.override });
+        if (outcome.error) pub.publish(LIVE_FRAME_CHANNEL, JSON.stringify({ org, platform: msg.platform, error: outcome.error })).catch(onError);
       }
     })().catch(onError);
   });
@@ -84,10 +87,11 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
   // A platform nobody refreshed drops out; a dead api instance costs one TTL, not a stream forever.
   const reap = setInterval(() => {
     const cutoff = Date.now() - WATCH_TTL_MS;
-    for (const [platform, w] of wants) {
+    for (const [key, w] of wants) {
       if (w.lastSeen >= cutoff) continue;
-      wants.delete(platform);
-      if (w.attached) releaseStream(platform, w.sink);
+      wants.delete(key);
+      const [org, platform] = [Number(key.split(":")[0]), key.slice(key.indexOf(":") + 1)];
+      if (w.attached) releaseStream(org, platform, w.sink);
     }
   }, 5_000);
   reap.unref?.();
@@ -99,7 +103,7 @@ export async function startLiveRelay(redisUrl: string): Promise<{ connected: boo
     connected,
     stop: async () => {
       clearInterval(reap);
-      for (const [platform, w] of wants) if (w.attached) releaseStream(platform, w.sink);
+      for (const [key, w] of wants) if (w.attached) releaseStream(Number(key.split(":")[0]), key.slice(key.indexOf(":") + 1), w.sink);
       wants.clear();
       sub.disconnect();
       pub.disconnect();

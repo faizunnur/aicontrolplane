@@ -3,7 +3,7 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { bus } from "../bus.js";
 import { config } from "../config.js";
-import { addAudit } from "../db.js";
+import { addAudit, withOrg } from "../db.js";
 import { logger } from "../logger.js";
 import { liveViewers as liveViewersGauge } from "../metrics.js";
 import { browser, type BrowserSnapshot } from "./manager.js";
@@ -42,6 +42,8 @@ const remote = !localBrowser && !!config.redisUrl;
 
 interface Client {
   ws: WebSocket;
+  /** The viewer's workspace: the only tabs, frames and state they can ever see. */
+  orgId: number;
   /** Explicit tab, or null while following the agent. */
   platform: string | null;
   follow: boolean;
@@ -61,7 +63,9 @@ let snapshot: BrowserSnapshot | null = null;
 bus.on("browser", (snap: BrowserSnapshot) => {
   snapshot = snap;
   for (const c of clients) {
-    sendJson(c, { t: "state", browser: snap });
+    // Local mode recomputes per viewer so each sees exactly their workspace's tabs; the
+    // mirrored remote snapshot is a founding-workspace concern until the relay carries orgs.
+    sendJson(c, { t: "state", browser: currentSnapshotFor(c) });
     if (c.follow && targetOf(c) !== c.attached) void attach(c);
   }
 });
@@ -70,25 +74,25 @@ export function liveViewers() {
   return clients.size;
 }
 
-export function handleLiveUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
-  wss.handleUpgrade(req, socket, head, (ws) => onConnect(ws));
+export function handleLiveUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, orgId: number) {
+  wss.handleUpgrade(req, socket, head, (ws) => onConnect(ws, orgId));
 }
 
 function sendJson(c: Client, msg: unknown) {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(JSON.stringify(msg));
 }
 
-function currentSnapshot(): BrowserSnapshot {
-  if (localBrowser) return browser.snapshot();
+function currentSnapshotFor(c: Client): BrowserSnapshot {
+  if (localBrowser) return withOrg(c.orgId, () => browser.snapshot());
   return snapshot ?? { seq: 0, active: null, pages: [], busy: null, signIn: null, enabled: true, running: false, headless: true };
 }
 
-function onConnect(ws: WebSocket) {
-  const client: Client = { ws, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null };
+function onConnect(ws: WebSocket, orgId: number) {
+  const client: Client = { ws, orgId, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null };
   clients.add(client);
   liveViewersGauge.set(clients.size);
   log.info(`live view connected (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
-  sendJson(client, { t: "state", browser: currentSnapshot() });
+  sendJson(client, { t: "state", browser: currentSnapshotFor(client) });
   void attach(client);
 
   ws.on("message", (data, isBinary) => {
@@ -114,7 +118,7 @@ function onConnect(ws: WebSocket) {
 
 function targetOf(c: Client): string | null {
   if (!c.follow && c.platform) return c.platform;
-  const snap = currentSnapshot();
+  const snap = currentSnapshotFor(c);
   return snap.active ?? snap.pages[0]?.platform ?? null;
 }
 
@@ -143,7 +147,7 @@ async function attach(c: Client) {
       congested: () => c.ws.bufferedAmount > MAX_BUFFERED,
       deliver: (frame, meta, metaChanged) => deliverTo(c, frame, meta, metaChanged),
     };
-    if (!(await acquireStream(platform, sink))) {
+    if (!(await acquireStream(c.orgId, platform, sink))) {
       sendJson(c, { t: "meta", platform: null, url: "", title: "", width: 0, height: 0 });
       return;
     }
@@ -153,14 +157,14 @@ async function attach(c: Client) {
   }
   // Remote: count the want; the heartbeat tells the relay, frames arrive on the shared channel.
   c.attached = platform;
-  const cached = remoteLast.get(platform);
+  const cached = remoteLast.get(`${c.orgId}:${platform}`);
   if (cached) deliverTo(c, cached.frame, cached.meta, true);
   publishWants();
 }
 
 function detach(c: Client) {
   if (!c.attached) return;
-  if (localBrowser && c.sink) releaseStream(c.attached, c.sink);
+  if (localBrowser && c.sink) releaseStream(c.orgId, c.attached, c.sink);
   c.attached = null;
   c.sink = null;
   c.lastMetaKey = null;
@@ -175,14 +179,16 @@ import { keepSubscribed, resilientRedis } from "../../packages/realtime/src/inde
 const remoteLast = new Map<string, { frame: Buffer; meta: Meta }>();
 let ctlPub: Redis | null = null;
 
-function wantedNow(): { platform: string; level: Level }[] {
-  const byPlatform = new Map<string, Level>();
+function wantedNow(): { org: number; platform: string; level: Level }[] {
+  const byKey = new Map<string, { org: number; platform: string; level: Level }>();
   for (const c of clients) {
     if (!c.attached) continue;
-    const cur = byPlatform.get(c.attached) ?? "low";
-    byPlatform.set(c.attached, LEVEL_ORDER.indexOf(c.level) > LEVEL_ORDER.indexOf(cur) ? c.level : cur);
+    const key = `${c.orgId}:${c.attached}`;
+    const cur = byKey.get(key);
+    const level = cur && LEVEL_ORDER.indexOf(cur.level) > LEVEL_ORDER.indexOf(c.level) ? cur.level : c.level;
+    byKey.set(key, { org: c.orgId, platform: c.attached, level });
   }
-  return [...byPlatform.entries()].map(([platform, level]) => ({ platform, level }));
+  return [...byKey.values()];
 }
 
 function publishWants() {
@@ -197,15 +203,16 @@ if (remote) {
   void keepSubscribed(frameSub, LIVE_FRAME_CHANNEL, onError);
   frameSub.on("message", (_ch: string, raw: string) => {
     try {
-      const msg = JSON.parse(raw) as { platform: string; meta?: Meta; metaChanged?: boolean; data?: string; error?: string };
+      const msg = JSON.parse(raw) as { org?: number; platform: string; meta?: Meta; metaChanged?: boolean; data?: string; error?: string };
+      const org = Number(msg.org) || 1;
       if (msg.error) {
-        for (const c of clients) if (c.attached === msg.platform) sendJson(c, { t: "error", message: msg.error });
+        for (const c of clients) if (c.orgId === org && c.attached === msg.platform) sendJson(c, { t: "error", message: msg.error });
         return;
       }
       if (!msg.data || !msg.meta) return;
       const frame = Buffer.from(msg.data, "base64");
-      remoteLast.set(msg.platform, { frame, meta: msg.meta });
-      for (const c of clients) if (c.attached === msg.platform) deliverTo(c, frame, msg.meta, !!msg.metaChanged);
+      remoteLast.set(`${org}:${msg.platform}`, { frame, meta: msg.meta });
+      for (const c of clients) if (c.orgId === org && c.attached === msg.platform) deliverTo(c, frame, msg.meta, !!msg.metaChanged);
     } catch (err) {
       onError(err);
     }
@@ -236,14 +243,14 @@ async function handle(c: Client, msg: Record<string, unknown>) {
     if (level in QUALITY) {
       c.level = level;
       if (c.sink) c.sink.level = level;
-      if (localBrowser && c.attached) await refreshLevel(c.attached);
+      if (localBrowser && c.attached) await refreshLevel(c.orgId, c.attached);
       if (remote) publishWants();
     }
     return;
   }
   if (t === "override") {
     c.override = !!msg.on;
-    if (c.override) await addAudit({ actor: "you", action: "browser.take_control", target: c.attached, detail: localBrowser ? (browser.busy?.label ?? null) : null });
+    if (c.override) await withOrg(c.orgId, () => addAudit({ actor: "you", action: "browser.take_control", target: c.attached, detail: localBrowser ? (withOrg(c.orgId, () => browser.busy)?.label ?? null) : null }));
     return;
   }
   if (!c.attached) return;
@@ -252,9 +259,9 @@ async function handle(c: Client, msg: Record<string, unknown>) {
 
 async function forwardCommand(c: Client, platform: string, msg: Record<string, unknown>) {
   if (localBrowser) {
-    const outcome = await applyCommand(platform, msg, { override: c.override });
+    const outcome = await applyCommand(c.orgId, platform, msg, { override: c.override });
     if (outcome.error) sendJson(c, { t: "error", message: outcome.error });
     return;
   }
-  ctlPub?.publish(LIVE_CTL_CHANNEL, JSON.stringify({ t: "cmd", platform, override: c.override, msg })).catch(() => undefined);
+  ctlPub?.publish(LIVE_CTL_CHANNEL, JSON.stringify({ t: "cmd", org: c.orgId, platform, override: c.override, msg })).catch(() => undefined);
 }

@@ -984,6 +984,11 @@ export async function getBrowserSession(id: string): Promise<string | undefined>
 export async function setBrowserSession(id: string, blob: string): Promise<void> {
   await q.run("INSERT INTO browser_sessions (id, org_id, blob, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(org_id, id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at", [id, oid(), blob, now()]);
 }
+/** Which workspaces have browser sessions at all — the sync dispatcher's fan-out list. */
+export async function listBrowserSessionOrgsAll(): Promise<number[]> {
+  assertSystem();
+  return (await q.all<{ org_id: number }>("SELECT DISTINCT org_id FROM browser_sessions")).map((r) => r.org_id);
+}
 export async function browserSessionUpdatedAt(id: string): Promise<string | undefined> {
   const r = await q.get<{ updated_at: string }>("SELECT updated_at FROM browser_sessions WHERE id = ? AND org_id = ?", [id, oid()]);
   return r?.updated_at;

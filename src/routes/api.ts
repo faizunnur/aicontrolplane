@@ -229,9 +229,12 @@ const signupLimit = rateLimit({ name: "signup", max: 5, windowMs: 60 * 60_000 })
 const VERIFY_TTL_MS = 24 * 60 * 60_000;
 const RESET_TTL_MS = 60 * 60_000;
 
-async function signupStatus(): Promise<{ enabled: boolean; reason?: "sqlite" | "mail" | "disabled" }> {
+async function signupStatus(): Promise<{ enabled: boolean; reason?: "sqlite" | "mail" | "browser" | "disabled" }> {
   if (dataDriver() !== "pg") return { enabled: false, reason: "sqlite" };
   if (!mailConfigured()) return { enabled: false, reason: "mail" };
+  // The legacy browser is ONE profile with ONE cookie jar. Letting strangers into an install
+  // whose browser cannot separate workspaces would share sessions between them — refuse.
+  if (config.browser.enabled && config.fleet.mode !== "ephemeral") return { enabled: false, reason: "browser" };
   if ((await withOrg(1, () => getSettingCached("signups_enabled"))) === "false") return { enabled: false, reason: "disabled" };
   return { enabled: true };
 }

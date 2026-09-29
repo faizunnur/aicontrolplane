@@ -1063,6 +1063,7 @@ curl -X POST ${base}/api/ingest \\
         $("#signups-enabled").checked = settings.signups.reason !== "disabled";
         $("#signups-note").textContent = settings.signups.reason === "sqlite" ? "Needs a Postgres database before anyone can sign up."
           : settings.signups.reason === "mail" ? "Needs SMTP_HOST, SMTP_USER, SMTP_PASS and MAIL_FROM on the server before anyone can sign up (confirmation emails)."
+          : settings.signups.reason === "browser" ? "Needs BROWSER_FLEET=ephemeral on the server first: the classic browser keeps one shared sign-in profile, which must not be shared between workspaces."
           : "Each sign-up gets its own private workspace, isolated from yours.";
       }
       await renderPolicies();

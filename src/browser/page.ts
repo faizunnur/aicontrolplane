@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Page } from "playwright";
 import { config } from "../config.js";
-import { setPlatformState } from "../db.js";
+import { currentOrgId, setPlatformState } from "../db.js";
 import { logger } from "../logger.js";
 import { browser } from "./manager.js";
 
@@ -73,8 +73,10 @@ export class PageController {
   async screenshot(page?: Page): Promise<string | null> {
     try {
       const p = page ?? (await this.current());
-      fs.mkdirSync(config.screenshotDir, { recursive: true });
-      const file = path.join(config.screenshotDir, `${this.id}.png`);
+      // One file per (workspace, provider): two workspaces' screenshots must never share a path.
+      const dir = path.join(config.screenshotDir, String(currentOrgId() ?? 1));
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `${this.id}.png`);
       await p.screenshot({ path: file, fullPage: false, timeout: 15_000 });
       await setPlatformState(this.id, { screenshot_path: file });
       return file;

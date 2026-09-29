@@ -51,7 +51,7 @@ export function resolveExecutable(): { path: string; source: "env" | "channel" |
 }
 
 /** Software WebGL under a virtual display: a browser without any WebGL is an oddity sites notice. */
-const GPU_ARGS = process.platform === "linux" ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : [];
+export const GPU_ARGS = process.platform === "linux" ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : [];
 
 export interface BusyTask {
   /** Short human label: "Sending to ChatGPT", "Checking Claude", "Looking at Grok's tasks". */
@@ -96,6 +96,11 @@ class BrowserManager {
 
   isRunning() {
     return this.context !== null;
+  }
+
+  /** Whose workspace the physical desktop screen belongs to right now. Legacy: the founding one. */
+  vncOwnerOrg(): number {
+    return 1;
   }
 
   /** The desktop sign-in in progress, if any. */
@@ -512,7 +517,7 @@ class BrowserManager {
 }
 
 /** Ask a plain browser window to close and give it time to flush its profile; force it only if it will not. */
-async function stopChild(child: ChildProcess, graceMs: number): Promise<void> {
+export async function stopChild(child: ChildProcess, graceMs: number): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise<void>((r) => child.once("exit", () => r()));
   if (process.platform === "win32" && child.pid) spawnSync("taskkill", ["/PID", String(child.pid)], { stdio: "ignore" }); // graceful window close

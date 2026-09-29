@@ -40,6 +40,8 @@ export const jobsFailed = new Counter({
 
 export const sseClients = new Gauge({ name: "acp_sse_clients", help: "Open event-stream connections", registers: [registry] });
 export const liveViewers = new Gauge({ name: "acp_live_viewers", help: "Open live-view sockets", registers: [registry] });
+export const browserContextsOpen = new Gauge({ name: "acp_browser_contexts_open", help: "Open fleet browser contexts (one per active workspace-provider connection)", registers: [registry] });
+export const browserContextWaiters = new Gauge({ name: "acp_browser_context_waiters", help: "Jobs waiting for a fleet browser context slot", registers: [registry] });
 
 new Gauge({
   name: "acp_queue_jobs",

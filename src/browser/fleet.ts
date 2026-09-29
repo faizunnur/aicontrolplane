@@ -1,11 +1,24 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Cookie, type Page } from "playwright";
 import { bus } from "../bus.js";
 import { config } from "../config.js";
 import { currentOrgId, withOrg } from "../db.js";
 import { logger } from "../logger.js";
+import { browserContextsOpen, browserContextWaiters } from "../metrics.js";
+import { getPlatform } from "../platforms.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
-import { loadConnectionState, saveConnectionState, type StorageStateLike } from "./session-store.js";
-import type { BrowserSnapshot, BusyTask, DesktopSignIn } from "./manager.js";
+import { GPU_ARGS, resolveExecutable, stopChild, type BrowserSnapshot, type BusyTask, type DesktopSignIn } from "./manager.js";
+import { loadConnectionState, saveConnectionState, sliceStateForPlatform, type StorageStateLike } from "./session-store.js";
+
+const DESKTOP_SIGNIN_TIMEOUT_MS = Math.max(1, Number(process.env.DESKTOP_SIGNIN_TIMEOUT_MIN) || 10) * 60_000;
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => (resolve = res));
+  return { promise, resolve };
+}
 
 const log = logger("fleet");
 
@@ -52,9 +65,14 @@ export class FleetManager {
   isRunning() {
     return this.browser !== null;
   }
-  /** Desktop sign-in on the shared display arrives with the fleet's next phase. */
+  /** The desktop sign-in in progress — visible only to the workspace that owns it. */
+  private desktop: { org: number; state: DesktopSignIn; done: ReturnType<typeof deferred<"finished" | "cancelled">>; job: Promise<void> } | null = null;
   get signIn(): DesktopSignIn | null {
-    return null;
+    return this.desktop && this.desktop.org === ambientOrg() ? this.desktop.state : null;
+  }
+  /** Whose workspace the one physical screen belongs to right now. */
+  vncOwnerOrg(): number {
+    return this.desktop?.org ?? 1;
   }
   get active(): string | null {
     const org = ambientOrg();
@@ -74,23 +92,131 @@ export class FleetManager {
       if (c.org !== org || !c.page || c.page.isClosed()) continue;
       pages.push({ platform: c.platform, url: c.page.url(), title: c.title });
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: true, active: this.active, busy: this.busy, pages, signIn: null, seq: ++this.snapshotSeq };
+    return { enabled: this.enabled, running: this.isRunning(), headless: true, active: this.active, busy: this.busy, pages, signIn: this.signIn, seq: ++this.snapshotSeq };
   }
   private announce() {
+    browserContextsOpen.set(this.connections.size);
+    browserContextWaiters.set(this.waiters.length);
     bus.emit("browser", this.snapshot());
   }
 
   canDesktopSignIn(): { ok: boolean; reason?: string } {
-    return { ok: false, reason: "the shared-desktop sign-in is not available in fleet mode yet; use “Connect from this computer” or sign in through the live view" };
+    if (!this.enabled) return { ok: false, reason: "the browser is disabled on this deployment" };
+    if (config.browser.headless) return { ok: false, reason: "this deployment runs without a display, so there is no desktop to sign in on; import a session from your own computer instead" };
+    if (this.desktop && this.desktop.org !== ambientOrg()) return { ok: false, reason: "the shared screen is in use by another workspace; try again in a few minutes" };
+    return { ok: true };
   }
-  async startDesktopSignIn(_platformId: string, _name: string, _url: string): Promise<DesktopSignIn> {
-    throw Object.assign(new Error(this.canDesktopSignIn().reason), { status: 409 });
+
+  /**
+   * A plain Chrome window on the ONE shared display, in a THROW-AWAY profile seeded from
+   * this workspace's session for this provider — never a shared profile, so no other
+   * workspace's cookies are anywhere near the window. Afterwards the profile is exported,
+   * domain-filtered, sealed to the (workspace, provider) blob, and deleted.
+   */
+  async startDesktopSignIn(platformId: string, name: string, url: string): Promise<DesktopSignIn> {
+    const can = this.canDesktopSignIn();
+    if (!can.ok) throw Object.assign(new Error(can.reason), { status: 409 });
+    const org = ambientOrg();
+    if (this.desktop && this.desktop.org === org && this.desktop.state.platform === platformId) return this.desktop.state;
+    if (this.desktop) throw Object.assign(new Error(`a sign-in to ${this.desktop.org === org ? this.desktop.state.platform : "another workspace's provider"} is already in progress; finish or cancel it first`), { status: 409 });
+    const done = deferred<"finished" | "cancelled">();
+    const started = deferred<DesktopSignIn | Error>();
+    const job = (async () => {
+      const tmpDir = path.join(config.dataDir, "desktop-tmp", `${org}-${platformId}-${Date.now()}`);
+      let child: ChildProcess | null = null;
+      try {
+        // Seed the throw-away profile with this workspace's cookies for the provider.
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const raw = await withOrg(org, () => loadConnectionState(platformId));
+        if (raw) {
+          const seedCtx = await chromium.launchPersistentContext(tmpDir, { headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage", "--password-store=basic"] });
+          try {
+            const state = JSON.parse(raw) as StorageStateLike;
+            const cookies = (state.cookies ?? []).filter((c) => c && c.name && c.domain);
+            if (cookies.length) await seedCtx.addCookies(cookies as never);
+          } finally {
+            await seedCtx.close().catch(() => undefined);
+          }
+        }
+        const exe = resolveExecutable();
+        const [w, h] = config.browser.windowSize;
+        const args = [
+          `--user-data-dir=${tmpDir}`,
+          "--password-store=basic",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-session-crashed-bubble",
+          "--hide-crash-restore-bubble",
+          `--window-size=${w},${h}`,
+          "--window-position=0,0",
+          "--lang=en-US",
+          ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage", ...GPU_ARGS] : []),
+          url,
+        ];
+        log.info(`desktop sign-in for workspace ${org} / ${platformId}: opening ${exe.path} on ${process.env.DISPLAY ?? "the desktop"} (throw-away profile)`);
+        child = spawn(exe.path, args, { stdio: "ignore", env: process.env });
+        const state: DesktopSignIn = { platform: platformId, url, since: new Date().toISOString(), pid: child.pid ?? null };
+        this.desktop = { org, state, done, job: job! };
+        this.announce();
+        child.on("exit", () => {
+          if (this.desktop?.state === state) done.resolve("finished");
+        });
+        child.on("error", (err) => {
+          log.error("desktop sign-in browser failed to start", err);
+          started.resolve(err instanceof Error ? err : new Error(String(err)));
+          done.resolve("cancelled");
+        });
+        started.resolve(state);
+        const outcome = await Promise.race([done.promise, new Promise<"cancelled">((r) => setTimeout(() => r("cancelled"), DESKTOP_SIGNIN_TIMEOUT_MS).unref?.())]);
+        log.info(`desktop sign-in for workspace ${org} / ${platformId} ${outcome}`);
+        await stopChild(child, outcome === "finished" ? 10_000 : 4_000);
+        if (outcome === "finished") {
+          // Export what the person signed in to, keep only this provider's slice, seal it.
+          const outCtx = await chromium.launchPersistentContext(tmpDir, { headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage", "--password-store=basic"] });
+          try {
+            const state2 = (await outCtx.storageState()) as StorageStateLike;
+            const p = withOrg(org, () => getPlatform(platformId));
+            const slice = p ? sliceStateForPlatform(state2, p) : state2;
+            await withOrg(org, () => saveConnectionState(platformId, JSON.stringify(slice)));
+          } finally {
+            await outCtx.close().catch(() => undefined);
+          }
+          // An open automation connection restarts from the fresh blob.
+          const conn = this.connections.get(keyOf(org, platformId));
+          if (conn) {
+            this.connections.delete(keyOf(org, platformId));
+            await conn.ctx.close().catch(() => undefined);
+            this.releaseSlot();
+          }
+        }
+      } catch (err) {
+        started.resolve(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      } finally {
+        this.desktop = null;
+        this.announce();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    })();
+    job.catch((err) => log.error("desktop sign-in failed", err));
+    const first = await started.promise;
+    if (first instanceof Error) throw first;
+    return first;
   }
+
   async finishDesktopSignIn(): Promise<boolean> {
-    return false;
+    const d = this.desktop;
+    if (!d || d.org !== ambientOrg()) return false;
+    d.done.resolve("finished");
+    await d.job.catch(() => undefined);
+    return true;
   }
   async cancelDesktopSignIn(): Promise<boolean> {
-    return false;
+    const d = this.desktop;
+    if (!d || d.org !== ambientOrg()) return false;
+    d.done.resolve("cancelled");
+    await d.job.catch(() => undefined);
+    return true;
   }
 
   /* ---------- the Chromium process and the context pool ---------- */

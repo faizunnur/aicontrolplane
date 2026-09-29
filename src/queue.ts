@@ -2,7 +2,7 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { BossQueue, InlineQueue, type Queue } from "../packages/queue/src/index.js";
 
-export { JOB, resumeJobFor, type BrowserOpJob, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "../packages/queue/src/index.js";
+export { JOB, resumeJobFor, type BrowserOpJob, type BrowserSyncJob, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "../packages/queue/src/index.js";
 
 const log = logger("queue");
 

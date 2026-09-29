@@ -1,13 +1,15 @@
 import { config } from "./config.js";
-import { getBrowserOpAnyOrg, getMessageAnyOrg, getRunAnyOrg, pruneBrowserOps, pruneOutbox, pruneUserTokens, systemScope, withOrg } from "./db.js";
+import { getBrowserOpAnyOrg, getMessageAnyOrg, getRunAnyOrg, listBrowserSessionOrgsAll, pruneBrowserOps, pruneOutbox, pruneUserTokens, systemScope, withOrg } from "./db.js";
 import { deliverMessage, deliverToConnection } from "./deliver.js";
 import { emailConfigured, pollOnce } from "./ingest/email.js";
 import { logger } from "./logger.js";
 import { reconcileParkedRuns, settleDecision, sweepApprovals } from "./policy.js";
 import { reapStaleRuns } from "./runs.js";
-import { syncTick } from "./sync.js";
+import { syncProvider, syncTick } from "./sync.js";
+import { refreshPlatformsNow, syncablePlatforms } from "./platforms.js";
+import { getProvider } from "./providers/registry.js";
 import { executeBrowserOpJob } from "./browser-ops.js";
-import { JOB, queue, type BrowserOpJob, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "./queue.js";
+import { JOB, queue, type BrowserOpJob, type BrowserSyncJob, type ChatDeliverJob, type DispatchDeliverJob, type RunResumeJob, type TaskStartJob } from "./queue.js";
 import { executeTaskRun, requeueStuckTaskRuns } from "./tasks.js";
 
 const log = logger("jobs");
@@ -86,9 +88,32 @@ export function registerJobHandlers(scope: HandlerScope): void {
     queue.work<BrowserOpJob>(JOB.browserOp, async ({ opId }) => {
       await adoptBrowserOp(opId, () => executeBrowserOpJob(opId));
     }, { teamSize: 2 });
+    queue.work<BrowserSyncJob>(JOB.browserSyncPlatform, async ({ orgId, platformId }) => {
+      await withOrg(orgId, async () => {
+        let adapter = getProvider(platformId);
+        if (!adapter) {
+          await refreshPlatformsNow(); // this worker may not have seen the workspace's provider yet
+          adapter = getProvider(platformId);
+        }
+        if (adapter) await syncProvider(adapter);
+      });
+    });
     queue.work("cron.sync", async () => {
-      // The browser serves the founding workspace until the fleet phase fans this out per workspace.
-      await withOrg(1, () => syncTick());
+      if (config.fleet.mode !== "ephemeral") {
+        // The legacy browser serves the founding workspace only.
+        await withOrg(1, () => syncTick());
+        return;
+      }
+      // Fleet: one look per (workspace, provider), deduped and jittered so a slow pass never
+      // stacks on itself and the fan-out does not stampede the context pool.
+      for (const orgId of await systemScope(() => listBrowserSessionOrgsAll())) {
+        await withOrg(orgId, async () => {
+          await refreshPlatformsNow();
+          for (const p of syncablePlatforms()) {
+            await queue.send<BrowserSyncJob>(JOB.browserSyncPlatform, { orgId, platformId: p.id }, { singletonKey: `sync:${orgId}:${p.id}`, startAfterSeconds: Math.floor(Math.random() * 90) });
+          }
+        });
+      }
     });
   }
   log.debug(`job handlers registered (${scope})`);

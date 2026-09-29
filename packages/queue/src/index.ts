@@ -59,6 +59,11 @@ export interface RunResumeJob {
 export interface BrowserOpJob {
   opId: number;
 }
+/** One workspace's look at one provider's tasks page (the fleet's sync fan-out). */
+export interface BrowserSyncJob {
+  orgId: number;
+  platformId: string;
+}
 
 /**
  * Job names. The `browser.` prefix marks work that may drive Chrome: those queues are claimed
@@ -73,6 +78,7 @@ export const JOB = {
   runResume: "run.resume",
   browserRunResume: "browser.run.resume",
   browserOp: "browser.op",
+  browserSyncPlatform: "browser.sync.platform",
 } as const;
 
 /** Which resume queue continues a parked run, by its kind. */

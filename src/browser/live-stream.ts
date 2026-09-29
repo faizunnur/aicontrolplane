@@ -1,5 +1,5 @@
 import type { CDPSession, Page } from "playwright";
-import { addAudit } from "../db.js";
+import { addAudit, withOrg } from "../db.js";
 import { logger } from "../logger.js";
 import { browser } from "./manager.js";
 
@@ -37,6 +37,7 @@ export interface Sink {
 }
 
 interface Stream {
+  org: number;
   platform: string;
   page: Page;
   session: CDPSession;
@@ -49,16 +50,19 @@ interface Stream {
   off: () => void;
 }
 
+// Streams are keyed by (workspace, platform): two workspaces watching the same provider are
+// two different tabs in two different contexts.
 const streams = new Map<string, Stream>();
+const keyOf = (org: number, platform: string) => `${org}:${platform}`;
 
-export function lastFrame(platform: string): { frame: Buffer; meta: Meta } | null {
-  const s = streams.get(platform);
+export function lastFrame(org: number, platform: string): { frame: Buffer; meta: Meta } | null {
+  const s = streams.get(keyOf(org, platform));
   return s?.last && s.meta ? { frame: s.last, meta: s.meta } : null;
 }
 
-/** Attach a sink to a platform's stream, starting it if needed. Returns false when there is no tab. */
-export async function acquireStream(platform: string, sink: Sink): Promise<boolean> {
-  const stream = await ensureStream(platform);
+/** Attach a sink to a connection's stream, starting it if needed. Returns false when there is no tab. */
+export async function acquireStream(org: number, platform: string, sink: Sink): Promise<boolean> {
+  const stream = await ensureStream(org, platform);
   if (!stream) return false;
   stream.sinks.add(sink);
   if (stream.stopTimer) {
@@ -70,8 +74,8 @@ export async function acquireStream(platform: string, sink: Sink): Promise<boole
   return true;
 }
 
-export function releaseStream(platform: string, sink: Sink): void {
-  const s = streams.get(platform);
+export function releaseStream(org: number, platform: string, sink: Sink): void {
+  const s = streams.get(keyOf(org, platform));
   if (!s) return;
   s.sinks.delete(sink);
   if (s.sinks.size === 0 && !s.stopTimer) {
@@ -81,16 +85,17 @@ export function releaseStream(platform: string, sink: Sink): void {
 }
 
 /** Re-evaluate the stream's quality after a sink changed its level. */
-export async function refreshLevel(platform: string): Promise<void> {
-  const s = streams.get(platform);
+export async function refreshLevel(org: number, platform: string): Promise<void> {
+  const s = streams.get(keyOf(org, platform));
   if (s) await applyLevel(s);
 }
 
-async function ensureStream(platform: string): Promise<Stream | null> {
-  const existing = streams.get(platform);
+async function ensureStream(org: number, platform: string): Promise<Stream | null> {
+  const key = keyOf(org, platform);
+  const existing = streams.get(key);
   if (existing && !existing.page.isClosed()) return existing;
   if (existing) await stopStream(existing);
-  const page = browser.pageOf(platform);
+  const page = withOrg(org, () => browser.pageOf(platform));
   if (!page) return null;
   let session: CDPSession;
   try {
@@ -99,15 +104,15 @@ async function ensureStream(platform: string): Promise<Stream | null> {
     log.warn(`cannot open a CDP session for ${platform}`, err);
     return null;
   }
-  const stream: Stream = { platform, page, session, sinks: new Set(), level: "medium", last: null, meta: null, stopTimer: null, started: false, off: () => undefined };
-  streams.set(platform, stream);
+  const stream: Stream = { org, platform, page, session, sinks: new Set(), level: "medium", last: null, meta: null, stopTimer: null, started: false, off: () => undefined };
+  streams.set(key, stream);
   session.on("Page.screencastFrame", (ev: { data: string; sessionId: number; metadata: { deviceWidth: number; deviceHeight: number } }) => {
     session.send("Page.screencastFrameAck", { sessionId: ev.sessionId }).catch(() => undefined);
     onFrame(stream, ev);
   });
   // A cross-site navigation can end the screencast; start it again when the new document is ready.
   const restart = () => {
-    if (streams.get(platform) === stream && stream.sinks.size) void startScreencast(stream);
+    if (streams.get(key) === stream && stream.sinks.size) void startScreencast(stream);
   };
   const closed = () => void stopStream(stream);
   page.on("load", restart);
@@ -145,7 +150,7 @@ async function applyLevel(s: Stream) {
 }
 
 async function stopStream(s: Stream) {
-  if (streams.get(s.platform) === s) streams.delete(s.platform);
+  if (streams.get(keyOf(s.org, s.platform)) === s) streams.delete(keyOf(s.org, s.platform));
   if (s.stopTimer) clearTimeout(s.stopTimer);
   s.off();
   s.sinks.clear();
@@ -163,7 +168,7 @@ function onFrame(s: Stream, ev: { data: string; metadata: { deviceWidth: number;
   const meta: Meta = {
     platform: s.platform,
     url: s.page.url(),
-    title: browser.snapshot().pages.find((p) => p.platform === s.platform)?.title ?? "",
+    title: withOrg(s.org, () => browser.snapshot()).pages.find((p) => p.platform === s.platform)?.title ?? "",
     width: Math.round(ev.metadata.deviceWidth),
     height: Math.round(ev.metadata.deviceHeight),
   };
@@ -189,8 +194,12 @@ export interface CommandOutcome {
  * guard and the audit live here, next to the page — whichever process the viewer's socket
  * terminates on.
  */
-export async function applyCommand(platform: string, msg: Record<string, unknown>, opts: { override: boolean; actor?: string } = { override: false }): Promise<CommandOutcome> {
-  const s = streams.get(platform);
+export async function applyCommand(org: number, platform: string, msg: Record<string, unknown>, opts: { override: boolean; actor?: string } = { override: false }): Promise<CommandOutcome> {
+  // The whole command runs in the connection's workspace: busy checks, audits, everything.
+  return withOrg(org, () => applyCommandScoped(org, platform, msg, opts));
+}
+async function applyCommandScoped(org: number, platform: string, msg: Record<string, unknown>, opts: { override: boolean; actor?: string }): Promise<CommandOutcome> {
+  const s = streams.get(keyOf(org, platform));
   if (!s || s.page.isClosed()) return {};
   const page = s.page;
   const meta = s.meta;
