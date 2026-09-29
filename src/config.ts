@@ -134,6 +134,16 @@ export const config = {
 
   router: routerConfig(),
 
+  /** Outbound mail (sign-up verification, password resets). SMTP_HOST=stub writes JSON files instead (tests). */
+  smtp: {
+    host: process.env.SMTP_HOST || "",
+    port: num(process.env.SMTP_PORT, 587),
+    user: process.env.SMTP_USER || "",
+    pass: process.env.SMTP_PASS || "",
+    secure: bool(process.env.SMTP_SECURE, false),
+    from: process.env.MAIL_FROM || process.env.SMTP_USER || "",
+  },
+
   email: {
     host: process.env.IMAP_HOST || "",
     port: num(process.env.IMAP_PORT, 993),

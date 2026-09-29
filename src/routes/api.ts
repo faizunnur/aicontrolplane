@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { availableActions } from "../actions.js";
@@ -66,6 +67,13 @@ import {
   updateMessage,
   upsertAgentProfile,
   upsertTask,
+  consumeUserToken,
+  createOrg,
+  createUserToken,
+  dataDriver,
+  getSettingCached,
+  setUserVerified,
+  systemScope,
   withOrg,
 } from "../db.js";
 import { streamClients, streamHandler } from "../live.js";
@@ -100,9 +108,15 @@ import {
   requireRole,
   SESSION_COOKIE,
   setupRequired,
+  tokenHash,
+  verifyPassword,
   verifyUser,
   type AuthUser,
 } from "../auth.js";
+import { alreadyRegisteredMail, mailConfigured, resetMail, sendMail, verifyMail } from "../mailer.js";
+import { logger } from "../logger.js";
+
+const log = logger("api");
 import { rateLimit } from "../ratelimit.js";
 import { isSyncRunning, schedulerStatus } from "../sync.js";
 import { resolveMode } from "../deliver.js";
@@ -182,6 +196,13 @@ api.post("/session", loginLimit, async (req, res) => {
   const email = typeof req.body?.email === "string" && req.body.email ? req.body.email.trim().toLowerCase().slice(0, 200) : undefined;
   const user = await verifyUser(token, email);
   if (!user) {
+    // The one case that gets its own answer: a correct password on an unverified account.
+    if (email) {
+      const pending = await getUserByEmail(email);
+      if (pending && !pending.verified_at && (await verifyPassword(pending.password_hash, token))) {
+        return res.status(401).json({ error: "Confirm your email first — we sent you a link. Check your inbox.", unverified: true });
+      }
+    }
     await addAudit({ actor: clientIp(req), action: "auth.login_failed", detail: email ?? null });
     const several = (await countUsers()) > 1 && !email;
     return res.status(401).json({ error: several ? "Several accounts exist here; sign in with your email and password." : "That password was not accepted.", setup: await setupRequired(), needsEmail: several });
@@ -197,6 +218,104 @@ api.delete("/session", async (req, res) => {
 api.get("/session", requireAdmin, (_req, res) => {
   const user = res.locals.user as AuthUser;
   res.json({ ok: true, admin: true, publicUrl: config.publicUrl, user: { email: user.email, role: user.role } });
+});
+
+/* ---------- sign-up: a new account is a new, private workspace ----------
+   Requires Postgres (SQLite installs are single-workspace by design) and a mail sender
+   (verification is mandatory). Every response is enumeration-safe: whether an email is
+   taken or free, the caller sees the same answer. */
+
+const signupLimit = rateLimit({ name: "signup", max: 5, windowMs: 60 * 60_000 });
+const VERIFY_TTL_MS = 24 * 60 * 60_000;
+const RESET_TTL_MS = 60 * 60_000;
+
+async function signupStatus(): Promise<{ enabled: boolean; reason?: "sqlite" | "mail" | "disabled" }> {
+  if (dataDriver() !== "pg") return { enabled: false, reason: "sqlite" };
+  if (!mailConfigured()) return { enabled: false, reason: "mail" };
+  if ((await withOrg(1, () => getSettingCached("signups_enabled"))) === "false") return { enabled: false, reason: "disabled" };
+  return { enabled: true };
+}
+api.get("/signup/status", async (_req, res) => res.json(await signupStatus()));
+
+api.post("/signup", signupLimit, async (req, res) => {
+  const status = await signupStatus();
+  if (!status.enabled) return bad(res, "Sign-up is not available yet.", 503);
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase().slice(0, 200) : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return bad(res, "A real email address, please.");
+  if (password.length < 8) return bad(res, "Use at least 8 characters.");
+  const existing = await getUserByEmail(email);
+  if (existing) {
+    // Same outward answer as a fresh sign-up; the difference goes to the inbox only.
+    await addAudit({ actor: clientIp(req), action: "auth.signup_existing", target: email });
+    sendMail(alreadyRegisteredMail(email)).catch((err) => log.warn("already-registered mail failed", err));
+    return res.json({ ok: true, check: email });
+  }
+  const org = await systemScope(() => createOrg({ name: `${email.split("@")[0]}'s workspace` }));
+  const token = randomBytes(32).toString("base64url");
+  await withOrg(org.id, async () => {
+    const u = await createUser({ email, password_hash: await hashPassword(password), role: "owner", verified: false });
+    await setSetting("ingest_token", randomBytes(24).toString("hex"));
+    await createUserToken(u.id, "verify", tokenHash(token), VERIFY_TTL_MS);
+    await addAudit({ actor: email, action: "auth.signup", target: `org:${org.id}` });
+  });
+  try {
+    await sendMail(verifyMail(email, token));
+  } catch (err) {
+    log.error("verification mail failed", err);
+    return bad(res, "The confirmation email could not be sent. Try again in a few minutes.", 502);
+  }
+  res.json({ ok: true, check: email });
+});
+
+/** The link in the verification email. Lands signed in, or back at the gate with a reason. */
+api.get("/verify", async (req, res) => {
+  const token = typeof req.query.token === "string" ? req.query.token : "";
+  const row = token ? await consumeUserToken(tokenHash(token), "verify") : undefined;
+  if (!row) return res.redirect("/?verify=failed");
+  const u = await getUser(row.user_id);
+  if (!u) return res.redirect("/?verify=failed");
+  await setUserVerified(u.id);
+  const user: AuthUser = { id: u.id, email: u.email, role: u.role, orgId: u.org_id };
+  await withOrg(u.org_id, () => addAudit({ actor: u.email, action: "auth.verified" }));
+  res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req, user)));
+  res.redirect("/");
+});
+
+api.post("/session/resend-verification", loginLimit, async (req, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase().slice(0, 200) : "";
+  const u = email ? await getUserByEmail(email) : undefined;
+  if (u && !u.verified_at && mailConfigured()) {
+    const token = randomBytes(32).toString("base64url");
+    await createUserToken(u.id, "verify", tokenHash(token), VERIFY_TTL_MS);
+    sendMail(verifyMail(email, token)).catch((err) => log.warn("verification mail failed", err));
+  }
+  res.json({ ok: true }); // one answer whatever happened: nothing to enumerate
+});
+
+api.post("/password-reset/request", loginLimit, async (req, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase().slice(0, 200) : "";
+  const u = email ? await getUserByEmail(email) : undefined;
+  if (u && u.verified_at && mailConfigured()) {
+    const token = randomBytes(32).toString("base64url");
+    await createUserToken(u.id, "reset", tokenHash(token), RESET_TTL_MS);
+    await withOrg(u.org_id, () => addAudit({ actor: clientIp(req), action: "auth.reset_requested", target: email }));
+    sendMail(resetMail(email, token)).catch((err) => log.warn("reset mail failed", err));
+  }
+  res.json({ ok: true });
+});
+
+api.post("/password-reset/confirm", loginLimit, async (req, res) => {
+  const token = typeof req.body?.token === "string" ? req.body.token : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (password.length < 8) return bad(res, "Use at least 8 characters.");
+  const row = token ? await consumeUserToken(tokenHash(token), "reset") : undefined;
+  const u = row ? await getUser(row.user_id) : undefined;
+  if (!u) return bad(res, "That link is not valid any more. Ask for a new one.", 400);
+  await updateUser(u.id, { password_hash: await hashPassword(password) });
+  await deleteSessionsForUser(u.id);
+  await withOrg(u.org_id, () => addAudit({ actor: u.email, action: "auth.password_reset" }));
+  res.json({ ok: true });
 });
 
 /* ---------- signing in from your own computer ----------
@@ -881,7 +1000,17 @@ api.get("/settings", async (_req, res) => {
     email: emailStatus(),
     storage: await storageInfo(),
     syncIntervalMin: config.sync.intervalMin,
+    signups: { ...(await signupStatus()), canToggle: (res.locals.user as AuthUser).orgId === 1 && (res.locals.user as AuthUser).role === "owner" },
   });
+});
+/** Open or close public sign-up. The founding workspace's owner speaks for the install. */
+api.post("/settings/signups", requireRole("owner"), async (req, res) => {
+  const user = res.locals.user as AuthUser;
+  if (user.orgId !== 1) return bad(res, "Only the founding workspace's owner can change this.", 403);
+  const enabled = req.body?.enabled === true;
+  await withOrg(1, () => setSetting("signups_enabled", enabled ? "true" : "false"));
+  await addAudit({ actor: user.email, action: "settings.signups", detail: enabled ? "enabled" : "disabled" });
+  res.json({ ok: true, ...(await signupStatus()) });
 });
 api.post("/settings/password", async (req, res) => {
   const current = String(req.body?.current ?? "");

@@ -118,6 +118,7 @@ export async function verifyUser(password: string, email?: string): Promise<Auth
   }
   if (!user) return null;
   if (!(await verifyPassword(user.password_hash, password))) return null;
+  if (!user.verified_at) return null; // the /session route tells them to check their inbox
   if (user.password_hash.startsWith("sha256:")) await updateUser(user.id, { password_hash: await hashPassword(password) });
   await updateUser(user.id, { last_login_at: new Date().toISOString() });
   return { id: user.id, email: user.email, role: user.role, orgId: user.org_id };
@@ -141,7 +142,7 @@ export async function matchUserByPassword(password: string, callerIp = "unknown"
   // API keys are the successor to password-as-bearer.
   for (const u of await listAllUsers()) {
     const row = await getUser(u.id);
-    if (row && (await verifyPassword(row.password_hash, password))) {
+    if (row && row.verified_at && (await verifyPassword(row.password_hash, password))) {
       const user: AuthUser = { id: row.id, email: row.email, role: row.role, orgId: row.org_id };
       if (bearerHits.size > 1000) bearerHits.clear();
       bearerHits.set(key, { at: Date.now(), user });

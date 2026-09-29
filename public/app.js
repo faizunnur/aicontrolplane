@@ -104,28 +104,88 @@
 
   /* ---------- gate ---------- */
   let gateMode = "login";
+  let resetToken = null;
+  const GATE_COPY = {
+    setup: { title: "Create your password", text: "This is the only password you need. It protects your chats and your saved sign-ins.", submit: "Create password", email: false, password: true, links: false },
+    login: { title: "Welcome back", text: "Sign in to open your workspace.", submit: "Open", email: true, password: true, links: true },
+    signup: { title: "Create your account", text: "Your own private workspace: your AIs, your chats, your rules. We'll email you a confirmation link.", submit: "Create account", email: true, password: true, links: false, back: true },
+    "check-email": { title: "Check your inbox", text: "We sent you a confirmation link. Click it and your workspace opens.", submit: null, email: false, password: false, links: false, back: true, resend: true },
+    forgot: { title: "Reset your password", text: "Tell us your email and we'll send you a reset link.", submit: "Send reset link", email: true, password: false, links: false, back: true },
+    reset: { title: "Choose a new password", text: "Almost done - pick a new password for your account.", submit: "Set new password", email: false, password: true, links: false },
+  };
   function showGate(mode) {
     gateMode = mode;
+    const c = GATE_COPY[mode] || GATE_COPY.login;
     $("#gate").hidden = false;
-    $("#gate-title").textContent = mode === "setup" ? "Create your password" : "Welcome back";
-    $("#gate-text").textContent = mode === "setup" ? "This is the only password you need. It protects your chats and your saved sign-ins." : "Enter your password to open the control plane.";
-    $("#gate-submit").textContent = mode === "setup" ? "Create password" : "Open";
-    $("#gate-password").setAttribute("autocomplete", mode === "setup" ? "new-password" : "current-password");
-    $("#gate-password").setAttribute("minlength", mode === "setup" ? "8" : "1");
-    $("#gate-password").focus();
+    $("#gate-title").textContent = c.title;
+    $("#gate-text").textContent = c.text;
+    $("#gate-error").hidden = true;
+    $("#gate-email").hidden = !c.email;
+    $("#gate-password").hidden = !c.password;
+    $("#gate-password").required = !!c.password;
+    $("#gate-submit").hidden = !c.submit;
+    if (c.submit) $("#gate-submit").textContent = c.submit;
+    $("#gate-links").hidden = !c.links;
+    $("#gate-back").hidden = !c.back;
+    $("#gate-resend").hidden = !c.resend;
+    const newPass = mode === "setup" || mode === "signup" || mode === "reset";
+    $("#gate-password").setAttribute("autocomplete", newPass ? "new-password" : "current-password");
+    $("#gate-password").setAttribute("minlength", newPass ? "8" : "1");
+    (c.email && !$("#gate-email").value ? $("#gate-email") : $("#gate-password")).focus();
   }
+  $("#gate-signup-link").addEventListener("click", async (e) => {
+    e.preventDefault();
+    try {
+      const s = await fetch("/api/signup/status").then((r) => r.json());
+      if (!s.enabled) {
+        $("#gate-error").textContent = "Sign-up is not available on this deployment yet.";
+        $("#gate-error").hidden = false;
+        return;
+      }
+    } catch { /* let the submit surface any error */ }
+    showGate("signup");
+  });
+  $("#gate-forgot-link").addEventListener("click", (e) => { e.preventDefault(); showGate("forgot"); });
+  $("#gate-back-link").addEventListener("click", (e) => { e.preventDefault(); showGate("login"); });
+  $("#gate-resend-link").addEventListener("click", async (e) => {
+    e.preventDefault();
+    await fetch("/api/session/resend-verification", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: $("#gate-email").value.trim() }) }).catch(() => {});
+    $("#gate-text").textContent = "Sent again. Give it a minute, and check spam too.";
+  });
   $("#gate-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const password = $("#gate-password").value;
     const email = $("#gate-email").value.trim() || undefined;
     try {
       if (gateMode === "setup") await api("/setup", { method: "POST", body: { password, email } });
-      else {
+      else if (gateMode === "signup") {
+        const res = await fetch("/api/signup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email, password }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || "Sign-up failed.");
+        $("#gate-password").value = "";
+        showGate("check-email");
+        return;
+      } else if (gateMode === "forgot") {
+        await fetch("/api/password-reset/request", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email }) }).catch(() => {});
+        $("#gate-text").textContent = "If that email has an account, a reset link is on its way.";
+        return;
+      } else if (gateMode === "reset") {
+        const res = await fetch("/api/password-reset/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: resetToken, password }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || "That link is not valid any more.");
+        resetToken = null;
+        history.replaceState(null, "", "/");
+        $("#gate-password").value = "";
+        showGate("login");
+        $("#gate-text").textContent = "Password changed. Sign in with the new one.";
+        return;
+      } else {
         const res = await fetch("/api/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password, email }) });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           // Several accounts exist: show the email field and let them try again with it.
           if (data.needsEmail) $("#gate-email").hidden = false;
+          if (data.unverified) $("#gate-resend").hidden = false;
           throw new Error(data.error || "That password was not accepted.");
         }
       }
@@ -998,6 +1058,13 @@ curl -X POST ${base}/api/ingest \\
   -d '{ "agent": { "key": "nightly-audit", "platform": "custom", "name": "Nightly audit", "schedule": "daily 02:00" },
         "profile": { "key": "scanner-bot" },
         "run": { "status": "success", "summary": "0 issues found" } }'`;
+      if (settings.signups?.canToggle) {
+        $("#signups-block").hidden = false;
+        $("#signups-enabled").checked = settings.signups.reason !== "disabled";
+        $("#signups-note").textContent = settings.signups.reason === "sqlite" ? "Needs a Postgres database before anyone can sign up."
+          : settings.signups.reason === "mail" ? "Needs SMTP_HOST, SMTP_USER, SMTP_PASS and MAIL_FROM on the server before anyone can sign up (confirmation emails)."
+          : "Each sign-up gets its own private workspace, isolated from yours.";
+      }
       await renderPolicies();
       const sel = $("#ai-select");
       sel.innerHTML = connections.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
@@ -1068,6 +1135,12 @@ curl -X POST ${base}/api/ingest \\
   $("#btn-rotate-token").addEventListener("click", async () => {
     if (!confirm("Make a new token? Agents using the old one will stop reporting until you update them.")) return;
     try { const r = await api("/settings/ingest-token/rotate", { method: "POST", body: {} }); $("#ingest-token").textContent = r.ingestToken; toast("New token created.", "ok"); } catch (err) { fail(err); }
+  });
+  $("#signups-enabled").addEventListener("change", async (e) => {
+    try {
+      const r = await api("/settings/signups", { method: "POST", body: { enabled: e.target.checked } });
+      toast(r.enabled ? "Sign-ups are open." : e.target.checked ? "Saved, but sign-ups still need server setup (see the note)." : "Sign-ups are closed.", "ok");
+    } catch (err) { fail(err); }
   });
   $("#btn-backup").addEventListener("click", async (e) => {
     try { await busy(e.currentTarget, async () => { const r = await api("/browser/backup", { method: "POST", body: {} }); toast(`Backed up ${r.cookies} sign-in cookies.`, "ok"); }); } catch (err) { fail(err); }
@@ -1202,10 +1275,24 @@ curl -X POST ${base}/api/ingest \\
   }
   (async () => {
     try {
+      const params = new URLSearchParams(location.search);
+      if (params.get("reset_token")) {
+        resetToken = params.get("reset_token");
+        return showGate("reset");
+      }
       const s = await fetch("/api/setup").then((r) => r.json());
       if (s.setupRequired) return showGate("setup");
       const ok = await fetch("/api/session", { credentials: "same-origin" }).then((r) => r.ok);
-      if (!ok) return showGate("login");
+      if (!ok) {
+        showGate("login");
+        if (params.get("verify") === "failed") {
+          $("#gate-error").textContent = "That confirmation link is not valid any more. Sign in, or ask for a new one below.";
+          $("#gate-error").hidden = false;
+          $("#gate-resend").hidden = false;
+          history.replaceState(null, "", "/");
+        }
+        return;
+      }
       await start();
     } catch (err) { console.error(err); showGate("login"); }
   })();

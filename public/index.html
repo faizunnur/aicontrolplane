@@ -56,7 +56,7 @@
     <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
   </svg>
 
-  <!-- Gate: create a password on first run, or sign in -->
+  <!-- Gate: first-run setup, sign in, create an account, verify, reset a password -->
   <div id="gate" class="gate" hidden>
     <form class="gate-card" id="gate-form">
       <div class="brand"><span class="mark" aria-hidden="true"></span><span class="wordmark">AI Control Plane</span></div>
@@ -68,6 +68,11 @@
       <input type="password" id="gate-password" autocomplete="current-password" placeholder="Password" required />
       <button class="btn primary big" type="submit" id="gate-submit">Continue</button>
       <p class="form-error" id="gate-error" hidden></p>
+      <p class="muted small" id="gate-links" hidden>
+        <a href="#" id="gate-signup-link">Create an account</a> · <a href="#" id="gate-forgot-link">Forgot password?</a>
+      </p>
+      <p class="muted small" id="gate-back" hidden><a href="#" id="gate-back-link">Back to sign in</a></p>
+      <p class="muted small" id="gate-resend" hidden><a href="#" id="gate-resend-link">Send the confirmation email again</a></p>
     </form>
   </div>
 
@@ -304,6 +309,11 @@
           <button class="btn small ghost" id="btn-rotate-token">New token</button>
         </div>
         <pre id="ingest-example"></pre>
+        <div id="signups-block" hidden>
+          <h3>Sign-ups</h3>
+          <p class="muted small" id="signups-note"></p>
+          <label class="row"><input type="checkbox" id="signups-enabled" /> <span>Let people create their own workspaces on this deployment</span></label>
+        </div>
         <p class="muted small">Endpoints: <code>POST /api/agents/register</code>, <code>POST /api/ingest</code> (tasks and finished runs), <code>POST /api/runs</code> then <code>/api/runs/:id/events</code> and <code>/api/runs/:id/finish</code> (a live run), <code>POST /api/approvals/request</code> (ask before a risky action), <code>GET /api/inbox</code> and <code>POST /api/inbox/:id/ack</code> (instructions). Live updates for your own tools: <code>GET /api/stream</code>. The <code>examples/</code> folder has a shell script, a Claude Code routine prompt and an MCP server for Cowork.</p>
       </div>
     </div>
