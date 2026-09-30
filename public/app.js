@@ -1096,6 +1096,7 @@ curl -X POST ${base}/api/ingest \\
   async function openSettings(tab = "general", aiId = null) {
     try {
       settings = await api("/settings");
+      $("#account-note").textContent = me?.email ? `Signed in as ${me.email}${me.role ? ` (${me.role})` : ""}.` : "Signed in.";
       $("#password-note").textContent = settings.passwordFromEnv ? "The password is set on the server (ACP_ADMIN_TOKEN). Change it there." : "";
       $("#password-form").hidden = settings.passwordFromEnv;
       $("#router-note").textContent = settings.router.provider === "claude-code" ? "Claude answers you here in its own words, using your Claude subscription (CLAUDE_CODE_OAUTH_TOKEN). It also decides which AI gets each message and whether a message is a question for the control plane. What it tells you is read from your own runs, tasks and approvals; it never invents an outcome, and it never decides an approval."
@@ -1122,6 +1123,11 @@ curl -X POST ${base}/api/ingest \\
       // (the server refuses them anyway; this keeps the page honest about it).
       const member = isMember();
       $('[data-stab="policies"]').hidden = member;
+      // API tokens and install-wide switches belong to the founding workspace's operators;
+      // sign-ups and members never see the Developer tab.
+      const developer = !member && me?.founding === true;
+      $('[data-stab="developer"]').hidden = !developer;
+      if (!developer && tab === "developer") tab = "general";
       $("#btn-download").hidden = member;
       $('label[for="sessions-file"]').hidden = member;
       for (const el of $$("#ai-form input, #ai-form textarea, #ai-form select, #ai-form button")) el.disabled = member;
@@ -1191,6 +1197,11 @@ curl -X POST ${base}/api/ingest \\
       e.target.reset();
       toast("Password changed.", "ok");
     } catch (err) { fail(err); }
+  });
+  $("#btn-logout").addEventListener("click", async () => {
+    // The server revokes the session and clears the cookie; reloading lands on the sign-in gate.
+    await fetch("/api/session", { method: "DELETE", credentials: "same-origin" }).catch(() => null);
+    location.replace("/");
   });
   $("#btn-copy-token").addEventListener("click", async () => { await navigator.clipboard.writeText($("#ingest-token").textContent).catch(() => null); toast("Copied.", "ok"); });
   $("#btn-rotate-token").addEventListener("click", async () => {

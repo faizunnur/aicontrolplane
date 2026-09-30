@@ -198,6 +198,9 @@ function secure(req: Request) {
 
 /* ---------- auth & first run ---------- */
 
+/** What the dashboard knows about who is signed in. `founding`: the install's own workspace, which alone sees install-wide controls. */
+const userView = (u: AuthUser) => ({ email: u.email, role: u.role, founding: u.orgId === 1 });
+
 const loginLimit = rateLimit({ name: "login", max: 10, windowMs: 10 * 60_000 });
 api.get("/setup", async (_req, res) => res.json({ setupRequired: await setupRequired(), passwordFromEnv: adminFromEnv() }));
 api.post("/setup", loginLimit, async (req, res) => {
@@ -207,7 +210,7 @@ api.post("/setup", loginLimit, async (req, res) => {
   if (!await createAdminPassword(password, email)) return bad(res, "An account already exists. Sign in instead.", 409);
   const user = await verifyUser(password, email);
   res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req, user)));
-  res.json({ ok: true, user: user ? { email: user.email, role: user.role } : null });
+  res.json({ ok: true, user: user ? userView(user) : null });
 });
 api.post("/session", loginLimit, async (req, res) => {
   const token = typeof req.body?.token === "string" ? req.body.token : typeof req.body?.password === "string" ? req.body.password : "";
@@ -226,7 +229,7 @@ api.post("/session", loginLimit, async (req, res) => {
     return res.status(401).json({ error: several ? "Several accounts exist here; sign in with your email and password." : "That password was not accepted.", setup: await setupRequired(), needsEmail: several });
   }
   res.setHeader("Set-Cookie", sessionCookieHeader(secure(req), await createSession(req, user)));
-  res.json({ ok: true, user: { email: user.email, role: user.role } });
+  res.json({ ok: true, user: userView(user) });
 });
 api.delete("/session", async (req, res) => {
   await revokeSession(req);
@@ -235,7 +238,7 @@ api.delete("/session", async (req, res) => {
 });
 api.get("/session", requireAdmin, (_req, res) => {
   const user = res.locals.user as AuthUser;
-  res.json({ ok: true, admin: true, publicUrl: config.publicUrl, user: { email: user.email, role: user.role } });
+  res.json({ ok: true, admin: true, publicUrl: config.publicUrl, user: userView(user) });
 });
 
 /* ---------- sign-up: a new account is a new, private workspace ----------
@@ -1018,7 +1021,7 @@ api.get("/home", async (req, res) => {
     overview: await overview(),
     // So a reloaded page can pick up a desktop sign-in that is still in progress.
     signInOptions: { desktop: browser.canDesktopSignIn(), vnc: { available: await vncAvailable(), url: VNC_PATH } },
-    user: { email: user.email, role: user.role },
+    user: userView(user),
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
     storage: await storageInfo(),
     browser: await browser.status(),
@@ -1033,12 +1036,14 @@ api.get("/home", async (req, res) => {
 
 /* settings */
 api.get("/settings", async (_req, res) => {
+  const user = res.locals.user as AuthUser;
   res.json({
-    passwordFromEnv: adminFromEnv(),
+    // Only the env-token login itself has its password on the server; real accounts change theirs here.
+    passwordFromEnv: adminFromEnv() && user.id === 0,
     // Whether a token exists, never the token: the plaintext is shown once, at rotation,
     // to an operator. Anything more would hand every member the whole workspace's agents.
-    ingest_token_set: await ingestTokenSet(),
-    ingestTokenFromEnv: !!process.env.ACP_INGEST_TOKEN,
+    ingest_token_set: await ingestTokenSet(user.orgId),
+    ingestTokenFromEnv: !!process.env.ACP_INGEST_TOKEN && user.orgId === 1,
     router: { provider: config.router.provider, model: config.router.model, llm: config.router.llm },
     alerts: { webhook: !!config.alerts.webhookUrl, telegram: !!(config.alerts.telegramToken && config.alerts.telegramChatId) },
     email: emailStatus(),
@@ -1120,7 +1125,10 @@ api.put("/logs/level", foundingOperator, async (req, res, next) => {
 });
 // The one moment the plaintext is shown: rotation answers with the new token so the operator
 // can hand it to their agents; afterwards only its existence is reported.
-api.post("/settings/ingest-token/rotate", operators, async (_req, res) => res.json({ ingestToken: await rotateIngestToken(), fromEnv: !!process.env.ACP_INGEST_TOKEN }));
+api.post("/settings/ingest-token/rotate", operators, async (_req, res) => {
+  const user = res.locals.user as AuthUser;
+  res.json({ ingestToken: await rotateIngestToken(user.orgId, user.email), fromEnv: !!process.env.ACP_INGEST_TOKEN && user.orgId === 1 });
+});
 
 /* ---------- messages (instructions from you, routed to agents) ---------- */
 

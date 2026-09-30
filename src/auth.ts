@@ -223,15 +223,17 @@ export async function changeAdminPassword(current: string, next: string, user?: 
 }
 
 /** Whether an ingest token exists at all — what the settings page may say. The token itself never travels with it. */
-export async function ingestTokenSet(): Promise<boolean> {
-  if (envIngest) return true;
+// ACP_INGEST_TOKEN resolves to the founding workspace (see resolveIngestOrg), so it is that
+// workspace's token alone: handing it to any other workspace would give it org 1's agents.
+export async function ingestTokenSet(orgId: number): Promise<boolean> {
+  if (envIngest && orgId === 1) return true;
   return hasIngestToken();
 }
-export async function rotateIngestToken(): Promise<string> {
-  if (envIngest) return envIngest;
+export async function rotateIngestToken(orgId: number, actor = "you"): Promise<string> {
+  if (envIngest && orgId === 1) return envIngest;
   const t = randomBytes(24).toString("hex");
   await setIngestToken(t);
-  await addAudit({ actor: "you", action: "auth.ingest_token_rotated" });
+  await addAudit({ actor, action: "auth.ingest_token_rotated" });
   return t;
 }
 

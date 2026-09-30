@@ -238,9 +238,15 @@
       </nav>
 
       <div class="stab" id="stab-general">
+        <h3>Account</h3>
+        <div class="row">
+          <p class="muted small" id="account-note" style="flex:1;margin:0"></p>
+          <button class="btn small" type="button" id="btn-logout">Log out</button>
+        </div>
+
         <h3>Password</h3>
+        <p class="muted small" id="password-note"></p>
         <form id="password-form" class="stack">
-          <p class="muted small" id="password-note"></p>
           <div class="form-grid">
             <div><label for="pw-current">Current</label><input type="password" id="pw-current" autocomplete="current-password" /></div>
             <div><label for="pw-next">New</label><input type="password" id="pw-next" autocomplete="new-password" minlength="8" /></div>

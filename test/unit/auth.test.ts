@@ -14,10 +14,10 @@ describe("sessions", () => {
     assert.ok(await auth.createAdminPassword("correct horse battery"));
     assert.equal(await auth.createAdminPassword("again"), false);
     await db.withOrg(1, async () => {
-      assert.equal(await auth.ingestTokenSet(), false, "nothing is minted at setup - a hash-only token could never be shown");
-      const minted = await auth.rotateIngestToken();
+      assert.equal(await auth.ingestTokenSet(1), false, "nothing is minted at setup - a hash-only token could never be shown");
+      const minted = await auth.rotateIngestToken(1);
       assert.ok(minted.length >= 40);
-      assert.equal(await auth.ingestTokenSet(), true);
+      assert.equal(await auth.ingestTokenSet(1), true);
       assert.ok(!(await db.rawAll<{ value: string }>("SELECT value FROM settings WHERE key = 'ingest_token'")).some((r) => r.value === minted), "only the hash is stored");
     });
     assert.equal(await auth.verifyAdmin("wrong"), false);
