@@ -1,6 +1,13 @@
 # Desktop-first: the plan
 
-Status: proposal, 2026-09-30. Nothing here is built yet.
+Status: in progress on `feature/desktop`, 2026-09-30.
+
+## Progress
+
+- **Stage 0, done.** The host seam: `src/browser/host.ts` (`ConnectorHost`), `host-local.ts` (the database implementation), the org scope moved to `packages/core/src/scope.ts`. `test/unit/host.test.ts` pins the browser code's import graph free of the database.
+- **Stage 1, done for a single-process deployment.** `packages/core/src/gateway.ts` (protocol), `src/gateway/{registry,calls,server}.ts`, `src/devices.ts`, migration 15/109 (`devices`), `GET/POST/DELETE /api/devices`, the `/gw` upgrade. A connected computer takes precedence for its workspace: interactive ops (`callBrowserOp`) and chat deliveries (`performChatSend`) go to it as jobs; its run events, platform state, captures, screenshots and screencast come back; the live view and `/api/browser` show its tabs. `test/e2e/gateway.test.ts` drives all of it with a stand-in connector.
+  Not yet: in split mode (`ROLE=api` + workers) the `browser.*` queues are still consumed by the browser role, which holds no connectors, so a workspace with a desktop but no browser service gets no chat delivery there. That is the Stage 3 dispatcher. Offline is still an error (503 "your computer is not connected"), not a parked run.
+- Stages 2 to 6: not started.
 
 The product model this plan implements:
 

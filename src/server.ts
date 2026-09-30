@@ -11,6 +11,7 @@ import { authUser, crossOrigin } from "./auth.js";
 import { bus } from "./bus.js";
 import { startRedisBridge } from "../packages/realtime/src/index.js";
 import { handleLiveUpgrade } from "./browser/live.js";
+import { handleGatewayUpgrade } from "./gateway/server.js";
 import { browser, sweepDesktopTmp, vncState } from "./browser/manager.js";
 import { storageInfo } from "./storage-info.js";
 import { config } from "./config.js";
@@ -197,6 +198,11 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 
 const server = http.createServer(app);
 server.on("upgrade", async (req, socket, head) => {
+  if (req.url === "/gw" || req.url?.startsWith("/gw?")) {
+    // A desktop connector: authenticated by its device token, not a browser session (src/gateway/server.ts).
+    await handleGatewayUpgrade(req, socket, head);
+    return;
+  }
   const isLive = req.url === "/live" || req.url?.startsWith("/live?");
   if (!isLive && !req.url?.startsWith("/vnc/")) {
     socket.destroy();

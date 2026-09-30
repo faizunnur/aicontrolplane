@@ -663,6 +663,25 @@ const MIGRATIONS: { id: number; name: string; up: (db: Database.Database) => voi
       db.exec("CREATE INDEX IF NOT EXISTS settings_key_value ON settings(key, value)");
     },
   },
+  {
+    id: 15,
+    name: "desktop devices: the connectors that run a workspace's browser on its owner's computer",
+    up: (db) => {
+      db.exec(`CREATE TABLE IF NOT EXISTS devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_id INTEGER NOT NULL DEFAULT 1,
+        user_id INTEGER,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        os TEXT,
+        app_version TEXT,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT,
+        revoked_at TEXT
+      )`);
+      db.exec("CREATE INDEX IF NOT EXISTS devices_org ON devices(org_id, id)");
+    },
+  },
 ];
 
 function migrate(db: Database.Database) {

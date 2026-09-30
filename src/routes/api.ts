@@ -79,6 +79,7 @@ import {
   currentOrgId,
 } from "../db.js";
 import { streamClients, streamHandler } from "../live.js";
+import { createDevice, listDevicesView, revokeDevice } from "../devices.js";
 import { routeMessage } from "../router.js";
 import { handleControl } from "../answers.js";
 import { classifyIntent } from "../intents.js";
@@ -1105,6 +1106,22 @@ api.delete("/users/:id", requireRole("owner"), async (req, res) => {
   await deleteUser(u.id);
   invalidateBearerCache(u.id); // a cached bearer match must not outlive the account
   await addAudit({ actor: me.email, action: "user.deleted", target: u.email });
+  res.json({ ok: true });
+});
+
+/* ---------- desktop devices: the computers that run this workspace's browser (src/devices.ts, src/gateway) ---------- */
+const gatewayUrl = () => (config.publicUrl ? `${config.publicUrl.replace(/^http/, "ws").replace(/\/$/, "")}/gw` : null);
+api.get("/devices", async (_req, res) => res.json({ devices: await listDevicesView(), gateway: gatewayUrl() }));
+api.post("/devices", operators, async (req, res) => {
+  const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 80) : "";
+  if (!name) return bad(res, "Give this computer a name.");
+  const { device, token } = await createDevice(name, res.locals.user as AuthUser);
+  // The token travels once, here; only its hash is kept.
+  res.json({ ok: true, device, token, gateway: gatewayUrl() });
+});
+api.delete("/devices/:id", operators, async (req, res) => {
+  const d = await revokeDevice(num(req.params.id, 0), (res.locals.user as AuthUser).email);
+  if (!d) return bad(res, "not found", 404);
   res.json({ ok: true });
 });
 

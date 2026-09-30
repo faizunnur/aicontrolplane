@@ -1,6 +1,8 @@
 import { browser } from "./browser/manager.js";
 import { config } from "./config.js";
-import { createBrowserOp, finishBrowserOp, getBrowserOp } from "./db.js";
+import { createBrowserOp, currentOrgId, finishBrowserOp, getBrowserOp } from "./db.js";
+import { gatewayCall } from "./gateway/calls.js";
+import { connectorOnline } from "./gateway/registry.js";
 import { logger } from "./logger.js";
 import { getPlatform, refreshPlatformsNow } from "./platforms.js";
 import { requireProvider } from "./providers/registry.js";
@@ -37,6 +39,13 @@ async function freshPlatform(platformId: string) {
 
 const OPS = {
   "auth.check": async ({ platformId }: { platformId: string }) => (await freshProvider(platformId)).checkAuth(),
+  /** A chat message typed into the provider's page; the bookkeeping around it stays with the caller (src/deliver.ts). */
+  "chat.send": async ({ platformId, text, runId, messageId }: { platformId: string; text: string; runId?: number | null; messageId?: number | null }) => {
+    const p = await freshPlatform(platformId);
+    const { RunTracker } = await import("./runs.js");
+    const { sendThroughBrowser } = await import("./providers/browser/chat.js");
+    return sendThroughBrowser(p, text, runId ? new RunTracker(runId, messageId ?? null) : undefined);
+  },
   "auth.connect": async ({ platformId }: { platformId: string }) => (await freshProvider(platformId)).connect(),
   "session.import": async ({ platformId, cookies, origins }: { platformId: string; cookies: StoredCookie[]; origins: StoredOrigin[] }) => {
     const p = await freshPlatform(platformId);
@@ -127,6 +136,10 @@ export class BrowserOpError extends Error {
 
 /** Run an op wherever the browser lives and return its answer, or throw BrowserOpError. */
 export async function callBrowserOp<T>(op: BrowserOpName, payload: unknown, timeoutMs = 90_000): Promise<T> {
+  // A workspace whose owner's computer is connected does its browser work there — even on a
+  // process that holds a browser of its own. The desktop is that workspace's browser.
+  const org = currentOrgId();
+  if (org !== undefined && connectorOnline(org)) return gatewayCall<T>(org, op, payload, timeoutMs);
   if (hasLocalBrowser()) return (await performBrowserOp(op, payload)) as T;
   const { JOB, queue } = await import("./queue.js");
   const row = await createBrowserOp(op, payload);

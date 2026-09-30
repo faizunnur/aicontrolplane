@@ -9,6 +9,7 @@ import { liveViewers as liveViewersGauge } from "../metrics.js";
 import { browser, type BrowserSnapshot } from "./manager.js";
 import { acquireStream, applyCommand, refreshLevel, releaseStream, LEVEL_ORDER, QUALITY, type Level, type Meta, type Sink } from "./live-stream.js";
 import { LIVE_CTL_CHANNEL, LIVE_STATE_CHANNEL } from "./live-relay.js";
+import { connectorFor, connectorOnline, onConnectorChange } from "../gateway/registry.js";
 
 /*
   The live browser view. One WebSocket per open UI (`/live`).
@@ -58,6 +59,8 @@ interface Client {
   lastMetaKey: string | null;
   /** Answered the last ping. */
   alive: boolean;
+  /** Which transport feeds this viewer's frames: the local browser, the Redis relay, or the workspace's desktop connector. */
+  via: "local" | "remote" | "connector" | null;
 }
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
@@ -106,6 +109,8 @@ function acceptRemoteSnapshot(org: number, snap: BrowserSnapshot) {
  * So split mode answers with what the browser service last said instead.
  */
 export async function browserStateFor(org: number): Promise<BrowserSnapshot> {
+  const fromConnector = connectorSnapshots.get(org);
+  if (fromConnector) return fromConnector;
   if (localBrowser) return withOrg(org, () => browser.status());
   return remoteSnapshots.get(org) ?? EMPTY_SNAPSHOT;
 }
@@ -123,12 +128,18 @@ function sendJson(c: Client, msg: unknown) {
 }
 
 function currentSnapshotFor(c: Client): BrowserSnapshot {
-  if (localBrowser) return withOrg(c.orgId, () => browser.snapshot());
-  return remoteSnapshots.get(c.orgId) ?? EMPTY_SNAPSHOT;
+  return snapshotForOrg(c.orgId);
+}
+function snapshotForOrg(org: number): BrowserSnapshot {
+  // The workspace's own computer, when connected, is its browser — whatever this process holds.
+  const fromConnector = connectorSnapshots.get(org);
+  if (fromConnector) return fromConnector;
+  if (localBrowser) return withOrg(org, () => browser.snapshot());
+  return remoteSnapshots.get(org) ?? EMPTY_SNAPSHOT;
 }
 
 function onConnect(ws: WebSocket, orgId: number) {
-  const client: Client = { ws, orgId, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null, alive: true };
+  const client: Client = { ws, orgId, platform: null, follow: true, level: "medium", override: false, attached: null, sink: null, lastMetaKey: null, alive: true, via: null };
   clients.add(client);
   liveViewersGauge.set(clients.size);
   log.info(`live view connected (${clients.size} viewer${clients.size === 1 ? "" : "s"})`);
@@ -203,6 +214,15 @@ async function attach(c: Client) {
     sendJson(c, { t: "meta", platform: null, url: "", title: "", width: 0, height: 0 });
     return;
   }
+  if (connectorOnline(c.orgId)) {
+    // The workspace's computer streams the tab; it is told what is wanted at which quality.
+    c.attached = platform;
+    c.via = "connector";
+    const cached = connectorLast.get(`${c.orgId}:${platform}`);
+    if (cached) deliverTo(c, cached.frame, cached.meta, true);
+    publishConnectorWants(c.orgId);
+    return;
+  }
   if (localBrowser) {
     const sink: Sink = {
       level: c.level,
@@ -215,11 +235,13 @@ async function attach(c: Client) {
     }
     c.sink = sink;
     c.attached = platform;
+    c.via = "local";
     return;
   }
   // Remote: count the want; the heartbeat tells the relay, and the stream's own frame
   // channel is subscribed for as long as anyone here watches it.
   c.attached = platform;
+  c.via = "remote";
   retainFrames(c.orgId, platform);
   const cached = remoteLast.get(`${c.orgId}:${platform}`);
   if (cached) deliverTo(c, cached.frame, cached.meta, true);
@@ -228,12 +250,22 @@ async function attach(c: Client) {
 
 function detach(c: Client) {
   if (!c.attached) return;
-  if (localBrowser && c.sink) releaseStream(c.orgId, c.attached, c.sink);
-  if (remote) releaseFrames(c.orgId, c.attached);
+  const was = c.attached;
+  const via = c.via;
+  const sink = c.sink;
   c.attached = null;
   c.sink = null;
   c.lastMetaKey = null;
-  if (remote) publishWants();
+  c.via = null;
+  if (via === "connector") {
+    publishConnectorWants(c.orgId);
+    return;
+  }
+  if (via === "local" && sink) releaseStream(c.orgId, was, sink);
+  if (via === "remote") {
+    releaseFrames(c.orgId, was);
+    publishWants();
+  }
 }
 
 /* ---------- the remote transport (api process without a browser) ---------- */
@@ -356,6 +388,89 @@ if (remote) {
   sweep.unref?.();
 }
 
+/* ---------- the desktop connector transport (a workspace whose browser is on its owner's computer) ---------- */
+
+/** The connector's latest snapshot per workspace; while one is connected it IS the workspace's browser. */
+const connectorSnapshots = new Map<number, BrowserSnapshot>();
+/** Last frame per connector stream "org:platform", so a fresh viewer sees something before the next repaint. */
+const connectorLast = new Map<string, { frame: Buffer; meta: Meta }>();
+/** What each connector was last told is wanted, so only changes travel. */
+const connectorWantsSent = new Map<number, Map<string, Level>>();
+
+export function acceptConnectorSnapshot(org: number, snap: BrowserSnapshot): void {
+  const prev = connectorSnapshots.get(org);
+  if (prev && prev.epoch === snap.epoch && typeof snap.seq === "number" && typeof prev.seq === "number" && snap.seq < prev.seq) return;
+  connectorSnapshots.set(org, snap);
+  for (const c of clients) {
+    if (c.orgId !== org) continue;
+    sendJson(c, { t: "state", browser: snap });
+    if (c.follow && targetOf(c) !== c.attached) void attach(c);
+  }
+  // The dashboards learn over the event stream the same way a remote browser service's snapshots reach them.
+  deliveringRemoteState = true;
+  try {
+    bus.emit("browser", snap, undefined, org);
+  } finally {
+    deliveringRemoteState = false;
+  }
+}
+
+export function acceptConnectorFrame(org: number, platform: string, meta: Meta, body: Buffer, metaChanged: boolean): void {
+  const key = `${org}:${platform}`;
+  let watched = false;
+  for (const c of clients) {
+    if (c.orgId !== org || c.attached !== platform || c.via !== "connector") continue;
+    watched = true;
+    deliverTo(c, body, meta, metaChanged);
+  }
+  if (watched) connectorLast.set(key, { frame: body, meta });
+}
+
+export function connectorLiveError(org: number, platform: string, message: string): void {
+  for (const c of clients) if (c.orgId === org && c.attached === platform && c.via === "connector") sendJson(c, { t: "error", message });
+}
+
+/** Tell the workspace's connector which tabs its viewers want, at what quality; nothing when nothing changed. */
+function publishConnectorWants(org: number) {
+  const conn = connectorFor(org);
+  if (!conn) return;
+  const want = new Map<string, Level>();
+  for (const c of clients) {
+    if (c.orgId !== org || !c.attached || c.via !== "connector") continue;
+    const cur = want.get(c.attached);
+    want.set(c.attached, cur && LEVEL_ORDER.indexOf(cur) > LEVEL_ORDER.indexOf(c.level) ? cur : c.level);
+  }
+  const sent = connectorWantsSent.get(org) ?? new Map<string, Level>();
+  for (const [platform, level] of want) if (sent.get(platform) !== level) conn.send({ t: "live", platform, level });
+  for (const platform of sent.keys()) {
+    if (want.has(platform)) continue;
+    conn.send({ t: "live", platform, level: null });
+    connectorLast.delete(`${org}:${platform}`);
+  }
+  connectorWantsSent.set(org, want);
+}
+
+onConnectorChange((org, conn) => {
+  if (!conn) {
+    connectorSnapshots.delete(org);
+    connectorWantsSent.delete(org);
+    for (const key of [...connectorLast.keys()]) if (key.startsWith(`${org}:`)) connectorLast.delete(key);
+  }
+  // Viewers of this workspace move to (or off) the connector: re-attach from scratch.
+  for (const c of clients) {
+    if (c.orgId !== org) continue;
+    detach(c);
+    sendJson(c, { t: "state", browser: currentSnapshotFor(c) });
+    void attach(c);
+  }
+  deliveringRemoteState = true;
+  try {
+    bus.emit("browser", snapshotForOrg(org), undefined, org);
+  } finally {
+    deliveringRemoteState = false;
+  }
+});
+
 /* ---------- commands from the UI ---------- */
 
 async function handle(c: Client, msg: Record<string, unknown>) {
@@ -378,8 +493,9 @@ async function handle(c: Client, msg: Record<string, unknown>) {
     if (level in QUALITY) {
       c.level = level;
       if (c.sink) c.sink.level = level;
-      if (localBrowser && c.attached) await refreshLevel(c.orgId, c.attached);
-      if (remote) publishWants();
+      if (c.via === "local" && c.attached) await refreshLevel(c.orgId, c.attached);
+      if (c.via === "remote") publishWants();
+      if (c.via === "connector") publishConnectorWants(c.orgId);
     }
     return;
   }
@@ -393,6 +509,11 @@ async function handle(c: Client, msg: Record<string, unknown>) {
 }
 
 async function forwardCommand(c: Client, platform: string, msg: Record<string, unknown>) {
+  const conn = connectorFor(c.orgId);
+  if (conn && c.via === "connector") {
+    conn.send({ t: "cmd", platform, override: c.override, msg });
+    return;
+  }
   if (localBrowser) {
     const outcome = await applyCommand(c.orgId, platform, msg, { override: c.override });
     if (outcome.error) sendJson(c, { t: "error", message: outcome.error });

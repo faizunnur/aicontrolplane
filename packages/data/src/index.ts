@@ -1497,6 +1497,49 @@ export async function updatePairing(id: number, patch: Partial<Pick<PairingRow, 
   if (cols.length) await q.run(`UPDATE pairings SET ${cols.join(", ")} WHERE id = ?`, [...vals, id]);
   return getPairing(id);
 }
+
+/* ---------- desktop devices: the connectors that run a workspace's browser on its owner's computer ---------- */
+
+export interface DeviceRow {
+  id: number;
+  org_id: number;
+  user_id: number | null;
+  name: string;
+  /** sha256 of the device token; the token itself is shown once and never stored. */
+  token_hash: string;
+  os: string | null;
+  app_version: string | null;
+  created_at: string;
+  last_seen_at: string | null;
+  revoked_at: string | null;
+}
+
+export async function insertDevice(input: { name: string; user_id: number | null; token_hash: string }): Promise<DeviceRow> {
+  const row = await q.get<{ id: number }>("INSERT INTO devices (org_id, user_id, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id", [oid(), input.user_id, input.name, input.token_hash, now()]);
+  return (await getDevice(row!.id))!;
+}
+export async function listDevices(): Promise<DeviceRow[]> {
+  return q.all<DeviceRow>("SELECT * FROM devices WHERE org_id = ? ORDER BY id", [oid()]);
+}
+export async function getDevice(id: number): Promise<DeviceRow | undefined> {
+  return q.get<DeviceRow>("SELECT * FROM devices WHERE id = ? AND org_id = ?", [id, oid()]);
+}
+// The token lookup is global on purpose: a connector arrives with no login and no workspace —
+// the hashed token IS the capability, and the gateway adopts the row's org.
+export async function findDeviceByTokenHash(hash: string): Promise<DeviceRow | undefined> {
+  return q.get<DeviceRow>("SELECT * FROM devices WHERE token_hash = ? AND revoked_at IS NULL", [hash]);
+}
+export async function updateDevice(id: number, patch: Partial<Pick<DeviceRow, "name" | "os" | "app_version" | "last_seen_at" | "revoked_at">>): Promise<DeviceRow | undefined> {
+  const cols: string[] = [];
+  const vals: unknown[] = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    cols.push(`${k} = ?`);
+    vals.push(v);
+  }
+  if (cols.length) await q.run(`UPDATE devices SET ${cols.join(", ")} WHERE id = ? AND org_id = ?`, [...vals, id, oid()]);
+  return getDevice(id);
+}
 export async function latestPairing(platform: string): Promise<PairingRow | undefined> {
   return q.get<PairingRow>("SELECT * FROM pairings WHERE platform = ? AND org_id = ? ORDER BY id DESC LIMIT 1", [platform, oid()]);
 }

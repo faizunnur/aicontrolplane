@@ -5,14 +5,17 @@ import { ensureProviderAgent, ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
 import { egressFetch } from "./egress.js";
-import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
+import { addEvent, currentOrgId, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
+import { gatewayCall } from "./gateway/calls.js";
+import { connectorOnline } from "./gateway/registry.js";
 import { logger } from "./logger.js";
 import { openMaybe } from "./secrets.js";
 import { getPlatform, refreshPlatformsNow } from "./platforms.js";
 import { ApprovalPending, guard, registerResumer } from "./policy.js";
 import { getProvider } from "./providers/registry.js";
 import { beginRun, endRun, enforceRunQuotas, QuotaExceededError, RunTracker, withRunLease } from "./runs.js";
-import type { AgentDelivery, DeliveryMode, Task } from "../packages/core/src/index.js";
+import type { AgentDelivery, DeliveryMode, SessionStatus, Task } from "../packages/core/src/index.js";
+import type { ChatResult } from "./providers/types.js";
 
 const log = logger("deliver");
 
@@ -138,6 +141,10 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
   const msg = (await getMessage(messageId))!;
   const adapter = getProvider(platformId)!;
   const p = adapter.config();
+  // The workspace owner's connected computer, when there is one, does the browser work; its
+  // steps arrive over the gateway as run events on this same run.
+  const org = currentOrgId();
+  const desktop = org !== undefined && connectorOnline(org) ? org : null;
   const fail = async (error: string, status: "failed" | "cancelled" = "failed") => {
     await track.failRunning(error);
     await endRun(runId, { status, error });
@@ -149,7 +156,7 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
     let status = (await getPlatformState(p.id)).session_status;
     if (status !== "logged_in") {
       await track.start("connect", `Checking ${p.name} is connected`);
-      status = await adapter.checkAuth({ messageId: msg.id, runId, track });
+      status = desktop !== null ? await gatewayCall<SessionStatus>(desktop, "auth.check", { platformId: p.id }, 120_000) : await adapter.checkAuth({ messageId: msg.id, runId, track });
       if (status === "logged_in") await track.done("connect", "connected");
       else await track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
     }
@@ -159,7 +166,7 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
       return fail(error);
     }
     await updateMessage(msg.id, { status: "delivered", delivered_at: new Date().toISOString() });
-    const r = await adapter.sendMessage(msg.text, { messageId: msg.id, runId, track });
+    const r = desktop !== null ? await gatewayCall<ChatResult>(desktop, "chat.send", { platformId: p.id, text: msg.text, runId, messageId: msg.id }, 5 * 60_000) : await adapter.sendMessage(msg.text, { messageId: msg.id, runId, track });
     if (r.cancelled) return fail(r.error ?? "Stopped.", "cancelled");
     if (!r.ok) {
       log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
