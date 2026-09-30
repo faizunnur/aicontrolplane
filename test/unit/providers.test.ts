@@ -129,7 +129,10 @@ describe("login detection", () => {
     assert.equal(await detectLoginState(platform({ loggedInSelector: "" }), fakePage()), "unknown");
   });
 
-  it("a provider with no markers at all keeps the benefit of the doubt", async () => {
-    assert.equal(await detectLoginState(platform({ loggedInSelector: "", composerSelector: "" }), fakePage()), "logged_in");
+  it("a provider with no markers at all is unknown — nothing can vouch for a session", async () => {
+    // The old default answered logged_in, so a freshly added provider showed "Connected"
+    // while its site sat on a login page. Unknown keeps the card honest; the chat path
+    // still proceeds and flips the state to logged_in when its composer really appears.
+    assert.equal(await detectLoginState(platform({ loggedInSelector: "", composerSelector: "" }), fakePage()), "unknown");
   });
 });

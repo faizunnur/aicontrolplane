@@ -12,11 +12,11 @@ import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/i
  *      configured name (sites chunk cookies into .0 .1)
  *   5. the configured composer is on the page          → signed in
  *   6. signed-in markers are configured but absent     → unknown
- *   7. nothing is configured to judge by              → signed in
- * Cookies never vote "signed out" on their own: names change, pages don't lie. And a page
- * missing every marker the provider promised never votes "signed in": an unrecognised
- * logged-out page masquerading as a session dies later as a generic chat timeout instead
- * of an honest needs_login.
+ *   7. nothing is configured to judge by              → unknown
+ * Cookies never vote "signed out" on their own: names change, pages don't lie. And no page
+ * ever votes "signed in" without evidence: a provider with nothing to judge by is unknown,
+ * not connected — its sidebar card must not claim a session that was never seen. The chat
+ * path still proceeds on "unknown" (the composer's presence is the verdict there).
  */
 export async function detectLoginState(p: PlatformConfig, page: Page, extra: { unauthorized?: boolean } = {}): Promise<SessionStatus> {
   const url = page.url();
@@ -43,8 +43,7 @@ export async function detectLoginState(p: PlatformConfig, page: Page, extra: { u
     const n = await page.locator(p.composerSelector).count().catch(() => 0);
     if (n > 0) return "logged_in";
   }
-  if (p.loggedInSelector || p.composerSelector) return "unknown";
-  return "logged_in";
+  return "unknown";
 }
 
 export interface ChallengeState {

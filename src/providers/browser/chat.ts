@@ -80,6 +80,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker, thre
 
   let page!: Page;
   let composer!: ReturnType<Page["locator"]>;
+  let login: SessionStatus = "unknown";
   for (let attempt = 0; attempt < targets.length; attempt++) {
     const url = targets[attempt];
     const continuing = url !== fresh;
@@ -90,7 +91,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker, thre
     if (attempt === 0) {
       // The sign-in is a property of the site, not the page: checking it once is enough.
       await step?.start("check", "Checking the sign-in");
-      const login = await detectLoginState(p, page);
+      login = await detectLoginState(p, page);
       if (login === "needs_login") {
         await setPlatformState(p.id, { session_status: "needs_login" });
         await step?.fail("check", "signed out");
@@ -123,6 +124,9 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker, thre
       throw err;
     }
   }
+  // The composer's presence is the verdict the "unknown" login check deferred to: record it,
+  // so a provider with no sign-in markers becomes Connected from evidence, never by default.
+  if (login === "unknown") await setPlatformState(p.id, { session_status: "logged_in", last_error: null });
   const before = p.replySelector ? await page.locator(p.replySelector).count().catch(() => 0) : 0;
   await composer.click({ timeout: 10_000 });
   try {
@@ -192,7 +196,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker, thre
 }
 
 /** Quick "are we signed in?" check: open the app page and look, without capturing tasks. */
-export async function checkSignIn(p: PlatformConfig): Promise<Exclude<SessionStatus, "unknown">> {
+export async function checkSignIn(p: PlatformConfig): Promise<SessionStatus> {
   if (!browser.enabled || !p.appUrl) return "error";
   return browser.withLock(
     async () => {
@@ -201,10 +205,12 @@ export async function checkSignIn(p: PlatformConfig): Promise<Exclude<SessionSta
         // A single-page app needs a moment after load to decide what to render.
         const page = await pc.open(p.appUrl, { networkIdleMs: 10_000, settleMs: 1_000 });
         const login = await detectLoginState(p, page);
-        // "unknown" (no marker answered) counts as signed in ONLY after a bot check is ruled
-        // out — an interstitial shows none of the provider's markers either.
+        // "unknown" is ruled a bot check when one is on the page (an interstitial shows none
+        // of the provider's markers either); otherwise it STAYS unknown — a check that saw
+        // no evidence must not paint the card "Connected". A send still proceeds on unknown,
+        // and its success is what flips the state to logged_in.
         const challenged = login === "unknown" && (await detectChallenge(page)).challenge !== null;
-        const status = login === "needs_login" || challenged ? "needs_login" : "logged_in";
+        const status: SessionStatus = login === "needs_login" || challenged ? "needs_login" : login;
         await pc.screenshot(page);
         await setPlatformState(p.id, { session_status: status, last_error: challenged ? `${p.name} is showing a human-verification challenge` : null });
         if (status === "logged_in") void browser.backupSessions();

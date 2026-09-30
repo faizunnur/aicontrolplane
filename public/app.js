@@ -1051,6 +1051,10 @@
           signingIn = null;
           live.followAgent();
           renderRibbons(); renderTabs();
+        } else if (r.status === "unknown") {
+          // The provider has no sign-in markers to judge by; its first successful message is what proves the session.
+          toast(`${r.name} has no sign-in markers configured, so the session cannot be verified here. If you finished signing in, just send it a message — it shows as connected once it answers.`, "warn");
+          if (mode === "desktop") { signingIn = null; renderRibbons(); }
         } else if (mode === "desktop") {
           toast(r.status === "needs_login" ? `${r.name} still looks signed out. The window was closed; start the sign-in again, or use "Connect from this computer" from its menu if the site refused the check.` : `Could not check ${r.name}: ${r.lastError || "try again"}`, "bad");
           signingIn = null;
@@ -1333,7 +1337,7 @@ curl -X POST ${base}/api/ingest \\
       else if (d.pairingCancel) { await busy(btn, () => api(`/connections/${d.pairingCancel}/pairing`, { method: "DELETE" })); if (pairing?.platform === d.pairingCancel) { closePairing(); pairing = null; } toast("Cancelled. Make a new code whenever you are ready."); }
       else if (d.logClear !== undefined) { const l = $("#log-lines"); if (l) l.innerHTML = ""; }
       else if (d.viewAi) { showBrowser(); if (browserState?.pages?.some((p) => p.platform === d.viewAi)) live.watch(d.viewAi); else { await api("/browser/open", { method: "POST", body: { platform: d.viewAi, url: conn(d.viewAi)?.appUrl } }); live.watch(d.viewAi); } renderTabs(); }
-      else if (d.check) { await busy(btn, async () => { const r = await api(`/connections/${d.check}/check`, { method: "POST", body: {} }); toast(r.status === "logged_in" ? `${r.name} is connected.` : `${r.name} is signed out.`, r.status === "logged_in" ? "ok" : "bad"); }); }
+      else if (d.check) { await busy(btn, async () => { const r = await api(`/connections/${d.check}/check`, { method: "POST", body: {} }); toast(r.status === "logged_in" ? `${r.name} is connected.` : r.status === "unknown" ? `${r.name} has no sign-in markers to judge by; it shows as connected once a message to it succeeds.` : `${r.name} is signed out.`, r.status === "logged_in" ? "ok" : r.status === "unknown" ? "warn" : "bad"); }); }
       else if (d.refresh) { await busy(btn, async () => { const c = conn(d.refresh); if (c?.canSync) await api(`/platforms/${c.id}/sync`, { method: "POST" }); else await api(`/connections/${d.refresh}/check`, { method: "POST", body: {} }); }); refreshView(); }
       else if (d.remove) { if (confirm(`Remove ${aiName(d.remove)} from the app?`)) { await api(`/connections/${d.remove}`, { method: "DELETE" }); await load(current ? current.id : null); } }
       else if (d.read) { await api(`/events/${d.read}/read`, { method: "POST", body: {} }); refreshOverview(); refreshView(); }

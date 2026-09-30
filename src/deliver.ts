@@ -151,9 +151,12 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
       await track.start("connect", `Checking ${p.name} is connected`);
       status = await adapter.checkAuth({ messageId: msg.id, runId, track });
       if (status === "logged_in") await track.done("connect", "connected");
+      // "unknown" (no sign-in markers answered, no bot check): the send itself is the verdict —
+      // its composer wait fails honestly if the page is really signed out.
+      else if (status === "unknown") await track.done("connect", "no sign-in markers to judge by; trying anyway");
       else await track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
     }
-    if (status !== "logged_in") {
+    if (status !== "logged_in" && status !== "unknown") {
       // "Sign in AGAIN" only when there ever was a sign-in; a never-connected AI just isn't connected.
       const error = status === "needs_login" && (await getPlatformState(p.id)).last_login_at ? `${p.name} needs you to sign in again.` : `${p.name} is not connected yet. Sign in first.`;
       await addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
