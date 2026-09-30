@@ -149,7 +149,7 @@ export class BrowserProviderAdapter implements ProviderAdapter {
 
   async sendMessage(text: string, ctx: ExecutionContext): Promise<ChatResult> {
     this.require("chat");
-    return await sendThroughBrowser(this.cfg(), text, ctx.track);
+    return await sendThroughBrowser(this.cfg(), text, ctx.track, ctx.threadUrl ?? null);
   }
 
   async listTasks(ctx: ExecutionContext): Promise<TaskListResult> {

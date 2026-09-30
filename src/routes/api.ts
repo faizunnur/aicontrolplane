@@ -125,7 +125,7 @@ import { resolveMode } from "../deliver.js";
 import { JOB, queue, type ChatDeliverJob, type DispatchDeliverJob } from "../queue.js";
 import { browserRuntimeAvailable, callBrowserOp, desktopState } from "../browser-ops.js";
 import { getProvider, listProviders, providerView, requireProvider } from "../providers/registry.js";
-import { connectedPlatforms, routeToConnection } from "../router.js";
+import { connectedPlatforms, namedPlatform, routeToConnection } from "../router.js";
 
 export const api = Router();
 
@@ -920,6 +920,18 @@ api.post("/chat", async (req, res) => {
     // Respond right away; the reply lands in the thread when the AI answers.
     res.json({ message: await expandMessage((await getMessage(msg.id))!), routed: chosen, conversation: await getConversation(conversation.id) });
     void queue.send<ChatDeliverJob>(JOB.chatDeliver, { messageId: msg.id, platformId: chosen });
+    return;
+  }
+  // A follow-up in a thread that is already talking to an AI stays with that AI — a short
+  // answer like "gmail" after Claude asked a question must reach that same chat, not a fresh
+  // routing decision. Naming another AI ("ask grok…") still wins, and a brand-new thread
+  // routes as always.
+  const followUp = !namedPlatform(text) && conversation.last_platform && getPlatform(conversation.last_platform) ? conversation.last_platform : null;
+  if (followUp) {
+    const name = getPlatform(followUp)!.name;
+    await updateMessage(msg.id, { routing: { method: "follow-up", confidence: 1, reason: `Continuing your ${name} conversation.` } });
+    res.json({ message: await expandMessage((await getMessage(msg.id))!), routed: followUp, conversation: await getConversation(conversation.id) });
+    void queue.send<ChatDeliverJob>(JOB.chatDeliver, { messageId: msg.id, platformId: followUp });
     return;
   }
   const routing = await routeToConnection(text);

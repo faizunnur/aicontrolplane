@@ -160,6 +160,8 @@ export interface Conversation {
   created_at: string;
   updated_at: string;
   last_message_at: string | null;
+  /** JSON { platformId: url } — the provider-side chat each AI holds for this thread, so a follow-up continues it instead of opening a new one. */
+  threads: string | null;
 }
 
 export interface Suggestion {

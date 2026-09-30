@@ -5,7 +5,7 @@ import { ensureProviderAgent, ensureTaskAgent } from "./agents.js";
 import { config } from "./config.js";
 import { withLogContext } from "./context.js";
 import { egressFetch } from "./egress.js";
-import { addEvent, getMessage, getPlatformState, getTask, updateMessage, type MessageWithTask } from "./db.js";
+import { addEvent, conversationThreads, getConversation, getMessage, getPlatformState, getTask, setConversationThread, updateMessage, type MessageWithTask } from "./db.js";
 import { logger } from "./logger.js";
 import { openMaybe } from "./secrets.js";
 import { getPlatform, refreshPlatformsNow } from "./platforms.js";
@@ -93,7 +93,7 @@ async function webhookAuthHeaders(token: string | null | undefined, rawBody: str
 function describeRouting(routing: string | null): string {
   try {
     const r = routing ? (JSON.parse(routing) as { method?: string }) : null;
-    return { mention: "you named it", only: "the only AI connected", llm: "picked by Claude", keywords: "picked by keywords", manual: "you chose it" }[r?.method ?? ""] ?? "";
+    return { mention: "you named it", only: "the only AI connected", llm: "picked by Claude", keywords: "picked by keywords", manual: "you chose it", "follow-up": "continuing this conversation" }[r?.method ?? ""] ?? "";
   } catch {
     return "";
   }
@@ -159,12 +159,23 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
       return fail(error);
     }
     await updateMessage(msg.id, { status: "delivered", delivered_at: new Date().toISOString() });
-    const r = await adapter.sendMessage(msg.text, { messageId: msg.id, runId, track });
+    // A thread that already talks to this AI continues in the SAME chat at the provider —
+    // "which email provider?" answered with "gmail" must land under the question, not in a
+    // fresh conversation that has never heard of email.
+    const conversation = msg.conversation_id ? await getConversation(msg.conversation_id) : undefined;
+    const threadUrl = conversation ? (conversationThreads(conversation)[p.id] ?? null) : null;
+    const r = await adapter.sendMessage(msg.text, { messageId: msg.id, runId, track, threadUrl });
     if (r.cancelled) return fail(r.error ?? "Stopped.", "cancelled");
     if (!r.ok) {
       log.warn(`chat delivery of message ${msg.id} to ${p.name} failed: ${r.error}`);
       await addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: `${r.error}\n\n"${msg.text.slice(0, 200)}"`, dedupe_key: `message_failed:${msg.id}` });
       return fail(r.error ?? "unknown error");
+    }
+    // Remember where the provider put this chat, so the next message in this conversation
+    // continues it. The new-chat URL itself is never worth saving: reopening it would start
+    // over, which is exactly what this avoids.
+    if (conversation && r.url && /^https?:\/\//i.test(r.url) && r.url !== (p.chatUrl || p.appUrl) && r.url !== threadUrl) {
+      await setConversationThread(conversation.id, p.id, r.url).catch((err) => log.warn(`could not remember the ${p.name} thread for conversation ${conversation.id}`, err));
     }
     const response = r.reply ? (r.partial ? r.reply + "\n\n(reply was still being written when I stopped waiting)" : r.reply) : "Sent. No reply text could be read back; open the AI to see it.";
     await endRun(runId, { status: "success", summary: response.slice(0, 500), output_url: r.url ?? null });

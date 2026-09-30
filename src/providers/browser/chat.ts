@@ -18,25 +18,26 @@ const MAX_REPLY_CHARS = 8_000;
 const clipReply = (s: string) => (s.length > MAX_REPLY_CHARS ? s.slice(0, MAX_REPLY_CHARS) + "\n…[truncated]" : s);
 
 /**
- * Send a message to a provider exactly the way you would: open a new conversation, type it,
- * send it, wait for the answer, and read the answer back. Everything the site needs (URLs and
- * selectors) comes from the provider's configuration; every stage is reported through the step
- * tracker so the thread shows it live.
+ * Send a message to a provider exactly the way you would: open the conversation (the thread
+ * the control-plane conversation already holds there, or a new one), type it, send it, wait
+ * for the answer, and read the answer back. Everything the site needs (URLs and selectors)
+ * comes from the provider's configuration; every stage is reported through the step tracker
+ * so the thread shows it live.
  */
-export async function sendThroughBrowser(p: PlatformConfig, text: string, track?: RunTracker): Promise<ChatResult> {
+export async function sendThroughBrowser(p: PlatformConfig, text: string, track?: RunTracker, threadUrl?: string | null): Promise<ChatResult> {
   if (!browser.enabled) return { ok: false, error: "the browser is disabled on this deployment" };
   if (!p.composerSelector) return { ok: false, error: `${p.name} has no chat box configured` };
   return browser.withLock(
     async () => {
       try {
-        return await sendOnce(p, text, track);
+        return await sendOnce(p, text, track, threadUrl);
       } catch (err) {
         if (err instanceof CancelledError) return { ok: false, cancelled: true, error: err.message };
         if (isStall(err)) {
           log.warn(`chat ${p.id}: ${cleanError(err)}; retrying on a fresh tab`);
           await browser.resetConsolePage(p.id);
           try {
-            return await sendOnce(p, text, track);
+            return await sendOnce(p, text, track, threadUrl);
           } catch (err2) {
             if (err2 instanceof CancelledError) return { ok: false, cancelled: true, error: err2.message };
             return { ok: false, error: cleanError(err2) };
@@ -69,39 +70,58 @@ async function challengeFailure(p: PlatformConfig, page: Page, step: RunTracker 
   return { ok: false, error: `${p.name} is showing a human-verification challenge — open the live view or re-run sign-in.`, url: page.url() };
 }
 
-async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Promise<ChatResult> {
+async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker, threadUrl?: string | null): Promise<ChatResult> {
   const pc = new PageController(p.id, p.name);
-  const url = p.chatUrl || p.appUrl;
+  const fresh = p.chatUrl || p.appUrl;
+  // The conversation's own chat at the provider first; a thread that will not come back
+  // (deleted there, another account, a changed URL scheme) falls back to a new chat rather
+  // than failing the message.
+  const targets = threadUrl && threadUrl !== fresh ? [threadUrl, fresh] : [fresh];
 
-  await step?.start("open", `Opening ${p.name}`);
-  const page = await pc.open(url);
-  await step?.done("open", hostOf(url));
+  let page!: Page;
+  let composer!: ReturnType<Page["locator"]>;
+  for (let attempt = 0; attempt < targets.length; attempt++) {
+    const url = targets[attempt];
+    const continuing = url !== fresh;
+    await step?.start("open", continuing ? `Reopening your ${p.name} chat` : attempt > 0 ? `Opening a new ${p.name} chat` : `Opening ${p.name}`);
+    page = await pc.open(url);
+    await step?.done("open", hostOf(url));
 
-  await step?.start("check", "Checking the sign-in");
-  const login = await detectLoginState(p, page);
-  if (login === "needs_login") {
-    await setPlatformState(p.id, { session_status: "needs_login" });
-    await step?.fail("check", "signed out");
-    return { ok: false, error: `${p.name} needs you to sign in again`, url: page.url() };
-  }
-  if (login === "unknown") {
-    // None of the provider's markers answered either way. Look for a bot check before
-    // trusting the page, then proceed-but-verify: the composer wait below is the verdict.
-    if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "check");
-    await step?.done("check", "no sign-in markers answered; proceeding carefully");
-  } else {
-    await step?.done("check", "signed in");
-  }
+    if (attempt === 0) {
+      // The sign-in is a property of the site, not the page: checking it once is enough.
+      await step?.start("check", "Checking the sign-in");
+      const login = await detectLoginState(p, page);
+      if (login === "needs_login") {
+        await setPlatformState(p.id, { session_status: "needs_login" });
+        await step?.fail("check", "signed out");
+        return { ok: false, error: `${p.name} needs you to sign in again`, url: page.url() };
+      }
+      if (login === "unknown") {
+        // None of the provider's markers answered either way. Look for a bot check before
+        // trusting the page, then proceed-but-verify: the composer wait below is the verdict.
+        if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "check");
+        await step?.done("check", "no sign-in markers answered; proceeding carefully");
+      } else {
+        await step?.done("check", "signed in");
+      }
+    }
 
-  await step?.start("type", "Typing your message");
-  const composer = page.locator(p.composerSelector).first();
-  try {
-    await composer.waitFor({ state: "visible", timeout: 20_000 });
-  } catch (err) {
-    // The composer never appeared — the classic face of a Cloudflare interstitial. Name it
-    // when it IS one; otherwise the timeout is real and flows to the ordinary handling.
-    if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "type");
-    throw err;
+    await step?.start("type", "Typing your message");
+    composer = page.locator(p.composerSelector).first();
+    try {
+      await composer.waitFor({ state: "visible", timeout: 20_000 });
+      break;
+    } catch (err) {
+      // The composer never appeared — the classic face of a Cloudflare interstitial. Name it
+      // when it IS one; otherwise a vanished thread gets one try on a new chat, and a real
+      // timeout flows to the ordinary handling.
+      if ((await detectChallenge(page)).challenge) return challengeFailure(p, page, step, "type");
+      if (attempt < targets.length - 1) {
+        log.warn(`chat ${p.id}: the saved thread at ${threadUrl} shows no composer; starting a new chat`);
+        continue;
+      }
+      throw err;
+    }
   }
   const before = p.replySelector ? await page.locator(p.replySelector).count().catch(() => 0) : 0;
   await composer.click({ timeout: 10_000 });

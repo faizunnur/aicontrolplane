@@ -44,6 +44,11 @@ function mentioned(text: string, p: PlatformConfig): boolean {
   return names.some((n) => n && (lower.includes(`@${n}`) || new RegExp(`(^|\\b)(ask|tell|use|in|on|via|with|to)\\s+${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(lower) || new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[,:]`).test(lower)));
 }
 
+/** The chat-capable platform the text names outright ("ask Grok…", "@claude"), if any. */
+export function namedPlatform(text: string): PlatformConfig | null {
+  return visiblePlatforms().find((p) => getProvider(p.id)?.supports("chat") && mentioned(text, p)) ?? null;
+}
+
 export async function routeToConnection(text: string): Promise<ConnectionRouting> {
   const connected = await connectedPlatforms();
   const all = visiblePlatforms().filter((p) => getProvider(p.id)?.supports("chat"));

@@ -1595,6 +1595,30 @@ export async function updateConversation(id: number, patch: { title?: string; la
   return next;
 }
 
+/** The provider-side chats this conversation already holds, as { platformId: url }. */
+export function conversationThreads(c: Pick<Conversation, "threads">): Record<string, string> {
+  try {
+    const t = c.threads ? (JSON.parse(c.threads) as Record<string, unknown>) : null;
+    if (!t || typeof t !== "object") return {};
+    return Object.fromEntries(Object.entries(t).filter(([, v]) => typeof v === "string" && /^https?:\/\//i.test(v))) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+/** Remember (or forget, with null) the provider's own chat URL for this conversation, so a follow-up continues it. */
+export async function setConversationThread(id: number, platform: string, url: string | null): Promise<ConversationSummary | undefined> {
+  const c = await getConversation(id);
+  if (!c) return undefined;
+  const threads = conversationThreads(c);
+  if (url) threads[platform] = url;
+  else delete threads[platform];
+  await q.run("UPDATE conversations SET threads = ?, updated_at = ? WHERE id = ? AND org_id = ?", [Object.keys(threads).length ? JSON.stringify(threads) : null, now(), id, oid()]);
+  const next = (await getConversation(id))!;
+  notify("conversation", { action: "updated", conversation: next });
+  return next;
+}
+
 export async function deleteConversation(id: number): Promise<boolean> {
   const c = await getConversation(id);
   if (!c) return false;

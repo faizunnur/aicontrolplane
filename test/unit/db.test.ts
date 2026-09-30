@@ -10,7 +10,7 @@ describe("schema", () => {
   it("applies every migration to a fresh database", async () => {
     const applied = (await db.schemaVersion()).map((m) => m.id);
     // SQLite replays its historical chain; Postgres starts from its own baseline (id 100+).
-    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     else assert.ok(applied.includes(100), "postgres baseline applied");
     if (db.db) {
       const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
@@ -52,6 +52,20 @@ describe("conversations and messages", () => {
     const m = await db.createMessage("x", c.id);
     assert.ok(await db.deleteConversation(c.id));
     assert.equal(await db.getMessage(m.id), undefined);
+  });
+
+  it("remembers each provider's own chat so a follow-up continues it", async () => {
+    const c = await db.createConversation("threads");
+    assert.deepEqual(db.conversationThreads(c), {});
+    await db.setConversationThread(c.id, "claude", "https://claude.ai/chat/abc-123");
+    await db.setConversationThread(c.id, "grok", "https://grok.com/chat/9");
+    const withBoth = (await db.getConversation(c.id))!;
+    assert.deepEqual(db.conversationThreads(withBoth), { claude: "https://claude.ai/chat/abc-123", grok: "https://grok.com/chat/9" });
+    await db.setConversationThread(c.id, "claude", null); // forgotten, e.g. after the thread died at the provider
+    assert.deepEqual(db.conversationThreads((await db.getConversation(c.id))!), { grok: "https://grok.com/chat/9" });
+    // Junk in the column never breaks a send: it reads as "no thread yet".
+    assert.deepEqual(db.conversationThreads({ threads: "not json" }), {});
+    assert.deepEqual(db.conversationThreads({ threads: '{"claude":"javascript:alert(1)"}' }), {}, "only http(s) urls come back");
   });
 });
 

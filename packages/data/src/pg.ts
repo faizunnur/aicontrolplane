@@ -142,7 +142,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   title TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  last_message_at TEXT
+  last_message_at TEXT,
+  threads TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -539,6 +540,14 @@ PG_MIGRATIONS.push({
       await d.run("UPDATE settings SET value = ? WHERE key = 'ingest_token' AND org_id = ?", [createHash("sha256").update(r.value).digest("hex"), r.org_id]);
     }
     await d.exec("CREATE INDEX IF NOT EXISTS settings_ingest_value ON settings(value) WHERE key = 'ingest_token'");
+  },
+});
+
+PG_MIGRATIONS.push({
+  id: 109,
+  name: "conversations remember each provider's own chat",
+  up: async (d) => {
+    await d.exec("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS threads TEXT");
   },
 });
 

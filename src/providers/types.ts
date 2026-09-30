@@ -72,6 +72,8 @@ export interface ExecutionContext {
   runKind?: string;
   /** The gate for this execution was already passed (a resume after approval): do not ask again. */
   approved?: boolean;
+  /** The provider's own chat to continue (a conversation's saved thread); without one, a chat send opens a new chat. */
+  threadUrl?: string | null;
 }
 
 export interface ChatResult {

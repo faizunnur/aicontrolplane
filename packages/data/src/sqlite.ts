@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   title TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  last_message_at TEXT
+  last_message_at TEXT,
+  threads TEXT
 );
 `);
 }
@@ -661,6 +662,13 @@ const MIGRATIONS: { id: number; name: string; up: (db: Database.Database) => voi
         db.prepare("UPDATE settings SET value = ? WHERE key = 'ingest_token' AND org_id = ?").run(createHash("sha256").update(r.value).digest("hex"), r.org_id);
       }
       db.exec("CREATE INDEX IF NOT EXISTS settings_key_value ON settings(key, value)");
+    },
+  },
+  {
+    id: 15,
+    name: "conversations remember each provider's own chat",
+    up: (db) => {
+      ensureColumn(db, "conversations", "threads", "threads TEXT");
     },
   },
 ];
