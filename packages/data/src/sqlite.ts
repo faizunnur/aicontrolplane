@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS platform_state (
   session_status TEXT NOT NULL DEFAULT 'unknown',
   last_sync_at TEXT,
   last_ok_at TEXT,
+  last_login_at TEXT,
   last_error TEXT,
   screenshot_path TEXT,
   meta TEXT
@@ -669,6 +670,16 @@ const MIGRATIONS: { id: number; name: string; up: (db: Database.Database) => voi
     name: "conversations remember each provider's own chat",
     up: (db) => {
       ensureColumn(db, "conversations", "threads", "threads TEXT");
+    },
+  },
+  {
+    id: 16,
+    name: "platform state remembers when it was last seen signed in",
+    up: (db) => {
+      ensureColumn(db, "platform_state", "last_login_at", "last_login_at TEXT");
+      // Providers that are signed in right now have plainly been signed in; backfill so
+      // their next needs_login reads "signed out", not "not connected".
+      db.exec("UPDATE platform_state SET last_login_at = COALESCE(last_ok_at, last_sync_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE session_status = 'logged_in' AND last_login_at IS NULL");
     },
   },
 ];

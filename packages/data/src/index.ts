@@ -961,18 +961,21 @@ export async function markAllEventsRead(): Promise<number> {
 
 export async function getPlatformState(platform: string): Promise<PlatformState> {
   const row = await q.get<PlatformState>("SELECT * FROM platform_state WHERE platform = ? AND org_id = ?", [platform, oid()]);
-  return row ?? { platform, session_status: "unknown", last_sync_at: null, last_ok_at: null, last_error: null, screenshot_path: null, meta: null };
+  return row ?? { platform, session_status: "unknown", last_sync_at: null, last_ok_at: null, last_login_at: null, last_error: null, screenshot_path: null, meta: null };
 }
 
 export async function setPlatformState(platform: string, patch: Partial<Omit<PlatformState, "platform">>): Promise<PlatformState> {
   const cur = await getPlatformState(platform);
   const next: PlatformState = { ...cur, ...patch, platform };
+  // The one fact every status writer records for free: when the session was last SEEN alive.
+  // "Never" is what separates a provider that was disconnected from one never connected.
+  if (next.session_status === "logged_in") next.last_login_at = now();
   await q.run(
-    `INSERT INTO platform_state (org_id, platform, session_status, last_sync_at, last_ok_at, last_error, screenshot_path, meta)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO platform_state (org_id, platform, session_status, last_sync_at, last_ok_at, last_login_at, last_error, screenshot_path, meta)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(org_id, platform) DO UPDATE SET session_status=excluded.session_status, last_sync_at=excluded.last_sync_at,
-       last_ok_at=excluded.last_ok_at, last_error=excluded.last_error, screenshot_path=excluded.screenshot_path, meta=excluded.meta`,
-    [oid(), platform, next.session_status, next.last_sync_at, next.last_ok_at, next.last_error, next.screenshot_path, next.meta],
+       last_ok_at=excluded.last_ok_at, last_login_at=excluded.last_login_at, last_error=excluded.last_error, screenshot_path=excluded.screenshot_path, meta=excluded.meta`,
+    [oid(), platform, next.session_status, next.last_sync_at, next.last_ok_at, next.last_login_at, next.last_error, next.screenshot_path, next.meta],
   );
   notify("platform:row", platform);
   return next;

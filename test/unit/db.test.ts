@@ -10,7 +10,7 @@ describe("schema", () => {
   it("applies every migration to a fresh database", async () => {
     const applied = (await db.schemaVersion()).map((m) => m.id);
     // SQLite replays its historical chain; Postgres starts from its own baseline (id 100+).
-    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    if (db.dataDriver() === "sqlite") assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     else assert.ok(applied.includes(100), "postgres baseline applied");
     if (db.db) {
       const tables = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
@@ -66,6 +66,24 @@ describe("conversations and messages", () => {
     // Junk in the column never breaks a send: it reads as "no thread yet".
     assert.deepEqual(db.conversationThreads({ threads: "not json" }), {});
     assert.deepEqual(db.conversationThreads({ threads: '{"claude":"javascript:alert(1)"}' }), {}, "only http(s) urls come back");
+  });
+});
+
+describe("platform state", () => {
+  it("tells a never-connected provider apart from a signed-out one", async () => {
+    const { shownSessionStatus } = await import("../../packages/core/src/index.js");
+    // The scheduler's first look at a fresh workspace finds a login page: needs_login, but
+    // nothing was ever lost — the UI must say "not connected", not "signed out".
+    const fresh = await db.setPlatformState("never-yet", { session_status: "needs_login" });
+    assert.equal(fresh.last_login_at, null);
+    assert.equal(shownSessionStatus(fresh), "unknown");
+    // Once a session was SEEN alive, losing it is genuinely "signed out".
+    const alive = await db.setPlatformState("never-yet", { session_status: "logged_in" });
+    assert.ok(alive.last_login_at, "a logged_in write stamps when the session was last seen");
+    const lost = await db.setPlatformState("never-yet", { session_status: "needs_login" });
+    assert.ok(lost.last_login_at, "the stamp survives the session dying");
+    assert.equal(shownSessionStatus(lost), "needs_login");
+    assert.equal(shownSessionStatus(await db.getPlatformState("never-yet")), "needs_login");
   });
 });
 

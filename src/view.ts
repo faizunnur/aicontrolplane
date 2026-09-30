@@ -3,7 +3,7 @@ import { foldSteps, getTask, getPlatformState, listTasks, runEvents, type Messag
 import { describeMode, resolveMode } from "./deliver.js";
 import { activePairing } from "./pairing.js";
 import { getProvider } from "./providers/registry.js";
-import type { PlatformConfig } from "../packages/core/src/index.js";
+import { shownSessionStatus, type PlatformConfig } from "../packages/core/src/index.js";
 
 /* Shapes the UI renders. Shared by the REST routes and the live stream so both agree. */
 
@@ -38,7 +38,10 @@ export type ExpandedMessage = Awaited<ReturnType<typeof expandMessage>>;
 export async function connectionCard(p: PlatformConfig) {
   const s = await getPlatformState(p.id);
   const tasks = await listTasks({ platform: p.id });
-  const status = !p.appUrl ? "none" : s.session_status;
+  // A provider this workspace was never signed in to is "not connected", not "signed out":
+  // the scheduler's first look at its site finds a login page and records needs_login, but
+  // there was no session to lose, and "Signed out" would claim a sign-in that never happened.
+  const status = !p.appUrl ? "none" : shownSessionStatus(s);
   const adapter = getProvider(p.id);
   return {
     id: p.id,

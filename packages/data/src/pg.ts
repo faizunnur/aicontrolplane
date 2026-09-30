@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS platform_state (
   session_status TEXT NOT NULL DEFAULT 'unknown',
   last_sync_at TEXT,
   last_ok_at TEXT,
+  last_login_at TEXT,
   last_error TEXT,
   screenshot_path TEXT,
   meta TEXT
@@ -548,6 +549,17 @@ PG_MIGRATIONS.push({
   name: "conversations remember each provider's own chat",
   up: async (d) => {
     await d.exec("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS threads TEXT");
+  },
+});
+
+PG_MIGRATIONS.push({
+  id: 110,
+  name: "platform state remembers when it was last seen signed in",
+  up: async (d) => {
+    await d.exec("ALTER TABLE platform_state ADD COLUMN IF NOT EXISTS last_login_at TEXT");
+    // Providers that are signed in right now have plainly been signed in; backfill so
+    // their next needs_login reads "signed out", not "not connected".
+    await d.exec("UPDATE platform_state SET last_login_at = COALESCE(last_ok_at, last_sync_at, to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) WHERE session_status = 'logged_in' AND last_login_at IS NULL");
   },
 });
 

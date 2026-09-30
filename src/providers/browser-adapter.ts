@@ -1,6 +1,6 @@
 import { browser } from "../browser/manager.js";
 import { getPlatformState, getSettingCached } from "../db.js";
-import type { PlatformConfig, SessionStatus } from "../../packages/core/src/index.js";
+import { shownSessionStatus, type PlatformConfig, type SessionStatus } from "../../packages/core/src/index.js";
 import { runConfiguredAction } from "./browser/actions.js";
 import { checkSignIn, sendThroughBrowser } from "./browser/chat.js";
 import { detectChallenge } from "./browser/login.js";
@@ -115,7 +115,7 @@ export class BrowserProviderAdapter implements ProviderAdapter {
 
   async connectionStatus(): Promise<ConnectionStatus> {
     const s = await getPlatformState(this.id);
-    return { status: this.cfg().appUrl ? s.session_status : "none", lastCheckedAt: s.last_sync_at, lastError: s.last_error };
+    return { status: this.cfg().appUrl ? shownSessionStatus(s) : "none", lastCheckedAt: s.last_sync_at, lastError: s.last_error };
   }
 
   async connect(): Promise<ConnectResult> {

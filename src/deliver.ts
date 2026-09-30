@@ -154,7 +154,8 @@ async function performChatSend(runId: number, track: RunTracker, messageId: numb
       else await track.fail("connect", status === "needs_login" ? "signed out" : "not reachable");
     }
     if (status !== "logged_in") {
-      const error = status === "needs_login" ? `${p.name} needs you to sign in again.` : `${p.name} is not connected yet. Sign in first.`;
+      // "Sign in AGAIN" only when there ever was a sign-in; a never-connected AI just isn't connected.
+      const error = status === "needs_login" && (await getPlatformState(p.id)).last_login_at ? `${p.name} needs you to sign in again.` : `${p.name} is not connected yet. Sign in first.`;
       await addEvent({ platform: p.id, kind: "message", title: `Could not send to ${p.name}`, body: error, dedupe_key: `message_failed:${msg.id}` });
       return fail(error);
     }

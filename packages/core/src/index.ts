@@ -273,9 +273,21 @@ export interface PlatformState {
   session_status: SessionStatus;
   last_sync_at: string | null;
   last_ok_at: string | null;
+  /** When this workspace was last SEEN signed in. Null means it never was: a needs_login found then is "not connected", not "signed out". */
+  last_login_at: string | null;
   last_error: string | null;
   screenshot_path: string | null;
   meta: string | null;
+}
+
+/**
+ * The session status to SHOW for a platform state. needs_login on a provider this workspace
+ * was never signed in to reads as "unknown" (not connected): there was no session to lose,
+ * so "signed out" would claim a sign-in that never happened. Delivery and sync keep reading
+ * the raw session_status; only the telling changes.
+ */
+export function shownSessionStatus(s: Pick<PlatformState, "session_status" | "last_login_at">): SessionStatus {
+  return s.session_status === "needs_login" && !s.last_login_at ? "unknown" : s.session_status;
 }
 
 export interface ActionStep {

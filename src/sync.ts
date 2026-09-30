@@ -165,7 +165,9 @@ export async function syncProvider(adapter: ProviderAdapter, ctx: ExecutionConte
       });
   await finishSyncLog(logId, { ok: result.ok, message: result.message, agents: result.agents, runs: result.runs, captures: result.captures });
 
-  if (result.sessionStatus === "needs_login" && before.session_status !== "needs_login") {
+  // Only a session that existed can be lost: a workspace that never signed in to this
+  // provider gets no "login required" alarm from the scheduler's routine look at its site.
+  if (result.sessionStatus === "needs_login" && before.session_status !== "needs_login" && before.last_login_at) {
     const how = await getSetting(`signin_mode:${p.id}`) === "local" ? `Open its menu in the sidebar and choose "Connect from this computer".` : "Sign in again from the sidebar.";
     await addEvent({ platform: p.id, kind: "session", title: `${p.name}: login required`, body: `The browser session for ${p.name} is no longer authenticated. ${how}`, dedupe_key: `session:${p.id}:${ts.slice(0, 10)}` });
     void sendAlert({ key: `session:${p.id}`, title: `${p.name} needs login`, body: "Open the control plane and sign in again." });
