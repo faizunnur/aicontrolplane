@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { chromium, type BrowserContext, type Cookie, type Page } from "playwright";
@@ -131,6 +132,9 @@ export interface BusyTask {
   since: string;
 }
 
+/** This process's snapshot epoch (see BrowserSnapshot.epoch). */
+export const SNAPSHOT_EPOCH = randomBytes(6).toString("hex");
+
 export interface BrowserSnapshot {
   enabled: boolean;
   running: boolean;
@@ -143,6 +147,8 @@ export interface BrowserSnapshot {
   signIn: DesktopSignIn | null;
   /** Rises with every snapshot. The page receives state over two channels (event stream, live-view socket) and drops any snapshot older than the one it has. */
   seq: number;
+  /** Which process made it (random per boot). Seq only orders snapshots of the same epoch: two processes, or one restarted, count independently. */
+  epoch: string;
 }
 
 /**
@@ -193,7 +199,7 @@ class BrowserManager {
       if (page.isClosed()) continue;
       pages.push({ platform, url: page.url(), title: this.titles.get(platform) ?? "" });
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages, signIn: this.desktop, seq: ++this.snapshotSeq };
+    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.activePlatform, busy: this.busyTask, pages, signIn: this.desktop, seq: ++this.snapshotSeq, epoch: SNAPSHOT_EPOCH };
   }
   private snapshotSeq = 0;
 

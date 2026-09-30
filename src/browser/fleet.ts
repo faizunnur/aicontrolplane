@@ -10,7 +10,7 @@ import { logger } from "../logger.js";
 import { browserContextsOpen, browserContextWaiters } from "../metrics.js";
 import { getPlatform } from "../platforms.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
-import { GPU_ARGS, launchWithSandboxFallback, resolveExecutable, sandboxArgs, stopChild, type BrowserSnapshot, type BusyTask, type DesktopSignIn } from "./manager.js";
+import { GPU_ARGS, launchWithSandboxFallback, resolveExecutable, sandboxArgs, SNAPSHOT_EPOCH, stopChild, type BrowserSnapshot, type BusyTask, type DesktopSignIn } from "./manager.js";
 import { loadConnectionState, saveConnectionState, sliceStateForPlatform, type StorageStateLike } from "./session-store.js";
 
 const DESKTOP_SIGNIN_TIMEOUT_MS = Math.max(1, Number(process.env.DESKTOP_SIGNIN_TIMEOUT_MIN) || 10) * 60_000;
@@ -124,7 +124,7 @@ export class FleetManager {
       if (c.org !== org || !c.page || c.page.isClosed()) continue;
       pages.push({ platform: c.platform, url: c.page.url(), title: c.title });
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.active, busy: this.busy, pages, signIn: this.signIn, seq: ++this.snapshotSeq };
+    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.active, busy: this.busy, pages, signIn: this.signIn, seq: ++this.snapshotSeq, epoch: SNAPSHOT_EPOCH };
   }
   private announce() {
     browserContextsOpen.set(this.connections.size);

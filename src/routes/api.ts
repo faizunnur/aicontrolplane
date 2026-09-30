@@ -6,7 +6,7 @@ import { availableActions } from "../actions.js";
 import { ensureTaskAgent } from "../agents.js";
 import { alertsConfigured, sendAlert } from "../alerts.js";
 import { approvalMode, decide, decideForMessage, listPolicies, pendingApprovals, requestExternalApproval, setApprovalMode, setPolicy } from "../policy.js";
-import { liveViewers } from "../browser/live.js";
+import { browserStateFor, liveViewers } from "../browser/live.js";
 import { browser, storageInfo, vncState } from "../browser/manager.js";
 import { config } from "../config.js";
 import {
@@ -75,6 +75,7 @@ import {
   setUserVerified,
   systemScope,
   withOrg,
+  currentOrgId,
 } from "../db.js";
 import { streamClients, streamHandler } from "../live.js";
 import { routeMessage } from "../router.js";
@@ -1024,7 +1025,7 @@ api.get("/home", async (req, res) => {
     user: userView(user),
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
     storage: await storageInfo(),
-    browser: await browser.status(),
+    browser: await browserStateFor(currentOrgId() ?? 1),
     scheduler: schedulerStatus(),
     alerts: { configured: alertsConfigured() },
     email: emailStatus(),
@@ -1239,7 +1240,7 @@ api.get("/diagnostics", async (_req, res) => {
     }
     return { id: p.id, name: p.name, syncable: !!p.tasksUrl, state: { ...s, meta: { finalUrl: meta.finalUrl, title: meta.title, snapshotAt: meta.snapshotAt } }, hasScreenshot: !!(s.screenshot_path && fs.existsSync(s.screenshot_path)), tasks: (await listTasks({ platform: p.id })).length, actions: availableActions(p) };
   });
-  res.json({ counts: { ...await overviewCounts(), openMessages: await openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: await storageInfo(), scheduler: schedulerStatus(), browser: await browser.status(), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, publicUrlSource: config.publicUrlSource, schema: await schemaVersion() });
+  res.json({ counts: { ...await overviewCounts(), openMessages: await openMessageCount() }, platforms: cards, router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold }, storage: await storageInfo(), scheduler: schedulerStatus(), browser: await browserStateFor(currentOrgId() ?? 1), email: emailStatus(), alerts: { configured: alertsConfigured() }, publicUrl: config.publicUrl, publicUrlSource: config.publicUrlSource, schema: await schemaVersion() });
 });
 
 /* ---------- agents (registry) ---------- */
@@ -1488,7 +1489,7 @@ api.get("/browser", async (_req, res) => {
   const domains = Object.values(getPlatforms())
     .map((p) => p.cookieDomain)
     .filter(Boolean);
-  res.json({ ...(await browser.status()), vnc: { connections: vncState.connections }, storage: await storageInfo(), cookies: await browser.cookieCounts(domains) });
+  res.json({ ...(await browserStateFor(currentOrgId() ?? 1)), vnc: { connections: vncState.connections }, storage: await storageInfo(), cookies: await browser.cookieCounts(domains) });
 });
 api.post("/browser/backup", async (_req, res) => {
   if (!browser.enabled) return bad(res, "browser is disabled", 409);

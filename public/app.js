@@ -390,7 +390,7 @@
     });
     es.addEventListener("browser", (e) => {
       const next = JSON.parse(e.data);
-      if (browserState && typeof next.seq === "number" && typeof browserState.seq === "number" && next.seq < browserState.seq) return; // older than what the live-view socket already delivered
+      if (browserState && next.epoch === browserState.epoch && typeof next.seq === "number" && typeof browserState.seq === "number" && next.seq < browserState.seq) return; // older than what the live-view socket already delivered
       const before = browserState?.signIn;
       browserState = next;
       live.state = next;

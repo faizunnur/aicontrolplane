@@ -70,7 +70,7 @@ const clients = new Set<Client>();
  * own workspace's; a workspace the worker has said nothing about sees an empty one.
  */
 const remoteSnapshots = new Map<number, BrowserSnapshot>();
-const EMPTY_SNAPSHOT: BrowserSnapshot = { seq: 0, active: null, pages: [], busy: null, signIn: null, enabled: true, running: false, headless: true };
+const EMPTY_SNAPSHOT: BrowserSnapshot = { seq: 0, epoch: "none", active: null, pages: [], busy: null, signIn: null, enabled: true, running: false, headless: true };
 
 let deliveringRemoteState = false;
 bus.on("browser", (snap: BrowserSnapshot, _id?: number, org?: number) => {
@@ -97,6 +97,17 @@ function acceptRemoteSnapshot(org: number, snap: BrowserSnapshot) {
     sendJson(c, { t: "state", browser: snap });
     if (c.follow && targetOf(c) !== c.attached) void attach(c);
   }
+}
+
+/**
+ * The browser state a workspace's dashboard should see. On an api-only process the local
+ * manager is a browser that never runs (and may carry this service's BROWSER_ENABLED=false):
+ * reporting it would paint "the browser is off" over a perfectly healthy browser service.
+ * So split mode answers with what the browser service last said instead.
+ */
+export async function browserStateFor(org: number): Promise<BrowserSnapshot> {
+  if (localBrowser) return withOrg(org, () => browser.status());
+  return remoteSnapshots.get(org) ?? EMPTY_SNAPSHOT;
 }
 
 export function liveViewers() {
