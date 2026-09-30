@@ -604,7 +604,8 @@
       const modeLabel = c.signInMode === "desktop" ? " (cloud desktop)" : c.signInMode === "local" ? " (from this computer)" : "";
       const alternatives = [
         c.signInMode !== "live" ? `<button class="btn small" data-connect="${c.id}" data-mode="live">${icon("eye", "sm")} Sign in in the live view</button>` : "",
-        c.signInMode !== "desktop" ? `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>` : "",
+        // The cloud desktop is one screen with one owner workspace; nobody else is offered it.
+        c.signInMode !== "desktop" && c.canDesktop ? `<button class="btn small" data-connect="${c.id}" data-mode="desktop">${icon("panel", "sm")} Sign in on the cloud desktop</button>` : "",
         c.signInMode !== "local" ? `<button class="btn small" data-connect="${c.id}" data-mode="local">${icon("terminal", "sm")} Connect from this computer</button>` : "",
       ].join("");
       const signInButtons = signingHere

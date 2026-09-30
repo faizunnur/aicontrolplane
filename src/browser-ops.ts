@@ -1,6 +1,6 @@
 import { browser } from "./browser/manager.js";
 import { config } from "./config.js";
-import { createBrowserOp, finishBrowserOp, getBrowserOp } from "./db.js";
+import { createBrowserOp, currentOrgId, finishBrowserOp, getBrowserOp } from "./db.js";
 import { logger } from "./logger.js";
 import { getPlatform, refreshPlatformsNow } from "./platforms.js";
 import { requireProvider } from "./providers/registry.js";
@@ -19,6 +19,13 @@ const log = logger("browser-ops");
 */
 
 type OpHandler = (payload: never) => Promise<unknown>;
+
+/**
+ * Whether the CALLING workspace owns the physical desktop screen. Ops run in the caller's
+ * workspace scope — the request's on a browser-holding process, the adopted op row's on a
+ * worker — so this is the org the answer is for, not the process's.
+ */
+const ownsDesktop = () => (currentOrgId() ?? 1) === browser.vncOwnerOrg();
 
 /** Resolve a provider, reading the store once more if this process has not seen it yet. */
 async function freshProvider(platformId: string) {
@@ -58,16 +65,29 @@ const OPS = {
     return { file: await screenshotProvider(p) };
   },
   "desktop.start": async ({ platformId }: { platformId: string }) => {
+    // The desktop is ONE physical screen, and the VNC route shows it only to its owner
+    // workspace. Starting a sign-in another workspace could never watch or finish would
+    // just park an orphaned window on someone else's desktop.
+    if (!ownsDesktop()) throw new BrowserOpError("the cloud desktop belongs to another workspace — sign in in the live view, or connect from this computer", 403);
     const p = await freshPlatform(platformId);
     return browser.startDesktopSignIn(p.id, p.name, p.appUrl);
   },
+  // finish/cancel stay open to every workspace: after the start gate only the owner can have
+  // a desktop sign-in, and an orphan from before the gate must stay cancellable by whoever
+  // sees its buttons.
   "desktop.finish": async ({ platformId }: { platformId: string }) => {
     const wasDesktop = await browser.finishDesktopSignIn();
     const status = await (await freshProvider(platformId)).checkAuth();
     return { wasDesktop, status };
   },
   "desktop.cancel": async (_p: Record<string, never>) => ({ ok: await browser.cancelDesktopSignIn() }),
-  "desktop.state": async (_p: Record<string, never>) => ({ signIn: browser.signIn ?? null, canDesktop: browser.canDesktopSignIn(), enabled: browser.enabled }),
+  "desktop.state": async (_p: Record<string, never>) => ({
+    // Another workspace's desktop sign-in is not this one's business — and must not block
+    // its pairing flow or paint its UI with a sign-in it cannot see.
+    signIn: ownsDesktop() ? (browser.signIn ?? null) : null,
+    canDesktop: ownsDesktop() ? browser.canDesktopSignIn() : { ok: false, reason: "the cloud desktop belongs to another workspace" },
+    enabled: browser.enabled,
+  }),
   "sync.provider": async ({ platformId }: { platformId: string }) => {
     const { syncProvider } = await import("./sync.js");
     return syncProvider(await freshProvider(platformId));
@@ -80,7 +100,8 @@ const OPS = {
 
 export interface DesktopState {
   signIn: { platform: string; name?: string } | null;
-  canDesktop: boolean;
+  /** Whether the CALLING workspace may sign in on the desktop, with the reason when it cannot. */
+  canDesktop: { ok: boolean; reason?: string };
   enabled: boolean;
 }
 
@@ -89,18 +110,21 @@ export function browserRuntimeAvailable(): boolean {
   return hasLocalBrowser() ? browser.enabled : true;
 }
 
-let desktopCache: { at: number; v: DesktopState } | null = null;
+/** Per workspace: the answer depends on who asks (only the desktop's owner can use it). */
+const desktopCache = new Map<number, { at: number; v: DesktopState }>();
 /** The desktop sign-in state, wherever the browser lives — cached briefly, degrading gracefully. */
 export async function desktopState(): Promise<DesktopState> {
   if (hasLocalBrowser()) return (await performBrowserOp("desktop.state", {})) as DesktopState;
-  if (desktopCache && Date.now() - desktopCache.at < 5_000) return desktopCache.v;
+  const org = currentOrgId() ?? 1;
+  const cached = desktopCache.get(org);
+  if (cached && Date.now() - cached.at < 5_000) return cached.v;
   try {
     const v = await callBrowserOp<DesktopState>("desktop.state", {}, 10_000);
-    desktopCache = { at: Date.now(), v };
+    desktopCache.set(org, { at: Date.now(), v });
     return v;
   } catch (err) {
     log.debug("desktop state unavailable", err);
-    return { signIn: null, canDesktop: false, enabled: true };
+    return { signIn: null, canDesktop: { ok: false, reason: "no browser worker answered" }, enabled: true };
   }
 }
 

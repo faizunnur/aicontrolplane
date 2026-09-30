@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { foldSteps, getTask, getPlatformState, listTasks, runEvents, type MessageWithTask } from "./db.js";
+import { desktopState } from "./browser-ops.js";
 import { describeMode, resolveMode } from "./deliver.js";
 import { activePairing } from "./pairing.js";
 import { getProvider } from "./providers/registry.js";
@@ -53,6 +54,8 @@ export async function connectionCard(p: PlatformConfig) {
     canChat: adapter ? adapter.supports("chat") : !!p.composerSelector,
     canSync: adapter ? adapter.supports("listTasks") : !!p.tasksUrl,
     signInMode: (await adapter?.preferredSignIn()) ?? "live",
+    /** Whether THIS workspace may use the cloud desktop (it is one screen, owned by one workspace). */
+    canDesktop: p.appUrl ? (await desktopState()).canDesktop.ok : false,
     /** A sign-in from the user's computer in progress (or just finished), if any. */
     pairing: p.appUrl ? await activePairing(p.id) : null,
     builtin: adapter?.builtin ?? false,

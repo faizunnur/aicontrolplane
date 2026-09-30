@@ -1032,8 +1032,10 @@ api.get("/home", async (req, res) => {
     // The overview already carries the attention list and the recent runs; the page reads
     // those from it, so /home no longer refetches the same rows a second time.
     overview: await overview(),
-    // So a reloaded page can pick up a desktop sign-in that is still in progress.
-    signInOptions: { desktop: browser.canDesktopSignIn(), vnc: { available: await vncAvailable(), url: VNC_PATH } },
+    // So a reloaded page can pick up a desktop sign-in that is still in progress. Through
+    // desktopState, not the local manager: the answer is per workspace (desktop ownership),
+    // and on an api process the local manager holds no browser anyway.
+    signInOptions: { desktop: (await desktopState()).canDesktop, vnc: { available: await vncAvailable(), url: VNC_PATH } },
     user: userView(user),
     router: { llm: config.router.llm, provider: config.router.provider, model: config.router.model, autoThreshold: config.router.autoThreshold },
     storage: await storageInfo(),
