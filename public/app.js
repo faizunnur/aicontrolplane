@@ -922,7 +922,7 @@
       ribbon.hidden = live.meta?.platform !== signingIn.platform;
       frame.hidden = true;
       $("#viewport").classList.remove("desktop");
-      $("#signin-text").textContent = signingIn.challenge ? `${name}'s sign-in page has a bot check that may refuse a browser in a datacenter. Sign in above if it lets you; otherwise connect from this computer. When you can see your chats, press` : "Sign in above, exactly as you normally do. When you can see your chats, press";
+      $("#signin-text").textContent = signingIn.challenge ? `${name}'s sign-in page has a bot check that may refuse a browser in a datacenter. Sign in above if it lets you; otherwise connect from this computer. When you can see your chats, press “I'm signed in”.` : "Sign in above, exactly as you normally do. When you can see your chats, press “I'm signed in”.";
       $("#btn-signin-desktop").hidden = !signingIn.desktopOk;
       $("#btn-signin-local").hidden = !(signingIn.challenge && signingIn.localOk);
     }
