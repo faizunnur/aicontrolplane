@@ -29,28 +29,9 @@ const DEFAULT_ID = "default"; // one shared browser today; per provider-connecti
 
 const legacyFile = () => path.join(config.dataDir, "sessions.json");
 
-/** The shape Playwright's storageState() returns and newContext({storageState}) accepts. */
-export interface StorageStateLike {
-  cookies?: { name: string; value: string; domain: string; [k: string]: unknown }[];
-  origins?: { origin: string; [k: string]: unknown }[];
-}
-
-/** One provider's slice of a whole-profile storageState, by its session domains. */
-export function sliceStateForPlatform(state: StorageStateLike, p: { cookieDomain: string; appUrl: string; chatUrl: string; tasksUrl: string; sessionDomains: string[] }): StorageStateLike {
-  const domains = sessionDomains(p);
-  const originMatches = (origin: string) => {
-    try {
-      const host = new URL(origin).hostname.toLowerCase();
-      return domains.some((d) => host === d || host.endsWith(`.${d}`));
-    } catch {
-      return false;
-    }
-  };
-  return {
-    cookies: (state.cookies ?? []).filter((c) => c && c.name && c.domain && cookieMatchesDomain(c.domain, domains)),
-    origins: (state.origins ?? []).filter((o) => o && originMatches(o.origin)),
-  };
-}
+// The slice helper moved next to the domain rules (no database behind them); re-exported for existing importers.
+import { sliceStateForPlatform, type StorageStateLike } from "../providers/browser/domains.js";
+export { sliceStateForPlatform, type StorageStateLike };
 
 /** One provider's sealed session for the ambient workspace. */
 export async function saveConnectionState(platformId: string, stateJson: string): Promise<void> {

@@ -2,9 +2,9 @@ import type { Page, Response } from "playwright";
 import { browser } from "../../browser/manager.js";
 import { cleanError, isStall, PageController } from "../../browser/page.js";
 import { config } from "../../config.js";
-import { addCapture, pruneCaptures } from "../../db.js";
+import { host } from "../../browser/host.js";
 import { logger } from "../../logger.js";
-import { compilePatterns } from "../../platforms.js";
+import { compilePatterns } from "./patterns.js";
 import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ExecutionContext, TaskListResult } from "../types.js";
 import { detectChallenge, detectLoginState } from "./login.js";
@@ -126,8 +126,8 @@ async function collectOnce(p: PlatformConfig, outputUrlFor: OutputUrlHook, ctx: 
   await ctx.track?.start("capture", "Reading what the page loaded");
   const screenshotPath = await pc.screenshot(page);
   const snapshot = await textSnapshot(p, page);
-  for (const c of captured) await addCapture({ platform: p.id, url: c.url, method: c.method, status: c.status, content_type: c.contentType, body: c.body });
-  await pruneCaptures(p.id);
+  for (const c of captured) await host().addCapture({ platform: p.id, url: c.url, method: c.method, status: c.status, content_type: c.contentType, body: c.body });
+  await host().pruneCaptures(p.id);
 
   const norm = sessionStatus === "logged_in" ? normalizePayloads(p, captured.map((c) => tryParse(c.body)).filter((v) => v !== undefined), { outputUrlFor }) : { tasks: [], runs: [] };
   await ctx.track?.done("capture", `${captured.length} payloads, ${norm.tasks.length} tasks, ${norm.runs.length} runs`);

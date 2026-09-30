@@ -335,3 +335,11 @@ export interface PlatformConfig {
   /** Hidden from the Connect list (for built-ins the user removed). */
   hidden: boolean;
 }
+
+/** Thrown inside a run when someone pressed Stop; callers report it as cancelled, never as failed. */
+export class CancelledError extends Error {
+  constructor(message = "You stopped it.") {
+    super(message);
+    this.name = "CancelledError";
+  }
+}

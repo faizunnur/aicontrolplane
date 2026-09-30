@@ -1,9 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
 import type { Page } from "playwright";
-import { config } from "../config.js";
-import { currentOrgId, setPlatformState } from "../db.js";
 import { logger } from "../logger.js";
+import { host } from "./host.js";
 import { browser } from "./manager.js";
 
 const log = logger("page");
@@ -73,13 +70,9 @@ export class PageController {
   async screenshot(page?: Page): Promise<string | null> {
     try {
       const p = page ?? (await this.current());
-      // One file per (workspace, provider): two workspaces' screenshots must never share a path.
-      const dir = path.join(config.screenshotDir, String(currentOrgId() ?? 1));
-      fs.mkdirSync(dir, { recursive: true });
-      const file = path.join(dir, `${this.id}.png`);
-      await p.screenshot({ path: file, fullPage: false, timeout: 15_000 });
-      await setPlatformState(this.id, { screenshot_path: file });
-      return file;
+      // The host decides where it lives (one file per workspace and provider in the cloud) and remembers it.
+      const png = await p.screenshot({ fullPage: false, timeout: 15_000 });
+      return await host().saveScreenshot(this.id, png);
     } catch (err) {
       log.warn(`screenshot failed for ${this.id}`, err);
       return null;

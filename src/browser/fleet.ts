@@ -5,13 +5,12 @@ import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Cookie, type Page } from "playwright";
 import { bus } from "../bus.js";
 import { config } from "../config.js";
-import { claimProvider, currentOrgId, releaseProviderClaim, renewProviderClaim, withOrg } from "../db.js";
+import { currentOrgId, withOrg } from "../../packages/core/src/scope.js";
 import { logger } from "../logger.js";
 import { browserContextsOpen, browserContextWaiters } from "../metrics.js";
-import { getPlatform } from "../platforms.js";
-import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
+import { host as connectorHost } from "./host.js";
+import { cookieMatchesDomain, sliceStateForPlatform, type StoredCookie, type StoredOrigin, type StorageStateLike } from "../providers/browser/domains.js";
 import { GPU_ARGS, launchWithSandboxFallback, resolveExecutable, sandboxArgs, SNAPSHOT_EPOCH, stopChild, type BrowserSnapshot, type BusyTask, type DesktopSignIn } from "./manager.js";
-import { loadConnectionState, saveConnectionState, sliceStateForPlatform, type StorageStateLike } from "./session-store.js";
 
 const DESKTOP_SIGNIN_TIMEOUT_MS = Math.max(1, Number(process.env.DESKTOP_SIGNIN_TIMEOUT_MIN) || 10) * 60_000;
 
@@ -164,7 +163,7 @@ export class FleetManager {
       try {
         // Seed the throw-away profile with this workspace's cookies for the provider.
         fs.mkdirSync(tmpDir, { recursive: true });
-        const raw = await withOrg(org, () => loadConnectionState(platformId));
+        const raw = await withOrg(org, () => connectorHost().loadSessionState(platformId));
         if (raw) {
           const seedCtx = await launchWithSandboxFallback((sandbox) => chromium.launchPersistentContext(tmpDir, { headless: true, args: [...sandbox, "--disable-dev-shm-usage", "--password-store=basic"] }));
           try {
@@ -217,9 +216,9 @@ export class FleetManager {
           const outCtx = await launchWithSandboxFallback((sandbox) => chromium.launchPersistentContext(tmpDir, { headless: true, args: [...sandbox, "--disable-dev-shm-usage", "--password-store=basic"] }));
           try {
             const state2 = (await outCtx.storageState()) as StorageStateLike;
-            const p = withOrg(org, () => getPlatform(platformId));
+            const p = await withOrg(org, () => connectorHost().platform(platformId));
             const slice = p ? sliceStateForPlatform(state2, p) : state2;
-            await withOrg(org, () => saveConnectionState(platformId, JSON.stringify(slice)));
+            await withOrg(org, () => connectorHost().saveSessionState(JSON.stringify(slice), platformId));
           } finally {
             await outCtx.close().catch(() => undefined);
           }
@@ -367,7 +366,7 @@ export class FleetManager {
     }
     const b = await this.host();
     await this.acquireSlot(org);
-    const raw = await withOrg(org, () => loadConnectionState(platform));
+    const raw = await withOrg(org, () => connectorHost().loadSessionState(platform));
     let storageState: StorageStateLike | undefined;
     try {
       storageState = raw ? (JSON.parse(raw) as StorageStateLike) : undefined;
@@ -394,12 +393,12 @@ export class FleetManager {
 
   /** Take (or keep) the claim for this job, and keep it renewed while the connection stays open. */
   private async acquireClaim(org: number, platform: string): Promise<void> {
-    const ok = await withOrg(org, () => claimProvider(platform, claimOwner, CLAIM_TTL_MS));
+    const ok = await withOrg(org, () => connectorHost().claimProvider(platform, claimOwner, CLAIM_TTL_MS));
     if (!ok) throw new ProviderBusyError(platform);
     const key = keyOf(org, platform);
     if (this.claimRenewers.has(key)) return;
     const timer = setInterval(() => {
-      void withOrg(org, () => renewProviderClaim(platform, claimOwner, CLAIM_TTL_MS))
+      void withOrg(org, () => connectorHost().renewProviderClaim(platform, claimOwner, CLAIM_TTL_MS))
         .then((held) => {
           if (!held) {
             // Only possible after the TTL lapsed (a long stall); the next job re-takes it.
@@ -422,7 +421,7 @@ export class FleetManager {
   /** Give the claim back — when the connection it protected is gone. */
   private async releaseClaim(org: number, platform: string): Promise<void> {
     this.stopClaimRenewal(keyOf(org, platform));
-    await withOrg(org, () => releaseProviderClaim(platform, claimOwner)).catch(() => undefined);
+    await withOrg(org, () => connectorHost().releaseProviderClaim(platform, claimOwner)).catch(() => undefined);
   }
 
   /** Export, seal and close a connection. Its session survives; the context's RAM does not. */
@@ -433,7 +432,7 @@ export class FleetManager {
     this.connections.delete(key);
     try {
       const state = await conn.ctx.storageState({ indexedDB: true }).catch(() => conn.ctx.storageState());
-      await withOrg(conn.org, () => saveConnectionState(conn.platform, JSON.stringify(state)));
+      await withOrg(conn.org, () => connectorHost().saveSessionState(JSON.stringify(state), conn.platform));
     } catch (err) {
       log.warn(`sealing ${key} failed (${why}); its last saved session stands`, err);
     }
@@ -582,7 +581,7 @@ export class FleetManager {
     const cookies: Cookie[] = [];
     const origins: StoredOrigin[] = [];
     for (const p of visiblePlatforms()) {
-      const raw = await loadConnectionState(p.id);
+      const raw = await connectorHost().loadSessionState(p.id);
       if (!raw) continue;
       try {
         const s = JSON.parse(raw) as StorageStateLike;
@@ -610,7 +609,7 @@ export class FleetManager {
       await this.releaseClaim(org, p.id);
       this.releaseSlot();
     } else {
-      const raw = await loadConnectionState(p.id);
+      const raw = await connectorHost().loadSessionState(p.id);
       if (raw) {
         try {
           cleared = ((JSON.parse(raw) as StorageStateLike).cookies ?? []).length;
@@ -623,7 +622,7 @@ export class FleetManager {
       cookies: state.cookies as unknown as StorageStateLike["cookies"],
       origins: state.origins.map((o) => ({ origin: o.origin, localStorage: o.localStorage })),
     };
-    await saveConnectionState(p.id, JSON.stringify(storage));
+    await connectorHost().saveSessionState(JSON.stringify(storage), p.id);
     log.info(`${p.name}: imported ${state.cookies.length} cookies and ${state.origins.length} origin(s) for workspace ${org} (replaced ${cleared})`);
     return { cookies: state.cookies.length, origins: state.origins.length, cleared };
   }
@@ -638,7 +637,7 @@ export class FleetManager {
       try {
         const state = await conn.ctx.storageState();
         cookies += state.cookies.length;
-        await withOrg(conn.org, () => saveConnectionState(conn.platform, JSON.stringify(state)));
+        await withOrg(conn.org, () => connectorHost().saveSessionState(JSON.stringify(state), conn.platform));
         if (!conn.busy) conn.lastUsed = Date.now();
       } catch (err) {
         log.warn(`backup of ${keyOf(conn.org, conn.platform)} failed`, err);

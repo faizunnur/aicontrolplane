@@ -29,12 +29,9 @@ export async function isCancelled(runId: number): Promise<boolean> {
   return cancelRequested(runId);
 }
 
-export class CancelledError extends Error {
-  constructor(message = "You stopped it.") {
-    super(message);
-    this.name = "CancelledError";
-  }
-}
+// Defined in packages/core so browser code can throw it without importing this module (and the database with it).
+import { CancelledError } from "../packages/core/src/index.js";
+export { CancelledError };
 
 export class RunTracker {
   /** The folded step view, maintained in memory: this tracker is the run's only writer while it executes. */

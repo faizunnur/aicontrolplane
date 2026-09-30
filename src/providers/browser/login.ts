@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import { browser } from "../../browser/manager.js";
-import { compilePatterns } from "../../platforms.js";
+import { compilePatterns } from "./patterns.js";
 import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 
 /**

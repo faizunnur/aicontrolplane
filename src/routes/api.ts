@@ -7,7 +7,8 @@ import { ensureTaskAgent } from "../agents.js";
 import { alertsConfigured, sendAlert } from "../alerts.js";
 import { approvalMode, decide, decideForMessage, listPolicies, pendingApprovals, requestExternalApproval, setApprovalMode, setPolicy } from "../policy.js";
 import { browserStateFor, liveViewers } from "../browser/live.js";
-import { browser, storageInfo, vncState } from "../browser/manager.js";
+import { browser, vncState } from "../browser/manager.js";
+import { storageInfo } from "../storage-info.js";
 import { config } from "../config.js";
 import {
   addAudit,

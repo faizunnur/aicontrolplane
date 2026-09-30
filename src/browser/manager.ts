@@ -6,12 +6,10 @@ import { chromium, type BrowserContext, type Cookie, type Page } from "playwrigh
 import { bus } from "../bus.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { persistStatus, saveToDatabase } from "../persist.js";
 import { cookieMatchesDomain, type StoredCookie, type StoredOrigin } from "../providers/browser/domains.js";
-import { browserSessionUpdatedAt, currentOrgId, withOrg } from "../db.js";
 import { chromeInstallCandidates } from "./executable.js";
 import { FleetManager } from "./fleet.js";
-import { loadSessionState, saveSessionState } from "./session-store.js";
+import { host } from "./host.js";
 
 const log = logger("browser");
 
@@ -412,8 +410,7 @@ class BrowserManager {
     if (!this.context) return 0;
     try {
       const state = await this.context.storageState();
-      await saveSessionState(JSON.stringify(state));
-      void saveToDatabase().catch(() => undefined);
+      await host().saveSessionState(JSON.stringify(state));
       return state.cookies.length;
     } catch (err) {
       log.warn("session backup failed", err);
@@ -426,7 +423,7 @@ class BrowserManager {
     try {
       const existing = await ctx.cookies();
       if (existing.length > 0) return;
-      const raw = await loadSessionState();
+      const raw = await host().loadSessionState();
       if (!raw) return;
       const state = JSON.parse(raw) as { cookies?: Cookie[] };
       const cookies = (state.cookies ?? []).filter((c) => c && c.name && c.domain);
@@ -608,52 +605,6 @@ export async function stopChild(child: ChildProcess, graceMs: number): Promise<v
   await Promise.race([exited, new Promise((r) => setTimeout(r, 3_000))]);
 }
 
-/**
- * Is DATA_DIR on a mounted volume? On Linux we read /proc/mounts; anywhere else we
- * cannot tell and return null. A false here means logins vanish on redeploy.
- */
-export async function storageInfo(): Promise<{
-  dataDir: string;
-  persistent: boolean | null;
-  mount: string | null;
-  backupAt: string | null;
-  /** What keeps state across redeploys. "unknown" when the platform cannot tell (e.g. local dev). */
-  persistedBy: "postgres" | "volume" | "database" | "none" | "unknown";
-  database: { enabled: boolean; lastSaveAt: string | null; lastError: string | null };
-}> {
-  let persistent: boolean | null = null;
-  let mount: string | null = null;
-  try {
-    if (process.platform === "linux" && fs.existsSync("/proc/mounts")) {
-      const mounts = fs
-        .readFileSync("/proc/mounts", "utf8")
-        .split("\n")
-        .map((l) => l.split(" ")[1])
-        .filter(Boolean)
-        .filter((m) => m !== "/" && !m.startsWith("/proc") && !m.startsWith("/sys") && !m.startsWith("/dev") && m !== "/etc/hosts" && m !== "/etc/hostname" && m !== "/etc/resolv.conf");
-      const dir = path.resolve(config.dataDir);
-      mount = mounts.filter((m) => dir === m || dir.startsWith(m + "/")).sort((a, b) => b.length - a.length)[0] ?? null;
-      persistent = mount !== null;
-    }
-  } catch {
-    persistent = null;
-  }
-  let backupAt: string | null = null;
-  try {
-    backupAt = (await withOrg(currentOrgId() ?? 1, () => browserSessionUpdatedAt("default"))) ?? null;
-    if (!backupAt) {
-      const f = path.join(config.dataDir, "sessions.json");
-      if (fs.existsSync(f)) backupAt = fs.statSync(f).mtime.toISOString();
-    }
-  } catch {
-    backupAt = null;
-  }
-  const database = persistStatus();
-  // Postgres as the primary database persists everything by itself; the volume/mirror story
-  // only applies to SQLite mode.
-  const persistedBy = config.db.driver === "pg" ? "postgres" : database.enabled && !database.lastError ? "database" : persistent === true ? "volume" : persistent === false ? "none" : "unknown";
-  return { dataDir: config.dataDir, persistent, mount, backupAt, persistedBy, database };
-}
 
 /**
  * Which browser serves this process: the legacy single persistent profile (today's

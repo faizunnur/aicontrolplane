@@ -160,14 +160,5 @@ export function syncablePlatforms(): PlatformConfig[] {
   return all;
 }
 
-export function compilePatterns(sources: string[]): RegExp[] {
-  const out: RegExp[] = [];
-  for (const s of sources ?? []) {
-    try {
-      out.push(new RegExp(s, "i"));
-    } catch {
-      log.warn(`invalid pattern ignored: ${s}`);
-    }
-  }
-  return out;
-}
+// Lives with the browser flows (no database behind it); kept here for the existing importers.
+export { compilePatterns } from "./providers/browser/patterns.js";

@@ -1,5 +1,6 @@
 import type { CDPSession, Page } from "playwright";
-import { addAudit, withOrg } from "../db.js";
+import { withOrg } from "../../packages/core/src/scope.js";
+import { host } from "./host.js";
 import { logger } from "../logger.js";
 import { browser } from "./manager.js";
 
@@ -213,7 +214,7 @@ async function applyCommandScoped(org: number, platform: string, msg: Record<str
         if (!url) return {};
         if (!/^[a-z]+:\/\//i.test(url)) url = /^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(url) ? `https://${url}` : `https://www.google.com/search?q=${encodeURIComponent(url)}`;
         if (!/^https?:\/\//i.test(url)) return { error: "Only http and https addresses can be opened here." };
-        await addAudit({ actor: opts.actor ?? "you", action: "browser.navigate", target: platform, detail: url.slice(0, 300) });
+        await host().audit({ actor: opts.actor ?? "you", action: "browser.navigate", target: platform, detail: url.slice(0, 300) });
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
       } else if (t === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
       else if (t === "forward") await page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });

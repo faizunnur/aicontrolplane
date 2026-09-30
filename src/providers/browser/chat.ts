@@ -1,9 +1,10 @@
 import type { Page } from "playwright";
 import { browser } from "../../browser/manager.js";
 import { cleanError, isStall, PageController } from "../../browser/page.js";
-import { setPlatformState } from "../../db.js";
+import { host } from "../../browser/host.js";
 import { logger } from "../../logger.js";
-import { CancelledError, isCancelled, type RunTracker } from "../../runs.js";
+import { CancelledError } from "../../../packages/core/src/index.js";
+import type { RunTracker } from "../../runs.js";
 import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ChatResult } from "../types.js";
 import { detectChallenge, detectLoginState } from "./login.js";
@@ -64,7 +65,7 @@ const hostOf = (url: string) => {
  * passes these checks) is the way back in.
  */
 async function challengeFailure(p: PlatformConfig, page: Page, step: RunTracker | undefined, key: string): Promise<ChatResult> {
-  await setPlatformState(p.id, { session_status: "needs_login", last_error: `${p.name} is showing a human-verification challenge` });
+  await host().setPlatformState(p.id, { session_status: "needs_login", last_error: `${p.name} is showing a human-verification challenge` });
   await step?.fail(key, "human-verification challenge");
   return { ok: false, error: `${p.name} is showing a human-verification challenge — open the live view or re-run sign-in.`, url: page.url() };
 }
@@ -80,7 +81,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
   await step?.start("check", "Checking the sign-in");
   const login = await detectLoginState(p, page);
   if (login === "needs_login") {
-    await setPlatformState(p.id, { session_status: "needs_login" });
+    await host().setPlatformState(p.id, { session_status: "needs_login" });
     await step?.fail("check", "signed out");
     return { ok: false, error: `${p.name} needs you to sign in again`, url: page.url() };
   }
@@ -135,7 +136,7 @@ async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Pro
   let seenNew = false;
   while (Date.now() - started < REPLY_TIMEOUT_MS) {
     await page.waitForTimeout(1_000);
-    if (step && (await isCancelled(step.runId))) {
+    if (step && (await host().isCancelled(step.runId))) {
       await pc.screenshot(page);
       await step.fail("wait", "stopped by you");
       return { ok: false, cancelled: true, error: `You stopped waiting. It was sent to ${p.name}; the answer is in its tab.`, url: page.url() };
@@ -186,11 +187,11 @@ export async function checkSignIn(p: PlatformConfig): Promise<Exclude<SessionSta
         const challenged = login === "unknown" && (await detectChallenge(page)).challenge !== null;
         const status = login === "needs_login" || challenged ? "needs_login" : "logged_in";
         await pc.screenshot(page);
-        await setPlatformState(p.id, { session_status: status, last_error: challenged ? `${p.name} is showing a human-verification challenge` : null });
+        await host().setPlatformState(p.id, { session_status: status, last_error: challenged ? `${p.name} is showing a human-verification challenge` : null });
         if (status === "logged_in") void browser.backupSessions();
         return status;
       } catch (err) {
-        await setPlatformState(p.id, { session_status: "error", last_error: cleanError(err) });
+        await host().setPlatformState(p.id, { session_status: "error", last_error: cleanError(err) });
         return "error";
       }
     },

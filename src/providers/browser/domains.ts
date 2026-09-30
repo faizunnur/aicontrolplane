@@ -53,6 +53,29 @@ export function sessionDomains(p: SessionDomainSource): string[] {
 }
 
 /** ".x.ai", "accounts.x.ai" and "x.ai" all belong to "x.ai"; "notx.ai" does not. */
+/** The shape Playwright's storageState() returns and newContext({storageState}) accepts. */
+export interface StorageStateLike {
+  cookies?: { name: string; value: string; domain: string; [k: string]: unknown }[];
+  origins?: { origin: string; [k: string]: unknown }[];
+}
+
+/** One provider's slice of a whole-profile storageState, by its session domains. */
+export function sliceStateForPlatform(state: StorageStateLike, p: SessionDomainSource): StorageStateLike {
+  const domains = sessionDomains(p);
+  const originMatches = (origin: string) => {
+    try {
+      const host = new URL(origin).hostname.toLowerCase();
+      return domains.some((d) => host === d || host.endsWith(`.${d}`));
+    } catch {
+      return false;
+    }
+  };
+  return {
+    cookies: (state.cookies ?? []).filter((c) => c && c.name && c.domain && cookieMatchesDomain(c.domain, domains)),
+    origins: (state.origins ?? []).filter((o) => o && originMatches(o.origin)),
+  };
+}
+
 export function cookieMatchesDomain(cookieDomain: string, domains: string[]): boolean {
   const host = String(cookieDomain ?? "")
     .toLowerCase()

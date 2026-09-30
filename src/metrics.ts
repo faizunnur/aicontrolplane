@@ -1,8 +1,11 @@
 import { collectDefaultMetrics, Counter, Gauge, Histogram, Registry } from "prom-client";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "./config.js";
-import { rawAll } from "./db.js";
 import { logger } from "./logger.js";
+
+// The database is reached lazily, at scrape time: the browser fleet reports its gauges here,
+// and browser code must load in a process that has no database (the desktop connector).
+const rawAll = async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => (await import("./db.js")).rawAll<T>(sql, params);
 
 const log = logger("metrics");
 
