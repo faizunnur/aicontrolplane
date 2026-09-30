@@ -124,7 +124,7 @@ export class FleetManager {
       if (c.org !== org || !c.page || c.page.isClosed()) continue;
       pages.push({ platform: c.platform, url: c.page.url(), title: c.title });
     }
-    return { enabled: this.enabled, running: this.isRunning(), headless: true, active: this.active, busy: this.busy, pages, signIn: this.signIn, seq: ++this.snapshotSeq };
+    return { enabled: this.enabled, running: this.isRunning(), headless: config.browser.headless, active: this.active, busy: this.busy, pages, signIn: this.signIn, seq: ++this.snapshotSeq };
   }
   private announce() {
     browserContextsOpen.set(this.connections.size);
@@ -274,10 +274,29 @@ export class FleetManager {
       log.info(`launching fleet Chromium (max ${config.fleet.maxContexts} contexts, ${config.fleet.orgMaxContexts}/workspace)`);
       // Every workspace's pages render in this one process tree: the renderer sandbox is the
       // wall between a compromised page and the other tenants' cookies. Never drop it lightly.
+      // The same fingerprint the legacy browser presents, or Cloudflare (ChatGPT, Grok, Claude)
+      // walls every page: the installed Chrome, not the bundled headless shell (whose user agent
+      // says "HeadlessChrome"); a real window on the virtual display unless HEADLESS=true; no
+      // --enable-automation (it sets navigator.webdriver); software WebGL.
+      const exe = resolveExecutable();
+      const [w, h] = config.browser.windowSize;
+      log.info(`fleet browser: headless=${config.browser.headless}, ${exe.source}: ${exe.path}`);
       const b = await launchWithSandboxFallback((sandbox) =>
         chromium.launch({
-          headless: true,
-          args: [...sandbox, "--disable-dev-shm-usage", "--password-store=basic", "--disable-blink-features=AutomationControlled"],
+          headless: config.browser.headless,
+          ...(exe.source === "bundled" ? {} : { executablePath: exe.path }),
+          args: [
+            ...sandbox,
+            "--disable-dev-shm-usage",
+            "--password-store=basic",
+            "--disable-blink-features=AutomationControlled",
+            `--window-size=${w},${h}`,
+            "--window-position=0,0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            ...GPU_ARGS,
+          ],
+          ignoreDefaultArgs: ["--enable-automation"],
         }),
       );
       b.on("disconnected", () => {

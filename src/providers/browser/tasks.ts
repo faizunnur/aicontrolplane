@@ -7,7 +7,7 @@ import { logger } from "../../logger.js";
 import { compilePatterns } from "../../platforms.js";
 import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ExecutionContext, TaskListResult } from "../types.js";
-import { detectLoginState } from "./login.js";
+import { detectChallenge, detectLoginState } from "./login.js";
 import { normalizePayloads } from "./normalize.js";
 
 const log = logger("browser-tasks");
@@ -109,6 +109,16 @@ async function collectOnce(p: PlatformConfig, outputUrlFor: OutputUrlHook, ctx: 
   await ctx.track?.done("open", hostOf(finalUrl));
 
   await ctx.track?.start("check", "Checking the sign-in");
+  // A bot-check wall first: the session cookie survives behind it, so the login check alone
+  // would call it signed in and the sync would report an empty, "successful" task list.
+  const { challenge } = await detectChallenge(page);
+  if (challenge) {
+    await ctx.track?.fail("check", "human-verification challenge");
+    const screenshotPath = await pc.screenshot(page);
+    const message = `${p.name} is showing a human-verification challenge — open the live view or re-run sign-in.`;
+    log.warn(`collect ${p.id}: ${challenge} challenge (${finalUrl})`);
+    return { ok: false, sessionStatus: "needs_login", tasks: [], runs: [], meta: { finalUrl, title: await page.title().catch(() => ""), captures: 0, discovered: [], snapshot: "", screenshotPath }, message };
+  }
   const sessionStatus: SessionStatus = await detectLoginState(p, page, { unauthorized: captured.some((c) => c.status === 401) });
   if (sessionStatus === "needs_login") await ctx.track?.fail("check", "signed out");
   else await ctx.track?.done("check", "signed in");
