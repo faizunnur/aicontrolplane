@@ -262,7 +262,8 @@
     $("#pairing-modal").hidden = false;
     renderPairing();
     clearInterval(pairingTimer);
-    pairingTimer = setInterval(renderPairing, 1000);
+    let tick = 0;
+    pairingTimer = setInterval(() => { renderPairing(); if (++tick % 3 === 0) pollPairing(); }, 1000);
   }
   function closePairing() {
     clearInterval(pairingTimer);
@@ -305,6 +306,31 @@
     $("#btn-pairing-cancel").hidden = over;
     $("#btn-pairing-new").hidden = !over || st === "done";
     $("#btn-pairing-done").hidden = st !== "done";
+  }
+  /** One update path for the stream and the poll: apply, re-render, toast only on a real change. */
+  function applyPairingEvent(p) {
+    const was = pairing && p.id === pairing.id ? pairing.status : null;
+    if (pairing && p.id === pairing.id) {
+      pairing.status = p.status;
+      pairing.detail = p.detail;
+      if (p.expires_at) pairing.expiresAt = p.expires_at;
+      renderPairing();
+    }
+    if (was === p.status) return; // the stream and the poll both deliver; say it once
+    if (p.status === "done") toast(`${aiName(p.platform)} is connected.`, "ok");
+    else if (p.status === "failed") toast(p.detail || `The sign-in to ${aiName(p.platform)} could not be imported.`, "bad");
+  }
+  /* The stream pushes every change, but one missed event (a reconnect at the wrong moment) must
+     not leave the panel on "Waiting for your computer…" forever: while it is open, also ask. */
+  let pairingPolling = false;
+  async function pollPairing() {
+    if (pairingPolling || !pairing || $("#pairing-modal").hidden || !["waiting", "paired", "importing"].includes(pairing.status)) return;
+    pairingPolling = true;
+    try {
+      const p = await api(`/connections/${pairing.platform}/pairing`);
+      if (p && pairing && p.id === pairing.id && p.status !== pairing.status) applyPairingEvent(p);
+    } catch { /* the stream is still there; the next tick tries again */ }
+    pairingPolling = false;
   }
   const pairingCommand = () => pairing?.connect?.[pairingOs] || pairing?.connect?.unix || "";
   $("#pairing-os").addEventListener("click", (e) => { const b = e.target.closest("[data-os]"); if (!b) return; pairingOs = b.dataset.os; store.set("acp-connect-os", pairingOs); renderPairing(); });
@@ -406,12 +432,7 @@
       renderAiList(); renderEngine(); renderTabs(); renderRibbons(); renderLiveContext();
     });
     es.addEventListener("log", (e) => { if (view === "logs") Views.appendLog(JSON.parse(e.data), $("#view"), logFilter()); });
-    es.addEventListener("pairing", (e) => {
-      const p = JSON.parse(e.data);
-      if (pairing && p.id === pairing.id) { pairing.status = p.status; pairing.detail = p.detail; if (p.expires_at) pairing.expiresAt = p.expires_at; renderPairing(); }
-      if (p.status === "done") toast(`${aiName(p.platform)} is connected.`, "ok");
-      else if (p.status === "failed") toast(p.detail || `The sign-in to ${aiName(p.platform)} could not be imported.`, "bad");
-    });
+    es.addEventListener("pairing", (e) => applyPairingEvent(JSON.parse(e.data)));
     es.addEventListener("conversation", (e) => {
       const { action, conversation: c } = JSON.parse(e.data);
       if (action === "deleted") {

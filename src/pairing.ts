@@ -2,8 +2,7 @@ import { randomBytes, randomInt } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, Response } from "express";
 import { authUser, bearer, tokenHash } from "./auth.js";
-import { bus } from "./bus.js";
-import { addAudit, expirePairings, findPairingByCodeHash, findPairingByTokenHash, getPairing, insertPairing, latestPairing, replaceWaitingPairings, updatePairing, type PairingRow, type PairingStatus } from "./db.js";
+import { addAudit, announceEvent, expirePairings, findPairingByCodeHash, findPairingByTokenHash, getPairing, insertPairing, latestPairing, replaceWaitingPairings, updatePairing, withOrg, type PairingRow, type PairingStatus } from "./db.js";
 import { logger } from "./logger.js";
 
 /*
@@ -51,8 +50,13 @@ function view(row: PairingRow): PairingView {
   return { id: row.id, platform: row.platform, status: row.status, detail: row.detail, expires_at: row.expires_at, paired_at: row.paired_at, finished_at: row.finished_at };
 }
 function announce(row: PairingRow) {
-  bus.emit("pairing", view(row));
-  bus.emit("platform:row", row.platform);
+  // Through the outbox, in the pairing's own workspace: the helper's exchange runs on an
+  // unauthenticated route, so the ambient scope cannot name the org. The outbox gives the
+  // events a replay id — a page that reconnects around the flip still hears it.
+  withOrg(row.org_id, () => {
+    announceEvent("pairing", view(row));
+    announceEvent("platform:row", row.platform);
+  });
 }
 
 export async function createPairing(platform: string): Promise<{ row: PairingRow; code: string }> {

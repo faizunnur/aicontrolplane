@@ -162,6 +162,15 @@ const notify: Notify = (topic, payload) => {
   }
 };
 
+/**
+ * Announce an app-level change that has no row helper of its own (a pairing's state, say).
+ * It takes the same path as every row change: appended to the outbox in the ambient
+ * workspace's scope, so it gains a replay id and reaches reconnecting clients too.
+ */
+export function announceEvent(topic: string, payload: unknown): void {
+  notify(topic, payload);
+}
+
 function queueOutboxFlush(): void {
   outboxChain = outboxChain.then(flushOutboxBuffer);
 }
