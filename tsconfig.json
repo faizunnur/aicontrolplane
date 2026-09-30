@@ -12,5 +12,5 @@
     "sourceMap": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "packages/**/*.ts"]
+  "include": ["src/**/*.ts", "packages/**/*.ts", "apps/**/*.ts"]
 }

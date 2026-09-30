@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
-import { activeRunCount, addRunEvent, cancelRequested, finishRun, foldSteps, getMessage, getRun, heartbeatRun, listStaleRunningRunsAll, orgQuotas, rawAll, rawRun, runCountSince, runEvents, setCancelRequested, startRun, systemScope, transitionRun, updateMessage, withOrg, type StartRunInput } from "./db.js";
+import { activeRunCount, addRunEvent, cancelRequested, currentOrgId, finishRun, foldSteps, getMessage, getRun, heartbeatRun, listStaleRunningRunsAll, orgQuotas, rawAll, rawRun, runCountSince, runEvents, setCancelRequested, startRun, systemScope, transitionRun, updateMessage, withOrg, type StartRunInput } from "./db.js";
+import { connectorFor } from "./gateway/registry.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { runsSettled } from "./metrics.js";
@@ -24,6 +25,9 @@ const log = logger("runs");
 
 export async function requestCancel(runId: number) {
   await setCancelRequested(runId);
+  // A run executing on the workspace's computer learns of the stop over the gateway.
+  const org = currentOrgId();
+  if (org !== undefined) connectorFor(org)?.send({ t: "cancel", runId });
 }
 export async function isCancelled(runId: number): Promise<boolean> {
   return cancelRequested(runId);

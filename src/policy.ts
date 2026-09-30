@@ -3,6 +3,7 @@ import { addAudit, addEvent, addRunEvent, createApproval, getApproval, getPolicy
 import { logger } from "./logger.js";
 import { queue, resumeJobFor, type RunResumeJob } from "./queue.js";
 import { endRun, finishParked, RunTracker } from "./runs.js";
+import type { StepReporter } from "./browser/host.js";
 import type { PolicyMode, Run } from "../packages/core/src/index.js";
 
 const log = logger("policy");
@@ -101,7 +102,7 @@ export interface GuardScope {
   messageId?: number | null;
   provider?: string | null;
   /** The run's tracker; the approval appears as its "approve" step. */
-  track?: RunTracker | null;
+  track?: StepReporter | null;
   /** Which resumer continues this run after approval (defaults to the run's kind). */
   kind: string;
   checkpoint: Checkpoint;

@@ -211,6 +211,65 @@ export async function startWorker(env: Record<string, string>, opts: { dataDir?:
   };
 }
 
+/**
+ * The desktop connector as a process (apps/connector), against a running server: it drives
+ * its own headless Chromium for the workspace whose device token it holds. Resolves once it
+ * reports itself connected to the gateway.
+ */
+export async function startConnector(env: Record<string, string> & { ACP_URL: string; ACP_DEVICE_TOKEN: string }, opts: { dataDir?: string } = {}): Promise<{ port: number; dataDir: string; stop(): Promise<void>; kill(): void }> {
+  const port = await freePort();
+  const dataDir = opts.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "acp-connector-"));
+  fs.mkdirSync(dataDir, { recursive: true });
+  const child: ChildProcess = spawn(process.execPath, ["--import", "tsx", "apps/connector/src/main.ts"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      HEADLESS: "true",
+      BROWSER_ENABLED: "true",
+      NODE_ENV: "test",
+      ACP_TEST_DEFAULT_ORG: "",
+      LOG_LEVEL: process.env.ACP_TEST_LOG || "warn",
+      RAILWAY_VOLUME_MOUNT_PATH: "",
+      DATABASE_URL: "",
+      ...env,
+    },
+    stdio: process.env.ACP_TEST_STDIO === "inherit" ? ["ignore", "inherit", "inherit"] : ["ignore", "pipe", "pipe"],
+  });
+  const logs: string[] = [];
+  child.stdout?.on("data", (d) => logs.push(String(d)));
+  child.stderr?.on("data", (d) => logs.push(String(d)));
+  const deadline = Date.now() + 90_000;
+  let up = false;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) break;
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/healthz`);
+      if (r.ok && (await r.json()).connected) {
+        up = true;
+        break;
+      }
+    } catch {
+      /* not yet */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  if (!up) {
+    stopChild(child);
+    throw new Error(`connector did not connect on :${port}\n${logs.join("")}`);
+  }
+  return {
+    port,
+    dataDir,
+    stop: async () => {
+      stopChild(child);
+      await new Promise((r) => setTimeout(r, 500));
+    },
+    kill: () => stopChild(child),
+  };
+}
+
 function stopChild(child: ChildProcess) {
   if (child.exitCode !== null || !child.pid) return;
   if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });

@@ -7,7 +7,9 @@ Status: in progress on `feature/desktop`, 2026-09-30.
 - **Stage 0, done.** The host seam: `src/browser/host.ts` (`ConnectorHost`), `host-local.ts` (the database implementation), the org scope moved to `packages/core/src/scope.ts`. `test/unit/host.test.ts` pins the browser code's import graph free of the database.
 - **Stage 1, done for a single-process deployment.** `packages/core/src/gateway.ts` (protocol), `src/gateway/{registry,calls,server}.ts`, `src/devices.ts`, migration 15/109 (`devices`), `GET/POST/DELETE /api/devices`, the `/gw` upgrade. A connected computer takes precedence for its workspace: interactive ops (`callBrowserOp`) and chat deliveries (`performChatSend`) go to it as jobs; its run events, platform state, captures, screenshots and screencast come back; the live view and `/api/browser` show its tabs. `test/e2e/gateway.test.ts` drives all of it with a stand-in connector.
   Not yet: in split mode (`ROLE=api` + workers) the `browser.*` queues are still consumed by the browser role, which holds no connectors, so a workspace with a desktop but no browser service gets no chat delivery there. That is the Stage 3 dispatcher. Offline is still an error (503 "your computer is not connected"), not a parked run.
-- Stages 2 to 6: not started.
+- **Stage 2, runtime done; shell not started.** `packages/connector/src/{client,host,ops}.ts` and `apps/connector` (`npm run connector`): the connector as a Node process — reconnecting gateway client, the host seam over the socket (`GatewayHost`, steps as `run-event` frames, screenshots as binary envelopes, sessions kept local), the op table (`auth.check`, `auth.connect`, `chat.send`, `console.open`, `screenshot.take`), screencast and viewer commands. Jobs carry the provider's current config; Stop reaches the connector as a `cancel` frame. `test/e2e/connector.test.ts` runs the real process with headless Chromium against the mock AI site. See [connector.md](connector.md).
+  Not yet: the Electron window, tray, autostart, `safeStorage` for sessions, sign-in flow in the app; `sync.*` and `action.run` on the connector.
+- Stages 3 to 6: not started.
 
 The product model this plan implements:
 

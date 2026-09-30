@@ -1,4 +1,4 @@
-import type { RunTracker } from "../runs.js";
+import type { StepReporter } from "../browser/host.js";
 import type { PlatformConfig, RunStatus, RunTrigger, SessionStatus } from "../../packages/core/src/index.js";
 
 /*
@@ -65,7 +65,7 @@ export interface ExecutionContext {
   /** Run the execution belongs to. Callers that have none get one created for them. */
   runId?: number;
   /** Step reporter for the run; adapters call start/done/fail on it as they go. */
-  track?: RunTracker;
+  track?: StepReporter;
   /** What started the work, for runs created on the caller's behalf. */
   trigger?: RunTrigger;
   /** The caller's run kind, so a gate inside this execution parks under the right resumer. */

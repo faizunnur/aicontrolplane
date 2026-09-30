@@ -1,4 +1,4 @@
-import type { PlatformConfig, PlatformState } from "../../packages/core/src/index.js";
+import type { PlatformConfig, PlatformState, StepStatus } from "../../packages/core/src/index.js";
 
 /*
   The host seam. Everything the browser code needs from the world outside a tab goes through
@@ -27,6 +27,27 @@ export interface AuditInput {
   action: string;
   target?: string | null;
   detail?: string | null;
+}
+
+/**
+ * The step reporter a browser flow is handed with its execution context. The cloud passes its
+ * RunTracker (which writes run_events); a desktop connector passes one that sends run-event
+ * frames. Browser code depends on this shape only, never on the class.
+ */
+export interface StepReporter {
+  readonly runId: number;
+  readonly messageId: number | null;
+  set(key: string, label: string, status: StepStatus, detail?: string | null): Promise<void>;
+  /** Begin a step. Throws CancelledError if the user pressed Stop, so callers unwind naturally. */
+  start(key: string, label: string, detail?: string | null): Promise<void>;
+  done(key: string, detail?: string | null): Promise<void>;
+  fail(key: string, detail?: string | null): Promise<void>;
+  skip(key: string, detail?: string | null): Promise<void>;
+  waiting(key: string, label: string, detail?: string | null): Promise<void>;
+  log(label: string, detail?: string | null): Promise<void>;
+  /** Whatever is still running or waiting failed with this reason. */
+  failRunning(detail: string): Promise<void>;
+  checkCancel(): Promise<void>;
 }
 
 export interface ConnectorHost {

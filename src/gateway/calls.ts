@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { JobFrame } from "../../packages/core/src/gateway.js";
+import { getPlatform } from "../platforms.js";
 import { connectorFor, type Connector } from "./registry.js";
 
 /*
@@ -38,7 +39,11 @@ export function gatewayCall<T>(org: number, op: string, payload: unknown, timeou
     }, timeoutMs);
     timer.unref?.();
     pending.set(jobId, { conn, resolve: resolve as (v: unknown) => void, reject, timer });
-    const job: JobFrame = { t: "job", jobId, op, payload, timeoutMs };
+    // The provider's configuration travels with the job (read in the caller's workspace scope),
+    // so the connector drives what the workspace has configured right now, not a stale copy.
+    const pid = payload && typeof payload === "object" ? (payload as { platformId?: unknown }).platformId : undefined;
+    const platform = typeof pid === "string" ? getPlatform(pid) : undefined;
+    const job: JobFrame = { t: "job", jobId, op, payload, timeoutMs, ...(platform ? { platform } : {}) };
     conn.send(job);
   });
 }

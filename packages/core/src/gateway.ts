@@ -129,6 +129,13 @@ export interface JobFrame {
   op: string;
   payload: unknown;
   timeoutMs: number;
+  /** The provider the job is about, as configured right now, so the connector never drives a stale config. */
+  platform?: PlatformConfig;
+}
+/** Someone pressed Stop on a run the connector is executing. */
+export interface CancelFrame {
+  t: "cancel";
+  runId: number;
 }
 /** A web viewer wants (level) or stops wanting (null) this tab's screencast. */
 export interface LiveWantFrame {
@@ -150,7 +157,7 @@ export interface ByeFrame {
   t: "bye";
   reason: string;
 }
-export type CloudFrame = WelcomeFrame | JobFrame | LiveWantFrame | CmdFrame | PingFrame | ByeFrame;
+export type CloudFrame = WelcomeFrame | JobFrame | CancelFrame | LiveWantFrame | CmdFrame | PingFrame | ByeFrame;
 
 /** Close codes the cloud uses; the connector reads them to decide whether reconnecting makes sense. */
 export const CLOSE_REVOKED = 4001;

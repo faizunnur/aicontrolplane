@@ -4,7 +4,7 @@ import { cleanError, isStall, PageController } from "../../browser/page.js";
 import { host } from "../../browser/host.js";
 import { logger } from "../../logger.js";
 import { CancelledError } from "../../../packages/core/src/index.js";
-import type { RunTracker } from "../../runs.js";
+import type { StepReporter } from "../../browser/host.js";
 import type { PlatformConfig, SessionStatus } from "../../../packages/core/src/index.js";
 import type { ChatResult } from "../types.js";
 import { detectChallenge, detectLoginState } from "./login.js";
@@ -24,7 +24,7 @@ const clipReply = (s: string) => (s.length > MAX_REPLY_CHARS ? s.slice(0, MAX_RE
  * selectors) comes from the provider's configuration; every stage is reported through the step
  * tracker so the thread shows it live.
  */
-export async function sendThroughBrowser(p: PlatformConfig, text: string, track?: RunTracker): Promise<ChatResult> {
+export async function sendThroughBrowser(p: PlatformConfig, text: string, track?: StepReporter): Promise<ChatResult> {
   if (!browser.enabled) return { ok: false, error: "the browser is disabled on this deployment" };
   if (!p.composerSelector) return { ok: false, error: `${p.name} has no chat box configured` };
   return browser.withLock(
@@ -64,13 +64,13 @@ const hostOf = (url: string) => {
  * with the challenge named in last_error — carries it, and the desktop sign-in flow (which
  * passes these checks) is the way back in.
  */
-async function challengeFailure(p: PlatformConfig, page: Page, step: RunTracker | undefined, key: string): Promise<ChatResult> {
+async function challengeFailure(p: PlatformConfig, page: Page, step: StepReporter | undefined, key: string): Promise<ChatResult> {
   await host().setPlatformState(p.id, { session_status: "needs_login", last_error: `${p.name} is showing a human-verification challenge` });
   await step?.fail(key, "human-verification challenge");
   return { ok: false, error: `${p.name} is showing a human-verification challenge — open the live view or re-run sign-in.`, url: page.url() };
 }
 
-async function sendOnce(p: PlatformConfig, text: string, step?: RunTracker): Promise<ChatResult> {
+async function sendOnce(p: PlatformConfig, text: string, step?: StepReporter): Promise<ChatResult> {
   const pc = new PageController(p.id, p.name);
   const url = p.chatUrl || p.appUrl;
 
