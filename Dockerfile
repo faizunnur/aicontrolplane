@@ -1,6 +1,6 @@
 # Playwright image ships Chromium + all Linux deps. Keep this tag equal to the
 # "playwright" version in package.json.
-FROM mcr.microsoft.com/playwright:v1.63.0-noble
+FROM mcr.microsoft.com/playwright:v1.64.1-noble
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
